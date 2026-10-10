@@ -1,0 +1,197 @@
+import { useEffect, useState } from "react";
+import { api, ProviderItem } from "../lib/api";
+import { useProviderStore } from "../stores/providerStore";
+import { useAppStore } from "../stores/appStore";
+import { toast } from "../lib/notify";
+import ProviderDialog from "./settings/ProviderDialog";
+import ProviderCard from "./settings/ProviderCard";
+import ThinkingSection from "./settings/ThinkingSection";
+
+export default function SettingsView() {
+  const providers = useProviderStore((s) => s.providers);
+  const loaded = useProviderStore((s) => s.loaded);
+  const refresh = useProviderStore((s) => s.refresh);
+  const [dialogOpen, setDialogOpen] = useState(false);
+  const [editing, setEditing] = useState<ProviderItem | null>(null);
+  const theme = useAppStore((s) => s.theme);
+  const setTheme = useAppStore((s) => s.setTheme);
+  const prefs = useAppStore((s) => s.prefs);
+  const setPrefs = useAppStore((s) => s.setPrefs);
+  const [dataDir, setDataDir] = useState("");
+  const [backupMsg, setBackupMsg] = useState("");
+
+  useEffect(() => {
+    if (!loaded) refresh();
+    api
+      .getAppDataDir()
+      .then(setDataDir)
+      .catch(() => undefined);
+  }, [loaded, refresh]);
+
+  const closeDialog = () => {
+    setDialogOpen(false);
+    setEditing(null);
+  };
+
+  const doExport = async () => {
+    try {
+      const data = await api.exportConfig();
+      const blob = new Blob([JSON.stringify(data, null, 2)], {
+        type: "application/json",
+      });
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `moling_backup_${Date.now()}.json`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      setBackupMsg("已导出（文件包含明文凭据，请妥善保管）");
+    } catch (e) {
+      setBackupMsg(`导出失败：${String(e)}`);
+    }
+  };
+
+  const doImport = async (file: File) => {
+    try {
+      const data = JSON.parse(await file.text());
+      await api.importConfig(data);
+      await refresh();
+      setBackupMsg("导入成功");
+    } catch (e) {
+      setBackupMsg(`导入失败：${String(e)}`);
+    }
+  };
+
+  return (
+    <div className="relative flex min-w-0 flex-1 flex-col bg-base">
+      <header className="bg-glass z-10 flex h-[52px] shrink-0 items-end border-b border-theme px-6 pb-2">
+        <h1 className="text-[17px] font-semibold tracking-tight text-primary">
+          设置
+        </h1>
+      </header>
+      <div className="flex-1 overflow-y-auto p-6">
+        <div className="mx-auto max-w-2xl space-y-8">
+          <section>
+            <div className="mb-4 flex items-center justify-between">
+              <h2 className="text-lg font-semibold">服务商管理</h2>
+              <button
+                onClick={() => {
+                  setEditing(null);
+                  setDialogOpen(true);
+                }}
+                className="rounded-[10px] bg-accent px-4 py-2 text-sm text-white"
+              >
+                + 新增服务商
+              </button>
+            </div>
+            {providers.length === 0 ? (
+              <div className="rounded-[var(--radius-card)] border border-dashed border-theme p-10 text-center text-sm text-tertiary">
+                还没有服务商。点击「新增服务商」，填入地址和 Key 即可开始绘图。
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {providers.map((item) => (
+                  <ProviderCard
+                    key={item.provider.id}
+                    item={item}
+                    onEdit={() => {
+                      setEditing(item);
+                      setDialogOpen(true);
+                    }}
+                  />
+                ))}
+              </div>
+            )}
+          </section>
+
+          <section>
+            <h2 className="mb-4 text-lg font-semibold">外观与默认项</h2>
+            <div className="space-y-3 rounded-[var(--radius-card)] border border-theme p-4">
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-secondary">主题</span>
+                <select
+                  value={theme}
+                  onChange={(e) =>
+                    setTheme(e.target.value as "system" | "light" | "dark")
+                  }
+                  className="rounded-[8px] border border-theme bg-transparent px-2 py-1 text-xs"
+                >
+                  <option value="system">跟随系统</option>
+                  <option value="light">浅色</option>
+                  <option value="dark">暗色</option>
+                </select>
+              </div>
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-secondary">默认生成参数</span>
+                <div className="flex gap-2 text-xs">
+                  <button
+                    onClick={() =>
+                      api
+                        .setSetting("defaultParams", JSON.stringify(prefs))
+                        .catch((e) =>
+                          toast(`保存默认参数失败：${String(e)}`, "error"),
+                        )
+                    }
+                    className="rounded-[8px] border border-theme px-2 py-1"
+                  >
+                    将当前设为默认
+                  </button>
+                  <button
+                    onClick={async () => {
+                      const saved = await api.getSetting("defaultParams");
+                      if (!saved) return;
+                      try {
+                        setPrefs(JSON.parse(saved));
+                      } catch {
+                        toast("默认参数损坏，无法恢复", "error");
+                      }
+                    }}
+                    className="rounded-[8px] border border-theme px-2 py-1"
+                  >
+                    恢复默认
+                  </button>
+                </div>
+              </div>
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-secondary">存储路径</span>
+                <span className="max-w-[60%] truncate text-xs text-tertiary">
+                  {dataDir}
+                </span>
+              </div>
+            </div>
+          </section>
+
+          <ThinkingSection />
+
+          <section>
+            <h2 className="mb-4 text-lg font-semibold">数据备份</h2>
+            <div className="flex items-center gap-2 rounded-[var(--radius-card)] border border-theme p-4">
+              <button
+                onClick={() => doExport().catch(() => undefined)}
+                className="rounded-[8px] border border-theme px-3 py-1.5 text-xs"
+              >
+                导出全部配置
+              </button>
+              <label className="cursor-pointer rounded-[8px] border border-theme px-3 py-1.5 text-xs">
+                导入配置
+                <input
+                  type="file"
+                  accept=".json"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) doImport(f).catch(() => undefined);
+                    e.target.value = "";
+                  }}
+                />
+              </label>
+              {backupMsg && (
+                <span className="text-xs text-tertiary">{backupMsg}</span>
+              )}
+            </div>
+          </section>
+        </div>
+      </div>
+      {dialogOpen && <ProviderDialog initial={editing} onClose={closeDialog} />}
+    </div>
+  );
+}

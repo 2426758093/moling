@@ -1,0 +1,208 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ---------------- Apple HIG 设计令牌 ---------------- */
+/* 浅色：iOS 系统色；深色：iOS 深色模式色。全 App 单一强调色。 */
+:root {
+  --bg-base: #f5f5f7;
+  --bg-elevated: #ffffff;
+  --bg-sunken: #eaeaee;
+  --bg-hover: rgba(60, 60, 67, 0.06);
+  --bg-active: rgba(60, 60, 67, 0.12);
+  --bg-grouped: #f2f2f6;
+  --border: rgba(60, 60, 67, 0.1);
+  --border-strong: rgba(60, 60, 67, 0.18);
+  --separator: rgba(60, 60, 67, 0.08);
+  --text-primary: #1c1c1e;
+  --text-secondary: rgba(60, 60, 67, 0.72);
+  --text-tertiary: rgba(60, 60, 67, 0.45);
+  --accent: #007aff;
+  --accent-strong: #0063d1;
+  --accent-soft: rgba(0, 122, 255, 0.1);
+  --accent-grad: #007aff; /* 兼容旧类名：纯实色 */
+  --danger: #ff3b30;
+  --success: #34c759;
+  /* 极淡阴影，iOS 风格 */
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --shadow-pop: 0 4px 24px rgba(0, 0, 0, 0.1), 0 1px 3px rgba(0, 0, 0, 0.05);
+  /* 毛玻璃 */
+  --glass: rgba(250, 250, 252, 0.75);
+  --glass-dark: rgba(30, 30, 32, 0.72);
+  --radius-card: 14px;
+  --radius-pop: 16px;
+}
+
+.dark {
+  --bg-base: #000000;
+  --bg-elevated: #1c1c1e;
+  --bg-sunken: #2c2c2e;
+  --bg-hover: rgba(120, 120, 128, 0.16);
+  --bg-active: rgba(120, 120, 128, 0.24);
+  --bg-grouped: #1c1c1e;
+  --border: rgba(84, 84, 88, 0.4);
+  --border-strong: rgba(84, 84, 88, 0.6);
+  --separator: rgba(84, 84, 88, 0.35);
+  --text-primary: #ffffff;
+  --text-secondary: rgba(235, 235, 245, 0.72);
+  --text-tertiary: rgba(235, 235, 245, 0.42);
+  --accent: #0a84ff;
+  --accent-strong: #409cff;
+  --accent-soft: rgba(10, 132, 255, 0.16);
+  --accent-grad: #0a84ff;
+  --danger: #ff453a;
+  --success: #30d158;
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow-pop: 0 8px 32px rgba(0, 0, 0, 0.5), 0 1px 3px rgba(0, 0, 0, 0.4);
+  --glass: rgba(28, 28, 30, 0.75);
+}
+
+:root {
+  color-scheme: light dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+}
+
+body {
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
+    "PingFang SC", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  letter-spacing: -0.01em;
+  transition:
+    background-color 0.25s ease,
+    color 0.25s ease;
+}
+
+/* 语义类 */
+.bg-base {
+  background-color: var(--bg-base);
+}
+.bg-elevated {
+  background-color: var(--bg-elevated);
+}
+.bg-sunken {
+  background-color: var(--bg-sunken);
+}
+.bg-grouped {
+  background-color: var(--bg-grouped);
+}
+.bg-hover {
+  background-color: var(--bg-hover);
+}
+.bg-accent-soft {
+  background-color: var(--accent-soft);
+}
+.text-primary {
+  color: var(--text-primary);
+}
+.text-secondary {
+  color: var(--text-secondary);
+}
+.text-tertiary {
+  color: var(--text-tertiary);
+}
+.text-accent {
+  color: var(--accent);
+}
+.border-theme {
+  border-color: var(--border);
+}
+.border-strong {
+  border-color: var(--border-strong);
+}
+.shadow-card {
+  box-shadow: var(--shadow-card);
+}
+.shadow-pop {
+  box-shadow: var(--shadow-pop);
+}
+.bg-accent-grad {
+  background-color: var(--accent);
+}
+
+/* 毛玻璃 */
+.bg-glass {
+  background-color: var(--glass);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+}
+
+/* iOS 按钮按压反馈 */
+.pressable {
+  transition:
+    transform 0.16s ease-out,
+    opacity 0.16s ease-out,
+    background-color 0.16s ease-out,
+    filter 0.16s ease-out;
+}
+.pressable:active {
+  transform: scale(0.96);
+  filter: brightness(0.92);
+}
+
+/* 滚动条：细、安静 */
+*::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+*::-webkit-scrollbar-thumb {
+  border-radius: 4px;
+  background: var(--border-strong);
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--text-tertiary);
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* 生成中骨架屏 shimmer */
+@keyframes shimmer {
+  0% {
+    background-position: -400px 0;
+  }
+  100% {
+    background-position: 400px 0;
+  }
+}
+.shimmer {
+  background: linear-gradient(
+    90deg,
+    var(--bg-sunken) 25%,
+    var(--bg-hover) 50%,
+    var(--bg-sunken) 75%
+  );
+  background-size: 800px 100%;
+  animation: shimmer 1.4s infinite linear;
+}
+
+/* 思考中的呼吸点 */
+@keyframes pulse-dot {
+  0%,
+  80%,
+  100% {
+    transform: scale(0.7);
+    opacity: 0.4;
+  }
+  40% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+.thinking-dot {
+  animation: pulse-dot 1.2s infinite ease-in-out;
+}
+.thinking-dot:nth-child(2) {
+  animation-delay: 0.15s;
+}
+.thinking-dot:nth-child(3) {
+  animation-delay: 0.3s;
+}
