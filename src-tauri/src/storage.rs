@@ -715,6 +715,33 @@ pub fn delete_setting(key: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// 当前代码期望的 schema 版本（诊断包用）
+pub fn schema_version() -> i64 {
+    SCHEMA_VERSION
+}
+
+/// 各业务表行数（诊断包用）。表名取自 sqlite_master，随迁移自动扩展。
+pub fn table_row_counts() -> AppResult<Vec<(String, i64)>> {
+    let c = conn()?;
+    let names: Vec<String> = {
+        let mut stmt = c.prepare(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let mut out = Vec::new();
+    for name in names {
+        // 表名来自 sqlite_master 而非用户输入，拼接安全
+        let n: i64 = c.query_row(&format!("SELECT COUNT(*) FROM \"{name}\""), [], |r| {
+            r.get(0)
+        })?;
+        out.push((name, n));
+    }
+    Ok(out)
+}
+
 /// 取导入文件中的 providers 数组；缺失或类型不对直接报错。
 /// 必须在任何 DELETE 之前调用（P0-2：否则会先清空用户旧配置再报错/静默成功）。
 fn require_providers(data: &serde_json::Value) -> AppResult<&[serde_json::Value]> {

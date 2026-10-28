@@ -4,18 +4,26 @@ mod error;
 mod image_gc;
 mod image_store;
 mod key_pool;
+mod logging;
 mod paths;
 mod storage;
 
 use tauri::Manager;
 
-/// 初始化 tracing：落盘 data_dir/moling.log，默认仅记录 WARN/ERROR（失败/密钥/重试等关键节点）
+/// 初始化 tracing：日志按天滚落到 data_dir/logs/moling.log.YYYY-MM-DD。
+/// 级别由 `MOLING_LOG` 覆盖，缺省 `warn`（全局）+ `info`（本应用），
+/// 默认不把请求体这类大字段写盘。
 fn init_tracing(data_dir: &std::path::Path) {
-    let file_appender = tracing_appender::rolling::never(data_dir, "moling.log");
+    let logs = logging::logs_dir(data_dir);
+    if let Err(e) = std::fs::create_dir_all(&logs) {
+        eprintln!("创建日志目录失败: {e}");
+    }
+    let filter = std::env::var("MOLING_LOG").unwrap_or_else(|_| "warn,moling_lib=info".to_string());
+    let file_appender = tracing_appender::rolling::daily(logs, "moling.log");
     let (writer, guard) = tracing_appender::non_blocking(file_appender);
     let subscriber = tracing_subscriber::fmt()
         .with_writer(writer)
-        .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
+        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .finish();
     let _ = tracing::subscriber::set_global_default(subscriber);
     // 非阻塞 writer 的 guard 需在进程生命周期内存活；此处有意泄漏
@@ -71,8 +79,14 @@ pub fn run() {
             adapters::http::init_from_storage();
             // 孤儿图片回收：后台执行，不阻塞首屏；内部自带失败兜底与两道安全哨兵，
             // 任何异常都只落日志，不影响启动。显式 drop 句柄 = 刻意 detach。
+            let gc_dir = data_dir.clone();
             std::mem::drop(tauri::async_runtime::spawn_blocking(move || {
-                image_gc::run(&data_dir)
+                image_gc::run(&gc_dir)
+            }));
+            // 日志保留：只清理超过 7 天的滚动文件，跳过当天；失败仅落日志
+            let logs = logging::logs_dir(&data_dir);
+            std::mem::drop(tauri::async_runtime::spawn_blocking(move || {
+                logging::prune(&logs, std::time::SystemTime::now());
             }));
             Ok(())
         })
@@ -102,6 +116,8 @@ pub fn run() {
             commands::get_app_data_dir,
             commands::export_config,
             commands::import_config,
+            commands::get_logs_dir,
+            commands::export_diagnostics,
             commands::get_thinking_config,
             commands::save_thinking_config,
             commands::test_thinking_connection,

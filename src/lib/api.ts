@@ -211,6 +211,9 @@ export const api = {
     invoke<void>("set_setting", { key, value }),
   getSetting: (key: string) => invoke<string | null>("get_setting", { key }),
   getAppDataDir: () => invoke<string>("get_app_data_dir"),
+  getLogsDir: () => invoke<string>("get_logs_dir"),
+  /** 导出脱敏诊断包（近 7 天日志 + 元信息），返回 zip 绝对路径 */
+  exportDiagnostics: () => invoke<string>("export_diagnostics"),
   exportConfig: (includeKeys: boolean) =>
     invoke<Record<string, unknown>>("export_config", { includeKeys }),
   importConfig: (data: Record<string, unknown>) =>

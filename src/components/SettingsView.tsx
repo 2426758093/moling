@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { api, ProviderItem } from "../lib/api";
 import { useProviderStore } from "../stores/providerStore";
 import { useAppStore } from "../stores/appStore";
@@ -19,6 +20,9 @@ export default function SettingsView() {
   const prefs = useAppStore((s) => s.prefs);
   const setPrefs = useAppStore((s) => s.setPrefs);
   const [dataDir, setDataDir] = useState("");
+  const [logsDir, setLogsDir] = useState("");
+  const [diagPath, setDiagPath] = useState("");
+  const [diagBusy, setDiagBusy] = useState(false);
   const [backupMsg, setBackupMsg] = useState("");
   // 默认不导出明文 Key；勾选后才写进备份文件
   const [includeKeys, setIncludeKeys] = useState(false);
@@ -31,7 +35,22 @@ export default function SettingsView() {
       .getAppDataDir()
       .then(setDataDir)
       .catch(() => undefined);
+    api
+      .getLogsDir()
+      .then(setLogsDir)
+      .catch(() => undefined);
   }, [loaded, refresh]);
+
+  const doExportDiagnostics = async () => {
+    setDiagBusy(true);
+    try {
+      setDiagPath(await api.exportDiagnostics());
+    } catch (e) {
+      toast(`导出诊断包失败：${String(e)}`, "error");
+    } finally {
+      setDiagBusy(false);
+    }
+  };
 
   const closeDialog = () => {
     setDialogOpen(false);
@@ -194,6 +213,50 @@ export default function SettingsView() {
           <ThinkingSection key={thinkingKey} />
 
           <NetworkSection />
+
+          <section>
+            <h2 className="mb-4 text-lg font-semibold">诊断日志</h2>
+            <div className="space-y-3 rounded-[var(--radius-card)] border border-theme p-4">
+              <div className="flex items-center justify-between text-sm">
+                <span className="text-secondary">日志目录</span>
+                <span className="max-w-[60%] truncate text-xs text-tertiary">
+                  {logsDir}
+                </span>
+              </div>
+              <p className="text-xs leading-relaxed text-tertiary">
+                诊断包包含近 7
+                天日志、应用版本与系统信息、服务商元信息与设置项；
+                不含图片、提示词与任何 API Key。日志里可能带上游返回的错误信息，
+                分享前请自行确认。
+              </p>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  onClick={() => doExportDiagnostics().catch(() => undefined)}
+                  disabled={diagBusy}
+                  className="rounded-[8px] border border-theme px-3 py-1.5 text-xs transition-opacity disabled:opacity-50"
+                >
+                  {diagBusy ? "打包中…" : "导出诊断包"}
+                </button>
+                {diagPath && (
+                  <>
+                    <button
+                      onClick={() =>
+                        revealItemInDir(diagPath).catch((e) =>
+                          toast(`打开目录失败：${String(e)}`, "error"),
+                        )
+                      }
+                      className="rounded-[8px] border border-theme px-3 py-1.5 text-xs"
+                    >
+                      打开所在目录
+                    </button>
+                    <span className="w-full truncate text-xs text-tertiary">
+                      已导出：{diagPath}
+                    </span>
+                  </>
+                )}
+              </div>
+            </div>
+          </section>
 
           <section>
             <h2 className="mb-4 text-lg font-semibold">数据备份</h2>
