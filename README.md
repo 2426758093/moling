@@ -12,10 +12,13 @@
 - **图像编辑**：局部重绘（涂抹蒙版）、AI 消除、扩图，结果自动回流对话
 - **提示词助手**：场景模板库、灵感骰子、图片反推
 - **服务商接入**：OpenAI 兼容接口 / 自定义占位符模板 / Mock 调试适配器；Key 本地 AES-256-GCM 加密存储
+- **多 Key 与代理**：单个服务商可挂多个 Key，401 自动切换并标记失效（403 只切换）；代理支持跟随系统 / 直连 / 手动，切换无需重启
 - **画廊**：生成记录、缩略图列表、按模型 / 风格 / 收藏筛选、复用参数、批量打包导出（含参数 JSON）
+- **批量队列**：一键把当前参数加入队列，串行执行、逐条取消 / 重试；重启后未完成任务标为中断且不自动重跑
 - **可取消生成**：停止按钮真正中止在途请求，已生成的图片保留
 - **双主题**：浅色 / 暗色，跟随系统，全站过渡动画
-- **数据备份**：配置与偏好一键导出/导入（默认不含明文 Key，可选包含；换机迁移）
+- **数据备份**：配置与偏好一键导出/导入（默认不含明文 Key，可选包含；支持多 Key 往返；换机迁移）
+- **诊断与更新**：按天滚动日志（保留 7 天）+ 一键导出脱敏诊断包；应用内检查 / 下载 / 安装更新（更新源待配置）
 
 ## 快速开始（Windows）
 
@@ -42,6 +45,19 @@ pnpm tauri dev       # 开发模式（热更新）
 pnpm tauri build --bundles nsis
 # 产物：src-tauri/target/release/bundle/nsis/墨灵_*_x64-setup.exe
 ```
+
+### 更新链路测试构建
+
+常规构建**不产出更新制品**（`bundle.createUpdaterArtifacts` 默认 false），因此没有签名密钥也能正常打包。要验证应用内更新，用测试配置覆盖一次：
+
+```bash
+# 私钥放仓库外，构建时通过环境变量提供
+export TAURI_SIGNING_PRIVATE_KEY="$USERPROFILE/.moling-updater-test/moling-test.key"
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="<测试口令>"
+pnpm tauri build --bundles nsis --config src-tauri/tauri.updater-test.conf.json
+```
+
+测试配置把更新端点指向 `http://127.0.0.1:8787/latest.json`。完整验收步骤（生成密钥对、本地清单服务、篡改包必须被拒）见[开发规范](墨灵_开发规范.md)「七、测试与质量门禁 → 更新链路本地验收」。
 
 ## 技术栈
 
@@ -72,11 +88,13 @@ CI（`.github/workflows/ci.yml`）在 Windows 上执行同一组门禁，并对�
 ```
 start.bat / stop.bat  一键启停入口（薄包装，逻辑在 scripts/）
 scripts/              启停脚本（PowerShell 5.1）：前置检查、后台启动、pid/日志、进程树回收
-src/                  React 前端（components / stores / lib）
+src/                  React 前端（components / stores / lib；含 QueueView 与设置页分段组件）
 src-tauri/src/        Rust 后端
-  adapters/           适配器协议与实现（openai / template / mock / chat）
-  commands/           Tauri 命令（mod / providers / settings / image / thinking / chat）
+  adapters/           适配器协议与实现（openai / template / mock / chat / http）
+  commands/           Tauri 命令（providers / network / settings / image / queue / chat / thinking / diagnostics / update）
   storage.rs          SQLite 存储与 Key 加密（AES-256-GCM）
+  key_pool.rs         多 Key 候选序列、失效标记与切换
+  logging.rs          按天滚动日志与 7 天保留
   image_store.rs      图片落盘、base64 富化与旧数据惰性迁移
   error.rs            统一错误类型与前端可解析的错误码
   paths.rs            应用数据目录解析

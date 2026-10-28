@@ -129,3 +129,31 @@ async fn download_and_install(app: &AppHandle) -> Result<(), String> {
             format!("安装更新失败: {e}")
         })
 }
+
+#[cfg(test)]
+mod tests {
+    fn plugin_config_of(raw: &str) -> tauri_plugin_updater::Config {
+        let root: serde_json::Value = serde_json::from_str(raw).expect("有效 JSON");
+        serde_json::from_value(root["plugins"]["updater"].clone()).expect("插件配置能反序列化")
+    }
+
+    /// 配置写错会让应用启动即失败（插件初始化时解析），因此在门禁里先验一遍
+    #[test]
+    fn shipped_updater_config_parses_and_stays_offline() {
+        let cfg = plugin_config_of(include_str!("../../tauri.conf.json"));
+        assert!(cfg.endpoints.is_empty(), "基础配置不得内置更新端点");
+        assert!(!cfg.pubkey.is_empty(), "pubkey 是必填项");
+        assert!(!cfg.dangerous_insecure_transport_protocol);
+    }
+
+    #[test]
+    fn updater_test_config_points_at_localhost() {
+        let cfg = plugin_config_of(include_str!("../../tauri.updater-test.conf.json"));
+        assert_eq!(cfg.endpoints.len(), 1);
+        assert_eq!(
+            cfg.endpoints[0].as_str(),
+            "http://127.0.0.1:8787/latest.json"
+        );
+        assert!(cfg.dangerous_insecure_transport_protocol);
+    }
+}

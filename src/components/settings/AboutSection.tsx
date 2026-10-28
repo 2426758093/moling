@@ -132,7 +132,7 @@ export default function AboutSection() {
 
         {progress && (
           <div className="space-y-1">
-            <div className="h-1.5 overflow-hidden rounded-full bg-black/10">
+            <div className="h-1 overflow-hidden rounded-full bg-sunken">
               <div
                 className="h-full rounded-full bg-accent transition-[width] duration-200"
                 style={{ width: `${percent ?? 5}%` }}
