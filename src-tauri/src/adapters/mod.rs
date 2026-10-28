@@ -1,4 +1,5 @@
 pub mod chat;
+pub mod http;
 pub mod mock;
 pub mod openai;
 pub mod template;
@@ -6,7 +7,7 @@ pub mod template;
 mod tests;
 
 use serde::{Deserialize, Serialize};
-use std::sync::OnceLock;
+use std::sync::Arc;
 
 /// provider kind 常量（serde/DB 中的字符串值冻结：mock/template/openai）
 pub const KIND_MOCK: &str = "mock";
@@ -62,18 +63,33 @@ pub struct ProviderConfig {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AdapterError {
-    AuthInvalid { message: String },
-    QuotaExceeded { message: String },
-    Timeout { message: String },
-    ContentBlocked { message: String },
-    Network { message: String },
-    Other { message: String },
+    AuthInvalid {
+        message: String,
+        /// HTTP 状态码：401 可判定 Key 失效并长期跳过；403 多为权限不足，只切换不标记
+        #[serde(default)]
+        status: u16,
+    },
+    QuotaExceeded {
+        message: String,
+    },
+    Timeout {
+        message: String,
+    },
+    ContentBlocked {
+        message: String,
+    },
+    Network {
+        message: String,
+    },
+    Other {
+        message: String,
+    },
 }
 
 impl AdapterError {
     pub fn message(&self) -> &str {
         match self {
-            AdapterError::AuthInvalid { message }
+            AdapterError::AuthInvalid { message, .. }
             | AdapterError::QuotaExceeded { message }
             | AdapterError::Timeout { message }
             | AdapterError::ContentBlocked { message }
@@ -128,21 +144,19 @@ pub fn adapter_error_json(e: AdapterError) -> String {
     serde_json::to_string(&e).unwrap_or_else(|_| e.message().to_string())
 }
 
-/// 全局共享 reqwest Client（连接池/TLS 会话复用，P5）；超时在各请求级单独设置
-static HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-
-pub(crate) fn http_client() -> &'static reqwest::Client {
-    HTTP_CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
-    })
+/// 全局共享 reqwest Client（连接池/TLS 会话复用，P5）；超时在各请求级单独设置。
+/// 返回 `Arc` 让调用方在读锁外持有客户端，代理热切换不会中断在途请求。
+pub(crate) fn http_client() -> Arc<reqwest::Client> {
+    http::current_client()
 }
 
 pub fn classify_http(status: reqwest::StatusCode, body: &str) -> AdapterError {
     let truncated: String = body.chars().take(ERROR_BODY_TRUNCATE_LEN).collect();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-        AdapterError::AuthInvalid { message: truncated }
+        AdapterError::AuthInvalid {
+            message: truncated,
+            status: status.as_u16(),
+        }
     } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS
         || status == reqwest::StatusCode::PAYMENT_REQUIRED
         || status.as_u16() == 402

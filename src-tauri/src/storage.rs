@@ -46,6 +46,41 @@ pub struct ProviderRow {
     pub key_error: bool,
 }
 
+/// 服务商 Key 列表中的一项。整组以 JSON 加密存于 `providers.api_keys_enc`；
+/// `api_key_enc` 始终镜像首项，兼容旧代码/旧备份/思考模型复用路径。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderKey {
+    pub key: String,
+    #[serde(default)]
+    pub invalid: bool,
+    #[serde(default)]
+    pub invalid_at: Option<String>,
+}
+
+impl ProviderKey {
+    pub fn new(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            invalid: false,
+            invalid_at: None,
+        }
+    }
+
+    /// 备份恢复用：保留失效标记，时间戳记为导入时刻
+    pub fn restored(key: impl Into<String>, invalid: bool) -> Self {
+        Self {
+            key: key.into(),
+            invalid,
+            invalid_at: if invalid {
+                Some(timestamp_millis())
+            } else {
+                None
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryRow {
@@ -141,8 +176,18 @@ const INDEXES_SQL: &str = "
         CREATE INDEX IF NOT EXISTS idx_history_model ON history(model);
 ";
 
+/// 迁移 003：多 Key 列表密文。`api_key_enc` 保留为首 Key 的镜像列，
+/// 存量单 Key 由 `backfill_provider_keys` 在迁移后幂等回填。
+const PROVIDER_KEYS_SQL: &str = "
+        ALTER TABLE providers ADD COLUMN api_keys_enc TEXT NOT NULL DEFAULT '';
+";
+
 /// (名称, SQL)，按顺序执行；`PRAGMA user_version` 记录已应用到的序号（从 1 起）。
-const MIGRATIONS: &[(&str, &str)] = &[("001_tables", SCHEMA_SQL), ("002_indexes", INDEXES_SQL)];
+const MIGRATIONS: &[(&str, &str)] = &[
+    ("001_tables", SCHEMA_SQL),
+    ("002_indexes", INDEXES_SQL),
+    ("003_provider_keys", PROVIDER_KEYS_SQL),
+];
 
 /// 当前 schema 版本 = 迁移条数
 const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -166,7 +211,60 @@ pub(crate) fn open_and_migrate(db_path: &std::path::Path) -> AppResult<Connectio
         backup_before_migration(db_path);
     }
     apply_migrations(&mut conn)?;
+    backfill_provider_keys(&conn);
     Ok(conn)
+}
+
+/// 把存量单 Key 回填成 Key 列表（迁移 003 之后执行）。
+/// 解密失败的行走跳过并留日志，下次启动重试；回填失败绝不阻断启动。
+fn backfill_provider_keys(conn: &Connection) {
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = match conn.prepare(
+            "SELECT id, api_key_enc FROM providers WHERE api_keys_enc = '' AND api_key_enc <> ''",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("多 Key 回填查询失败: {e}");
+                return;
+            }
+        };
+        let collected = match stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect::<Vec<_>>(),
+            Err(e) => {
+                tracing::warn!("多 Key 回填读取失败: {e}");
+                return;
+            }
+        };
+        collected
+    };
+    for (id, legacy_enc) in rows {
+        let key = match decrypt_secret(&legacy_enc) {
+            Ok(k) if !k.is_empty() => k,
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::warn!("服务商 id={id} 的旧 Key 解密失败，暂不参与多 Key 回填: {e}");
+                continue;
+            }
+        };
+        let json = match serde_json::to_string(&[ProviderKey::new(key)]) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("服务商 id={id} 的 Key 列表序列化失败: {e}");
+                continue;
+            }
+        };
+        match encrypt_secret(&json) {
+            Ok(enc) => {
+                if let Err(e) = conn.execute(
+                    "UPDATE providers SET api_keys_enc = ?1 WHERE id = ?2 AND api_keys_enc = ''",
+                    params![enc, id],
+                ) {
+                    tracing::warn!("服务商 id={id} 多 Key 回填写入失败: {e}");
+                }
+            }
+            Err(e) => tracing::warn!("服务商 id={id} 的 Key 列表加密失败: {e}"),
+        }
+    }
 }
 
 fn current_version(conn: &Connection) -> AppResult<i64> {
@@ -375,19 +473,18 @@ fn row_to_provider(row: &rusqlite::Row) -> rusqlite::Result<ProviderRow> {
 
 pub fn save_provider(id: Option<i64>, draft: &ProviderDraft) -> AppResult<ProviderRow> {
     let id = {
-        let c = conn()?;
-        match id {
+        // 元数据与 Key 列表同事务写入：避免「编辑资料 + 换主 Key」中途失败留下两列不一致
+        let mut c = conn()?;
+        let tx = c.transaction()?;
+        let id = match id {
             Some(existing) => {
-                let enc = draft.api_key.map(encrypt_secret).transpose()?;
-                // 单条 UPDATE：未提供新 Key 时 enc 为 NULL，COALESCE 保留旧密文
-                c.execute(
-                    "UPDATE providers SET name=?1, base_url=?2, api_key_enc=COALESCE(?3, api_key_enc),
-                     kind=?4, models_json=?5, default_model=?6, timeout_secs=?7, template_url=?8,
-                     template_body=?9, template_response_path=?10 WHERE id=?11",
+                let n = tx.execute(
+                    "UPDATE providers SET name=?1, base_url=?2, kind=?3, models_json=?4,
+                     default_model=?5, timeout_secs=?6, template_url=?7, template_body=?8,
+                     template_response_path=?9 WHERE id=?10",
                     params![
                         draft.name,
                         draft.base_url,
-                        enc,
                         draft.kind,
                         draft.models_json,
                         draft.default_model,
@@ -398,11 +495,15 @@ pub fn save_provider(id: Option<i64>, draft: &ProviderDraft) -> AppResult<Provid
                         existing
                     ],
                 )?;
+                if n == 0 {
+                    return Err(AppError::NotFound(format!("服务商 #{existing} 不存在")));
+                }
                 existing
             }
             None => {
-                let enc = encrypt_secret(draft.api_key.unwrap_or(""))?;
-                c.execute(
+                // Key 统一由下面的 replace_first 逻辑写两列，这里先落空密文
+                let enc = encrypt_secret("")?;
+                tx.execute(
                     "INSERT INTO providers (name, base_url, api_key_enc, kind, models_json,
                      default_model, timeout_secs, template_url, template_body, template_response_path)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
@@ -419,9 +520,30 @@ pub fn save_provider(id: Option<i64>, draft: &ProviderDraft) -> AppResult<Provid
                         draft.template_response_path
                     ],
                 )?;
-                c.last_insert_rowid()
+                tx.last_insert_rowid()
             }
+        };
+        // 未填新 Key 时保持整组 Key 与密文原样，避免解密失败的旧数据在纯改资料时被清空
+        if let Some(new_key) = draft.api_key {
+            let (keys_enc, legacy_enc): (String, String) = tx.query_row(
+                "SELECT api_keys_enc, api_key_enc FROM providers WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            // 主密钥变化后旧密文解不开：按用户新填的 Key 重建列表，而不是让保存失败
+            let mut keys = decode_keys(&keys_enc, &legacy_enc).unwrap_or_else(|e| {
+                tracing::warn!("保存服务商时旧 Key 解密失败，按新 Key 重建列表: {e}");
+                Vec::new()
+            });
+            if keys.is_empty() {
+                keys.push(ProviderKey::new(new_key));
+            } else {
+                keys[0] = ProviderKey::new(new_key);
+            }
+            write_keys_tx(&tx, id, &keys)?;
         }
+        tx.commit()?;
+        id
     };
     get_provider(id)?.ok_or_else(|| AppError::NotFound("provider not found after save".into()))
 }
@@ -451,6 +573,124 @@ pub fn list_providers() -> AppResult<Vec<ProviderRow>> {
 pub fn delete_provider(id: i64) -> AppResult<()> {
     conn()?.execute("DELETE FROM providers WHERE id = ?1", params![id])?;
     Ok(())
+}
+
+/// 优先读 Key 列表密文；为空时回退旧单 Key 列（迁移回填完成前/旧备份导入后）。
+fn decode_keys(keys_enc: &str, legacy_enc: &str) -> AppResult<Vec<ProviderKey>> {
+    if !keys_enc.trim().is_empty() {
+        let plain = decrypt_secret(keys_enc)?;
+        let mut keys: Vec<ProviderKey> = serde_json::from_str(&plain)
+            .map_err(|e| AppError::Crypto(format!("Key 列表解析失败: {e}")))?;
+        keys.retain(|k| !k.key.trim().is_empty());
+        return Ok(keys);
+    }
+    if legacy_enc.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let key = decrypt_secret(legacy_enc)?;
+    Ok(if key.trim().is_empty() {
+        Vec::new()
+    } else {
+        vec![ProviderKey::new(key)]
+    })
+}
+
+/// 返回 (Key 列表密文, 首 Key 密文)；空列表两列都写空串。
+fn encode_keys(keys: &[ProviderKey]) -> AppResult<(String, String)> {
+    if keys.is_empty() {
+        return Ok((String::new(), String::new()));
+    }
+    let json = serde_json::to_string(keys).map_err(|e| AppError::Other(e.to_string()))?;
+    Ok((encrypt_secret(&json)?, encrypt_secret(&keys[0].key)?))
+}
+
+fn write_keys_tx(tx: &rusqlite::Transaction<'_>, id: i64, keys: &[ProviderKey]) -> AppResult<()> {
+    let (keys_enc, first_enc) = encode_keys(keys)?;
+    let n = tx.execute(
+        "UPDATE providers SET api_keys_enc = ?1, api_key_enc = ?2 WHERE id = ?3",
+        params![keys_enc, first_enc, id],
+    )?;
+    if n == 0 {
+        return Err(AppError::NotFound(format!("服务商 #{id} 不存在")));
+    }
+    Ok(())
+}
+
+pub fn load_provider_keys(id: i64) -> AppResult<Vec<ProviderKey>> {
+    let c = conn()?;
+    let (keys_enc, legacy_enc): (String, String) = c
+        .query_row(
+            "SELECT api_keys_enc, api_key_enc FROM providers WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| AppError::NotFound(format!("服务商 #{id} 不存在")))?;
+    decode_keys(&keys_enc, &legacy_enc)
+}
+
+/// 读 → 改 → 写在同一事务内，避免并发生成标记失效与 UI 增删 Key 互相覆盖。
+fn mutate_keys<F>(id: i64, f: F) -> AppResult<Vec<ProviderKey>>
+where
+    F: FnOnce(&mut Vec<ProviderKey>) -> AppResult<()>,
+{
+    let mut c = conn()?;
+    let tx = c.transaction()?;
+    let (keys_enc, legacy_enc): (String, String) = tx
+        .query_row(
+            "SELECT api_keys_enc, api_key_enc FROM providers WHERE id = ?1",
+            params![id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| AppError::NotFound(format!("服务商 #{id} 不存在")))?;
+    let mut keys = decode_keys(&keys_enc, &legacy_enc)?;
+    f(&mut keys)?;
+    write_keys_tx(&tx, id, &keys)?;
+    tx.commit()?;
+    Ok(keys)
+}
+
+pub fn add_provider_key(id: i64, key: &str) -> AppResult<()> {
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(AppError::Other("Key 不能为空".into()));
+    }
+    mutate_keys(id, |keys| {
+        if keys.iter().any(|k| k.key == key) {
+            return Err(AppError::Other("该 Key 已存在".into()));
+        }
+        keys.push(ProviderKey::new(key));
+        Ok(())
+    })
+    .map(|_| ())
+}
+
+pub fn delete_provider_key(id: i64, index: usize) -> AppResult<()> {
+    mutate_keys(id, |keys| {
+        if index >= keys.len() {
+            return Err(AppError::NotFound("Key 序号不存在".into()));
+        }
+        keys.remove(index);
+        Ok(())
+    })
+    .map(|_| ())
+}
+
+/// 标记/恢复单个 Key 的失效状态；序号越界时静默忽略（轮换与删除存在竞态）。
+pub fn mark_key_invalid(id: i64, index: usize, invalid: bool) -> AppResult<()> {
+    mutate_keys(id, |keys| {
+        if let Some(key) = keys.get_mut(index) {
+            key.invalid = invalid;
+            key.invalid_at = if invalid {
+                Some(timestamp_millis())
+            } else {
+                None
+            };
+        }
+        Ok(())
+    })
+    .map(|_| ())
 }
 
 pub fn set_setting(key: &str, value: &str) -> AppResult<()> {
@@ -550,6 +790,68 @@ fn validate_import_templates(value: &serde_json::Value) -> AppResult<()> {
     Ok(())
 }
 
+/// v3 Key 列表与失效标记的格式校验，与其余导入校验一样在事务与 DELETE 之前执行。
+fn validate_import_keys(providers: &[serde_json::Value], version: u64) -> AppResult<()> {
+    if version < 3 {
+        return Ok(());
+    }
+    for p in providers {
+        if let Some(keys) = p.get("apiKeys") {
+            let list = keys
+                .as_array()
+                .ok_or_else(|| invalid_import("apiKeys 必须是数组"))?;
+            if list.iter().any(|k| !k.is_string()) {
+                return Err(invalid_import("apiKeys 只能包含字符串"));
+            }
+        }
+        if let Some(indexes) = p.get("invalidKeyIndexes") {
+            let list = indexes
+                .as_array()
+                .ok_or_else(|| invalid_import("invalidKeyIndexes 必须是数组"))?;
+            if list.iter().any(|v| v.as_u64().is_none()) {
+                return Err(invalid_import("invalidKeyIndexes 只能包含整数"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 从导入项取出整组 Key：优先 v3 `apiKeys`，兼容 v1/v2 单个 `apiKey`。
+/// 失效标记按 `apiKeys` 原始下标给出，过滤空串后下标仍对应原数组。
+fn import_keys(p: &serde_json::Value) -> Vec<ProviderKey> {
+    let invalid: HashSet<usize> = p
+        .get("invalidKeyIndexes")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_u64())
+                .map(|n| n as usize)
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut keys = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |key: &str, index: usize| {
+        let key = key.trim();
+        if !key.is_empty() && seen.insert(key.to_string()) {
+            keys.push(ProviderKey::restored(key, invalid.contains(&index)));
+        }
+    };
+    match p.get("apiKeys").and_then(|v| v.as_array()) {
+        Some(list) => {
+            for (i, v) in list.iter().enumerate() {
+                push(v.as_str().unwrap_or_default(), i);
+            }
+        }
+        None => {
+            if let Some(single) = p.get("apiKey").and_then(|v| v.as_str()) {
+                push(single, 0);
+            }
+        }
+    }
+    keys
+}
+
 fn validate_import_thinking(value: &serde_json::Value) -> AppResult<()> {
     let obj = value
         .as_object()
@@ -575,6 +877,77 @@ fn validate_import_thinking(value: &serde_json::Value) -> AppResult<()> {
             return Err(invalid_import("思考模型配置字段类型非法"));
         }
     }
+    Ok(())
+}
+
+/// v3 代理配置校验：只接受非密钥字段，手动代理必须带可解析的 http(s) 地址。
+fn validate_import_network(value: &serde_json::Value) -> AppResult<()> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| invalid_import("network 必须是对象"))?;
+    let mode = obj.get("mode").and_then(|v| v.as_str()).unwrap_or("system");
+    if !matches!(mode, "system" | "direct" | "manual") {
+        return Err(invalid_import("代理模式只能是 system/direct/manual"));
+    }
+    for key in ["url", "noProxy"] {
+        if obj.get(key).is_some_and(|v| !v.is_string()) {
+            return Err(invalid_import("代理配置字段类型非法"));
+        }
+    }
+    if mode == "manual" {
+        let url = obj
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .trim();
+        let parsed = reqwest::Url::parse(url).map_err(|_| invalid_import("代理地址无效"))?;
+        let has_host = !parsed.host_str().unwrap_or_default().is_empty();
+        if !matches!(parsed.scheme(), "http" | "https") || !has_host {
+            return Err(invalid_import("代理地址无效"));
+        }
+    }
+    Ok(())
+}
+
+/// 写入导入的代理配置：密码/用户名不随备份走，代理地址未变时沿用本机凭据，
+/// 换地址则清空，避免把旧密码发到新代理上。
+fn import_network(tx: &rusqlite::Transaction<'_>, value: &serde_json::Value) -> AppResult<()> {
+    use crate::adapters::http::{ProxyConfig, PROXY_SETTING_KEY};
+    let obj = value.as_object().expect("代理配置已在事务前校验为对象");
+    let url = obj.get("url").and_then(|v| v.as_str()).unwrap_or_default();
+    let old = tx
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![PROXY_SETTING_KEY],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .map(|raw| ProxyConfig::from_stored(Some(&raw)))
+        .filter(|cfg| cfg.url == url);
+    let cfg = ProxyConfig {
+        mode: obj
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("system")
+            .to_string(),
+        url: url.to_string(),
+        username: old.as_ref().map(|o| o.username.clone()).unwrap_or_default(),
+        password_enc: old
+            .as_ref()
+            .map(|o| o.password_enc.clone())
+            .unwrap_or_default(),
+        no_proxy: obj
+            .get("noProxy")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+    };
+    let json = serde_json::to_string(&cfg).map_err(|e| AppError::Other(e.to_string()))?;
+    tx.execute(
+        "INSERT INTO settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![PROXY_SETTING_KEY, json],
+    )?;
     Ok(())
 }
 
@@ -610,16 +983,23 @@ fn import_config_in(c: &mut Connection, data: &serde_json::Value) -> AppResult<u
     if let Some(t) = thinking {
         validate_import_thinking(t)?;
     }
+    validate_import_keys(providers, version)?;
+    if version >= 3 {
+        if let Some(net) = data.get("network") {
+            validate_import_network(net)?;
+        }
+    }
 
     let tx = c.transaction()?;
-    // v2 默认不导出明文 Key：删除前记录旧密文，导入项 apiKey 为空且
+    // v2/v3 默认不导出明文 Key：删除前记录旧密文，导入项无 Key 且
     // name+baseUrl 一致时复用，避免「不含 Key 的备份」在换机/回滚时清空密钥。
-    let old_keys: HashMap<(String, String), String> = {
-        let mut stmt = tx.prepare("SELECT name, base_url, api_key_enc FROM providers")?;
+    let old_keys: HashMap<(String, String), (String, String)> = {
+        let mut stmt =
+            tx.prepare("SELECT name, base_url, api_keys_enc, api_key_enc FROM providers")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 (r.get::<_, String>(0)?, r.get::<_, String>(1)?),
-                r.get::<_, String>(2)?,
+                (r.get::<_, String>(2)?, r.get::<_, String>(3)?),
             ))
         })?;
         rows.collect::<Result<Vec<_>, _>>()?.into_iter().collect()
@@ -667,23 +1047,25 @@ fn import_config_in(c: &mut Connection, data: &serde_json::Value) -> AppResult<u
         };
         let name = get("name");
         let base_url = get("baseUrl");
-        let api_key = get("apiKey");
-        let enc = if api_key.trim().is_empty() {
+        // v3 带整组 Key；v1/v2 只有单个 apiKey；都没有时沿用本机旧密文（含整组列表）
+        let keys = import_keys(p);
+        let (keys_enc, enc) = if keys.is_empty() {
             match old_keys.get(&(name.clone(), base_url.clone())) {
-                Some(old_enc) => old_enc.clone(),
-                None => encrypt_secret("")?,
+                Some((old_keys_enc, old_enc)) => (old_keys_enc.clone(), old_enc.clone()),
+                None => (String::new(), encrypt_secret("")?),
             }
         } else {
-            encrypt_secret(&api_key)?
+            encode_keys(&keys)?
         };
         tx.execute(
-            "INSERT INTO providers (name, base_url, api_key_enc, kind, models_json,
+            "INSERT INTO providers (name, base_url, api_key_enc, api_keys_enc, kind, models_json,
              default_model, timeout_secs, template_url, template_body, template_response_path)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
             params![
                 name,
                 base_url,
                 enc,
+                keys_enc,
                 get("kind"),
                 get("modelsJson"),
                 get("defaultModel"),
@@ -770,6 +1152,12 @@ fn import_config_in(c: &mut Connection, data: &serde_json::Value) -> AppResult<u
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![value.to_string()],
         )?;
+    }
+    // v3 备份携带代理的非密钥字段；密码与用户名留在本机
+    if version >= 3 {
+        if let Some(net) = data.get("network") {
+            import_network(&tx, net)?;
+        }
     }
     tx.commit()?;
     Ok(providers.len())
@@ -1969,5 +2357,183 @@ mod tests {
             Some(r"C:\data\images\solo.png"),
             "返回值必须是原始路径，不能被归一化改写"
         );
+    }
+
+    /// C2：迁移 003 之后把存量单 Key 幂等回填成 Key 列表
+    #[test]
+    fn backfill_moves_legacy_key_into_list() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(MASTER_KEY_ENV, "cc".repeat(32));
+        let c = mem_conn();
+        let enc = encrypt_secret("sk-legacy").expect("encrypt");
+        c.execute(
+            "INSERT INTO providers (name, base_url, api_key_enc) VALUES ('旧', '', ?1)",
+            params![enc],
+        )
+        .unwrap();
+        let id = c.last_insert_rowid();
+
+        backfill_provider_keys(&c);
+        let read = |c: &Connection| -> Vec<ProviderKey> {
+            let (keys_enc, legacy): (String, String) = c
+                .query_row(
+                    "SELECT api_keys_enc, api_key_enc FROM providers WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            decode_keys(&keys_enc, &legacy).expect("decode keys")
+        };
+        let keys = read(&c);
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "sk-legacy");
+        assert!(!keys[0].invalid);
+
+        // 幂等：再跑一次不会重复追加
+        backfill_provider_keys(&c);
+        assert_eq!(read(&c).len(), 1);
+        std::env::remove_var(MASTER_KEY_ENV);
+    }
+
+    /// C2：写 Key 列表时 `api_key_enc` 必须镜像首 Key（旧代码/思考模型复用路径依赖它）
+    #[test]
+    fn key_list_write_mirrors_first_key() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(MASTER_KEY_ENV, "dd".repeat(32));
+        let mut c = mem_conn();
+        let enc = encrypt_secret("").unwrap();
+        c.execute(
+            "INSERT INTO providers (name, base_url, api_key_enc) VALUES ('P', '', ?1)",
+            params![enc],
+        )
+        .unwrap();
+        let id = c.last_insert_rowid();
+        {
+            let tx = c.transaction().unwrap();
+            write_keys_tx(&tx, id, &[ProviderKey::new("k1"), ProviderKey::new("k2")]).unwrap();
+            tx.commit().unwrap();
+        }
+        let (keys_enc, first): (String, String) = c
+            .query_row(
+                "SELECT api_keys_enc, api_key_enc FROM providers WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(decrypt_secret(&first).unwrap(), "k1");
+        assert!(!keys_enc.contains("k1"), "Key 列表必须整体加密");
+        let decoded = decode_keys(&keys_enc, &first).unwrap();
+        assert_eq!(
+            decoded.iter().map(|k| k.key.as_str()).collect::<Vec<_>>(),
+            vec!["k1", "k2"]
+        );
+        std::env::remove_var(MASTER_KEY_ENV);
+    }
+
+    /// C2：v3 备份导入恢复整组 Key 与失效状态；不含 Key 的备份沿用本机整组密文
+    #[test]
+    fn import_v3_roundtrip_keeps_keys_and_invalid_state() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(MASTER_KEY_ENV, "ee".repeat(32));
+        let mut c = mem_conn();
+        let provider = |keys: serde_json::Value, invalid: serde_json::Value| {
+            serde_json::json!({
+                "name": "P",
+                "baseUrl": "https://api.example.com",
+                "kind": "openai",
+                "hasKeys": 3,
+                "apiKeys": keys,
+                "invalidKeyIndexes": invalid,
+                "modelsJson": "[\"m1\"]",
+                "defaultModel": "m1",
+                "timeoutSecs": 30,
+                "templateUrl": "",
+                "templateBody": "",
+                "templateResponsePath": "",
+            })
+        };
+        let data = serde_json::json!({
+            "version": 3,
+            "providers": [provider(
+                serde_json::json!(["sk-a", "sk-b", "sk-c"]),
+                serde_json::json!([1]),
+            )],
+            "settings": {},
+            "network": {
+                "mode": "manual",
+                "url": "http://127.0.0.1:7890",
+                "noProxy": "localhost",
+            },
+        });
+        import_config_in(&mut c, &data).expect("import v3");
+
+        let read_keys = |c: &Connection| -> Vec<ProviderKey> {
+            let (keys_enc, first): (String, String) = c
+                .query_row("SELECT api_keys_enc, api_key_enc FROM providers", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            decode_keys(&keys_enc, &first).expect("decode keys")
+        };
+        let keys = read_keys(&c);
+        assert_eq!(
+            keys.iter().map(|k| k.key.as_str()).collect::<Vec<_>>(),
+            vec!["sk-a", "sk-b", "sk-c"]
+        );
+        assert!(!keys[0].invalid);
+        assert!(keys[1].invalid, "失效下标必须随备份恢复");
+        assert!(!keys[2].invalid);
+
+        // 代理只恢复非密钥字段，密码永远不来自备份
+        let net: serde_json::Value =
+            serde_json::from_str(&setting_of(&c, "networkProxy").expect("networkProxy")).unwrap();
+        assert_eq!(net["mode"], "manual");
+        assert_eq!(net["url"], "http://127.0.0.1:7890");
+        assert_eq!(net["noProxy"], "localhost");
+        assert_eq!(net["passwordEnc"], "");
+
+        // includeKeys=false 的备份（apiKeys 为空）：按 name+baseUrl 复用本机整组 Key
+        let no_keys = serde_json::json!({
+            "version": 3,
+            "providers": [provider(serde_json::json!([]), serde_json::json!([]))],
+            "settings": {},
+        });
+        import_config_in(&mut c, &no_keys).expect("import v3 without keys");
+        let keys = read_keys(&c);
+        assert_eq!(keys.len(), 3);
+        assert!(keys[1].invalid);
+        std::env::remove_var(MASTER_KEY_ENV);
+    }
+
+    /// C2：v3 的 Key 字段类型错误必须在事务与 DELETE 之前被拒绝
+    #[test]
+    fn import_v3_rejects_bad_keys_before_touching_data() {
+        let mut c = mem_conn();
+        c.execute(
+            "INSERT INTO providers (name, base_url, api_key_enc) VALUES ('旧', '', '')",
+            [],
+        )
+        .unwrap();
+        for bad in [
+            serde_json::json!({
+                "version": 3,
+                "providers": [{ "name": "P", "baseUrl": "", "apiKeys": "oops" }],
+                "settings": {},
+            }),
+            serde_json::json!({
+                "version": 3,
+                "providers": [{ "name": "P", "baseUrl": "", "apiKeys": [], "invalidKeyIndexes": ["x"] }],
+                "settings": {},
+            }),
+            serde_json::json!({
+                "version": 3,
+                "providers": [{ "name": "P", "baseUrl": "", "apiKeys": [] }],
+                "settings": {},
+                "network": { "mode": "manual", "url": "socks5://127.0.0.1:1080" },
+            }),
+        ] {
+            import_config_in(&mut c, &bad).expect_err("非法 Key/代理配置应拒绝导入");
+            assert_eq!(count_providers(&c), 1, "拒绝时不得删除旧数据");
+        }
     }
 }

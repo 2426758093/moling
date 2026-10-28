@@ -41,7 +41,14 @@ export default function ProviderCard({
             </span>
           </div>
           <div className="mt-1 text-xs text-tertiary">
-            {p.baseUrl || "（无地址）"} · Key: {item.apiKeyMasked}
+            {p.baseUrl || "（无地址）"} ·{" "}
+            {item.keyCount > 1
+              ? `${item.keyCount} 个 Key${
+                  item.invalidKeyCount > 0
+                    ? ` · ${item.invalidKeyCount} 失效`
+                    : ""
+                }`
+              : `Key: ${item.apiKeyMasked}`}
             {p.defaultModel && ` · 默认: ${p.defaultModel}`}
           </div>
           {item.keyError && (

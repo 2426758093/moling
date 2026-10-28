@@ -6,6 +6,7 @@ import { toast } from "../lib/notify";
 import ProviderDialog from "./settings/ProviderDialog";
 import ProviderCard from "./settings/ProviderCard";
 import ThinkingSection from "./settings/ThinkingSection";
+import NetworkSection from "./settings/NetworkSection";
 
 export default function SettingsView() {
   const providers = useProviderStore((s) => s.providers);
@@ -191,6 +192,8 @@ export default function SettingsView() {
           </section>
 
           <ThinkingSection key={thinkingKey} />
+
+          <NetworkSection />
 
           <section>
             <h2 className="mb-4 text-lg font-semibold">数据备份</h2>

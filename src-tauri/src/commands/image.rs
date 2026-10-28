@@ -1,5 +1,6 @@
-use crate::adapters::{self, AdapterError, EditRequest, GenerateRequest, ProviderConfig};
+use crate::adapters::{self, AdapterError, EditRequest, GenerateRequest};
 use crate::image_store::{self, SAFE_NAME_MAX_CHARS};
+use crate::key_pool;
 use crate::storage;
 use std::sync::atomic::Ordering;
 
@@ -158,8 +159,10 @@ pub async fn generate_images(
 ) -> Result<serde_json::Value, String> {
     let row =
         storage::get_provider(input.provider_id)?.ok_or_else(|| "服务商不存在".to_string())?;
-    let config = ProviderConfig::try_from(&row)?;
-    let adapter = adapters::get_adapter(&config.kind).map_err(adapters::adapter_error_json)?;
+    let candidates = key_pool::candidates(input.provider_id)?;
+    if candidates.is_empty() {
+        return Err("该服务商还没有配置 API Key".to_string());
+    }
 
     // RA-06：注册取消 token（不传 jobId 时不注册，行为与旧版完全一致）；
     // _registration 守卫在函数退出（含出错提前返回）时自动移除 token。
@@ -196,40 +199,59 @@ pub async fn generate_images(
         },
     };
 
-    // 失败自动重试：仅 Network/Timeout 重试一次（RA-04）
+    // 失败自动重试：仅 Network/Timeout 重试一次（RA-04）；
+    // 401/403 视为该 Key 不可用，切到下一个 Key（生成请求被拒不会计费）
     let mut cancelled = false;
     let mut last_err: Option<AdapterError> = None;
     let mut images: Option<Vec<String>> = None;
-    for attempt in 0..GENERATE_MAX_ATTEMPTS {
-        // 每次生成请求发出前检查取消
-        if is_cancelled(&cancel_token) {
-            cancelled = true;
-            break;
-        }
-        match adapter.generate(&config, &req).await {
-            Ok(imgs) => {
-                images = Some(imgs);
-                break;
+    'keys: for candidate in &candidates {
+        let config = &candidate.config;
+        let adapter = match adapters::get_adapter(&config.kind) {
+            Ok(a) => a,
+            Err(e) => return Err(adapters::adapter_error_json(e)),
+        };
+        for attempt in 0..GENERATE_MAX_ATTEMPTS {
+            // 每次生成请求发出前检查取消
+            if is_cancelled(&cancel_token) {
+                cancelled = true;
+                break 'keys;
             }
-            Err(e) => {
-                // RA-04：只有瞬时错误才重试；生成非幂等且计费，
-                // 配额/鉴权/内容拦截/其他错误重试可能造成重复扣费，一律直接返回。
-                if attempt + 1 < GENERATE_MAX_ATTEMPTS && is_retryable(&e) {
+            match adapter.generate(config, &req).await {
+                Ok(imgs) => {
+                    key_pool::note_success(input.provider_id, candidate.index);
+                    images = Some(imgs);
+                    break 'keys;
+                }
+                Err(e) if key_pool::is_auth(&e) => {
+                    key_pool::note_auth_failure(input.provider_id, candidate.index, &e);
                     tracing::warn!(
-                        "generate_images 第 {} 次尝试失败，准备重试: {}",
-                        attempt + 1,
-                        e.message()
+                        "服务商「{}」第 {} 个 Key 鉴权失败，尝试下一个 Key",
+                        row.name,
+                        candidate.index + 1
                     );
                     last_err = Some(e);
-                    tokio::time::sleep(GENERATE_RETRY_BACKOFF).await;
-                    // 退避期间可能已被取消，重试前再检查一次
-                    if is_cancelled(&cancel_token) {
-                        cancelled = true;
-                        break;
-                    }
-                    continue;
+                    break;
                 }
-                return Err(adapters::adapter_error_json(e));
+                Err(e) => {
+                    // RA-04：只有瞬时错误才重试；生成非幂等且计费，
+                    // 配额/内容拦截/其他错误重试可能造成重复扣费，一律直接返回。
+                    if attempt + 1 < GENERATE_MAX_ATTEMPTS && is_retryable(&e) {
+                        tracing::warn!(
+                            "generate_images 第 {} 次尝试失败，准备重试: {}",
+                            attempt + 1,
+                            e.message()
+                        );
+                        last_err = Some(e);
+                        tokio::time::sleep(GENERATE_RETRY_BACKOFF).await;
+                        // 退避期间可能已被取消，重试前再检查一次
+                        if is_cancelled(&cancel_token) {
+                            cancelled = true;
+                            break 'keys;
+                        }
+                        continue;
+                    }
+                    return Err(adapters::adapter_error_json(e));
+                }
             }
         }
     }
@@ -274,9 +296,9 @@ pub async fn generate_images(
             });
         }
     } else if !cancelled {
-        // 未取消却没有图片：只可能是重试耗尽，返回最后一次错误
+        // 未取消却没有图片：只可能是所有 Key 均鉴权失败或重试耗尽
         return Err(adapters::adapter_error_json(
-            last_err.expect("重试耗尽必有错误"),
+            last_err.expect("无图片且未取消必有错误"),
         ));
     }
     Ok(serde_json::json!({ "images": out, "cancelled": cancelled }))
@@ -314,8 +336,11 @@ pub async fn edit_image(
     }
     let row =
         storage::get_provider(input.provider_id)?.ok_or_else(|| "服务商不存在".to_string())?;
-    let config = ProviderConfig::try_from(&row)?;
-    let adapter_prompt = if erase && config.kind == adapters::KIND_MOCK {
+    let candidates = key_pool::candidates(input.provider_id)?;
+    if candidates.is_empty() {
+        return Err("该服务商还没有配置 API Key".to_string());
+    }
+    let adapter_prompt = if erase && candidates[0].config.kind == adapters::KIND_MOCK {
         format!("[消除] {}", input.prompt)
     } else {
         input.prompt.clone()
@@ -328,11 +353,28 @@ pub async fn edit_image(
         width: input.width,
         height: input.height,
     };
-    let adapter = adapters::get_adapter(&config.kind).map_err(adapters::adapter_error_json)?;
-    let b64 = adapter
-        .edit(&config, &req)
-        .await
-        .map_err(adapters::adapter_error_json)?;
+    // 编辑同样计费，鉴权失败不重发，只换下一个 Key
+    let mut b64 = None;
+    let mut last_err: Option<AdapterError> = None;
+    for candidate in &candidates {
+        let adapter =
+            adapters::get_adapter(&candidate.config.kind).map_err(adapters::adapter_error_json)?;
+        match adapter.edit(&candidate.config, &req).await {
+            Ok(result) => {
+                key_pool::note_success(input.provider_id, candidate.index);
+                b64 = Some(result);
+                break;
+            }
+            Err(e) if key_pool::is_auth(&e) => {
+                key_pool::note_auth_failure(input.provider_id, candidate.index, &e);
+                last_err = Some(e);
+            }
+            Err(e) => return Err(adapters::adapter_error_json(e)),
+        }
+    }
+    let b64 = b64.ok_or_else(|| {
+        adapters::adapter_error_json(last_err.expect("候选列表非空时必有结果或错误"))
+    })?;
     let now = storage::timestamp_millis();
     // 统一命名：edit_ 前缀 + 纳秒 + 随机尾（旧版只到毫秒，同毫秒多张编辑会互相覆盖）
     let name = image_store::unique_name("edit_", &now, 0);
@@ -491,6 +533,7 @@ mod tests {
             (
                 AdapterError::AuthInvalid {
                     message: "x".into(),
+                    status: 401,
                 },
                 false,
             ),

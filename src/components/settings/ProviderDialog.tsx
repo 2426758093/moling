@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   api,
   EMPTY_PROVIDER,
   ProviderInput,
   ProviderItem,
+  ProviderKeyView,
 } from "../../lib/api";
 import { useProviderStore } from "../../stores/providerStore";
 import { inputCls, KIND_OPTIONS } from "./ui";
@@ -16,6 +17,8 @@ export default function ProviderDialog({
   onClose: () => void;
 }) {
   const save = useProviderStore((s) => s.save);
+  const refresh = useProviderStore((s) => s.refresh);
+  const providerId = initial?.provider.id ?? null;
   const [step, setStep] = useState(0);
   const [form, setForm] = useState<ProviderInput>(
     initial?.provider ?? EMPTY_PROVIDER,
@@ -29,6 +32,9 @@ export default function ProviderDialog({
       return [];
     }
   });
+  const [keys, setKeys] = useState<ProviderKeyView[]>(initial?.keys ?? []);
+  const [newKey, setNewKey] = useState("");
+  const [keyError, setKeyError] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -47,11 +53,60 @@ export default function ProviderDialog({
 
   const patch = (p: Partial<ProviderInput>) => setForm((f) => ({ ...f, ...p }));
 
+  const syncKeys = useCallback(
+    (list: ProviderKeyView[]) => {
+      setKeys(list);
+      // 卡片上的「N 个 Key · M 失效」依赖服务商列表，改动后一并刷新
+      void refresh();
+    },
+    [refresh],
+  );
+
+  const doAddKey = async () => {
+    if (!providerId || !newKey.trim()) return;
+    setKeyError("");
+    try {
+      const r = await api.addProviderKey(providerId, newKey.trim());
+      setNewKey("");
+      syncKeys(r.keys);
+    } catch (e) {
+      setKeyError(String(e));
+    }
+  };
+
+  const doDeleteKey = async (index: number) => {
+    if (!providerId) return;
+    setKeyError("");
+    try {
+      const r = await api.deleteProviderKey(providerId, index);
+      syncKeys(r.keys);
+    } catch (e) {
+      setKeyError(String(e));
+    }
+  };
+
+  const doResetKey = async (index: number) => {
+    if (!providerId) return;
+    setKeyError("");
+    try {
+      const r = await api.resetProviderKey(providerId, index);
+      syncKeys(r.keys);
+    } catch (e) {
+      setKeyError(String(e));
+    }
+  };
+
   const doPullModels = async () => {
     setBusy(true);
     setError("");
     try {
-      const list = await api.testModels(form);
+      // 编辑已有服务商且没输入新 Key 时走已存 Key（可能已在 Key 池里轮换），
+      // 避免用空 Key 请求导致必然的鉴权失败
+      const typed = (form.apiKey ?? "").trim();
+      const list =
+        providerId && !typed
+          ? await api.pullModels(providerId)
+          : await api.testModels(form);
       setModels(list);
       if (list.length > 0 && !form.defaultModel) {
         patch({ defaultModel: list[0] });
@@ -167,9 +222,90 @@ export default function ProviderDialog({
                   {initial?.hasKey && (
                     <div className="mt-1 text-[11px] text-tertiary">
                       出于安全考虑不回填明文 Key；留空保存即保持不变。
+                      {keys.length > 1 &&
+                        " 填写新 Key 会替换第 1 个，其余保留。"}
                     </div>
                   )}
                 </div>
+                {providerId && (
+                  <div className="rounded-[10px] border border-theme p-3">
+                    <div className="mb-2 flex items-center justify-between text-xs">
+                      <span className="text-secondary">
+                        Key 池（鉴权失败时自动切换到下一个）
+                      </span>
+                      <span className="text-tertiary">
+                        {keys.length} 个
+                        {keys.some((k) => k.invalid) &&
+                          ` · ${keys.filter((k) => k.invalid).length} 失效`}
+                      </span>
+                    </div>
+                    <div className="space-y-1.5">
+                      {keys.map((k) => (
+                        <div
+                          key={k.index}
+                          className="flex items-center justify-between gap-2 text-xs"
+                        >
+                          <span className="font-mono text-secondary">
+                            {k.index + 1}. {k.masked}
+                          </span>
+                          {k.invalid ? (
+                            <span className="rounded-full border border-danger/25 bg-danger/10 px-1.5 py-0.5 text-[10px] text-danger">
+                              已失效
+                            </span>
+                          ) : (
+                            <span className="text-[10px] text-tertiary">
+                              可用
+                            </span>
+                          )}
+                          <div className="ml-auto flex gap-1">
+                            {k.invalid && (
+                              <button
+                                onClick={() => doResetKey(k.index)}
+                                aria-label={`恢复 Key ${k.index + 1}`}
+                                className="rounded-[6px] border border-theme px-1.5 py-0.5"
+                              >
+                                恢复
+                              </button>
+                            )}
+                            <button
+                              onClick={() => doDeleteKey(k.index)}
+                              aria-label={`删除 Key ${k.index + 1}`}
+                              className="rounded-[6px] border border-theme px-1.5 py-0.5 text-danger"
+                            >
+                              删除
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                      {keys.length === 0 && (
+                        <div className="text-[11px] text-tertiary">
+                          还没有 Key，可在上方 API Key 里填写主 Key 后保存。
+                        </div>
+                      )}
+                    </div>
+                    <div className="mt-2 flex gap-2">
+                      <input
+                        className={inputCls}
+                        type="password"
+                        value={newKey}
+                        onChange={(e) => setNewKey(e.target.value)}
+                        placeholder="添加备用 Key"
+                      />
+                      <button
+                        onClick={doAddKey}
+                        disabled={!newKey.trim()}
+                        className="shrink-0 rounded-[10px] border border-theme px-3 text-xs transition-opacity disabled:opacity-50"
+                      >
+                        添加
+                      </button>
+                    </div>
+                    {keyError && (
+                      <div className="mt-1 text-[11px] text-danger">
+                        {keyError}
+                      </div>
+                    )}
+                  </div>
+                )}
               </>
             )}
             {form.kind === "template" && (

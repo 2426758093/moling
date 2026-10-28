@@ -62,7 +62,11 @@ impl ImageAdapter for MockAdapter {
             if let Some(injected) = req.prompt.strip_prefix("mock:error:") {
                 let message = format!("Mock 注入错误: {}", injected);
                 return Err(match injected {
-                    "auth" => AdapterError::AuthInvalid { message },
+                    // 注入鉴权错误按 401 处理，便于验证多 Key 轮换
+                    "auth" => AdapterError::AuthInvalid {
+                        message,
+                        status: 401,
+                    },
                     "quota" => AdapterError::QuotaExceeded { message },
                     "timeout" => AdapterError::Timeout { message },
                     "blocked" => AdapterError::ContentBlocked { message },

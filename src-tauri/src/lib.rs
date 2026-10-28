@@ -3,6 +3,7 @@ mod commands;
 mod error;
 mod image_gc;
 mod image_store;
+mod key_pool;
 mod paths;
 mod storage;
 
@@ -66,6 +67,8 @@ pub fn run() {
             init_tracing(&data_dir);
             init_storage_with_recovery(&data_dir)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            // 代理需在首个生成请求前生效；配置损坏只落日志，不阻断启动
+            adapters::http::init_from_storage();
             // 孤儿图片回收：后台执行，不阻塞首屏；内部自带失败兜底与两道安全哨兵，
             // 任何异常都只落日志，不影响启动。显式 drop 句柄 = 刻意 detach。
             std::mem::drop(tauri::async_runtime::spawn_blocking(move || {
@@ -74,8 +77,15 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::get_proxy_config,
+            commands::save_proxy_config,
+            commands::test_proxy,
             commands::save_provider,
             commands::list_providers,
+            commands::list_provider_keys,
+            commands::add_provider_key,
+            commands::delete_provider_key,
+            commands::reset_provider_key,
             commands::delete_provider,
             commands::pull_models,
             commands::test_models,

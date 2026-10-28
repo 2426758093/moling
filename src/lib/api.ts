@@ -15,16 +15,26 @@ export interface ProviderInput {
   extraParams?: string | null;
 }
 
+export interface ProviderKeyView {
+  index: number;
+  masked: string;
+  invalid: boolean;
+  invalidAt: string | null;
+}
+
 export interface ProviderItem {
   provider: ProviderInput;
   apiKeyMasked: string;
   hasKey: boolean;
   // API Key 解密失败标记（R2：密钥损坏时透出前端，禁止静默当作无 Key）
   keyError: boolean;
+  keyCount: number;
+  invalidKeyCount: number;
+  keys: ProviderKeyView[];
 }
 
 export type AdapterError =
-  | { type: "auth_invalid"; message: string }
+  | { type: "auth_invalid"; message: string; status?: number }
   | { type: "quota_exceeded"; message: string }
   | { type: "timeout"; message: string }
   | { type: "content_blocked"; message: string }
@@ -86,13 +96,37 @@ export interface GeneratedImage {
   seed: number | null;
 }
 
+export type ProxyMode = "system" | "direct" | "manual";
+
+export interface ProxyConfigView {
+  mode: ProxyMode;
+  url: string;
+  username: string;
+  hasPassword: boolean;
+  noProxy: string;
+}
+
+export interface ProxyInputPayload {
+  mode: ProxyMode;
+  url: string;
+  username: string;
+  /** null = 保持已保存密码；"" = 清除密码；其余为明文新密码 */
+  password?: string | null;
+  noProxy: string;
+}
+
 export const api = {
   saveProvider: (input: ProviderInput) =>
-    invoke<{ provider: ProviderInput; apiKeyMasked: string; hasKey: boolean }>(
-      "save_provider",
-      { input },
-    ),
+    invoke<ProviderItem>("save_provider", { input }),
   listProviders: () => invoke<{ providers: ProviderItem[] }>("list_providers"),
+  listProviderKeys: (id: number) =>
+    invoke<{ keys: ProviderKeyView[] }>("list_provider_keys", { id }),
+  addProviderKey: (id: number, key: string) =>
+    invoke<{ keys: ProviderKeyView[] }>("add_provider_key", { id, key }),
+  deleteProviderKey: (id: number, index: number) =>
+    invoke<{ keys: ProviderKeyView[] }>("delete_provider_key", { id, index }),
+  resetProviderKey: (id: number, index: number) =>
+    invoke<{ keys: ProviderKeyView[] }>("reset_provider_key", { id, index }),
   deleteProvider: (id: number) => invoke<void>("delete_provider", { id }),
   pullModels: (id: number) => invoke<string[]>("pull_models", { id }),
   testModels: (input: ProviderInput) =>
@@ -105,6 +139,16 @@ export const api = {
       // 后端返回 AdapterError 的 JSON 字符串（或裸字符串），由 parseAdapterError 兼容
       error?: string;
     }>("test_connection", { id }),
+  getProxyConfig: () => invoke<ProxyConfigView>("get_proxy_config"),
+  saveProxyConfig: (input: ProxyInputPayload) =>
+    invoke<ProxyConfigView>("save_proxy_config", { input }),
+  testProxy: (input: ProxyInputPayload, providerId: number) =>
+    invoke<{
+      ok: boolean;
+      latencyMs?: number;
+      status?: number;
+      error?: string;
+    }>("test_proxy", { input, providerId }),
   generateImages: (input: {
     providerId: number;
     prompt: string;

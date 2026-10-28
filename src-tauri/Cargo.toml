@@ -25,7 +25,10 @@ serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = [
   "json",
   "multipart",
-  "rustls-tls",
+  # 企业 MITM 代理的根证书在 Windows 证书库里，webpki 内置根会直接 TLS 失败
+  "rustls-tls-native-roots",
+  # default-features=false 会关掉系统代理；代理设置依赖它读取系统/环境代理
+  "system-proxy",
 ] }
 tokio = { version = "1", features = ["rt", "time"] }
 aes-gcm = "0.10"
