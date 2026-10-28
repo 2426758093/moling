@@ -2,6 +2,8 @@ import { useRef, useState, useCallback, useLayoutEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useChatStore } from "../stores/chatStore";
 import { useAppStore } from "../stores/appStore";
+import { useProviderStore } from "../stores/providerStore";
+import { useQueueStore } from "../stores/queueStore";
 import { RATIO_OPTIONS, STYLE_PRESETS } from "../lib/types";
 import {
   readFileAsDataUrl,
@@ -18,6 +20,7 @@ import {
   IconStop,
   IconChevron,
   IconSparkle,
+  IconQueue,
 } from "./Icons";
 import PromptAssist from "./PromptAssist";
 
@@ -76,6 +79,39 @@ export default function Composer() {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       doSend();
+    }
+  };
+
+  /// 加入队列：快照当前输入与参数，串行执行（v1 不支持参考图）
+  const doEnqueue = async () => {
+    const value = text.trim();
+    if (!value) return;
+    if (useChatStore.getState().attachments.length > 0) {
+      toast("队列暂不支持参考图，请先移除附件或直接发送", "error");
+      return;
+    }
+    const { providers, defaultProviderId } = useProviderStore.getState();
+    const provider = providers.find((p) => p.provider.id === defaultProviderId);
+    const model = provider?.provider.defaultModel;
+    if (!provider || defaultProviderId == null || !model) {
+      toast("请先在「设置」中配置绘图服务商与模型", "error");
+      return;
+    }
+    try {
+      await useQueueStore.getState().enqueue({
+        providerId: defaultProviderId,
+        prompt: value,
+        model,
+        style: prefs.style,
+        width: prefs.width,
+        height: prefs.height,
+        count: prefs.count,
+      });
+      setText("");
+      requestAnimationFrame(autoGrow);
+      toast("已加入队列");
+    } catch (e) {
+      toast(`加入队列失败：${String(e)}`, "error");
     }
   };
 
@@ -280,6 +316,20 @@ export default function Composer() {
             placeholder="描述你想要的画面…"
             className="min-w-0 flex-1 resize-none bg-transparent px-1 py-2 text-[15px] leading-snug outline-none placeholder:text-tertiary"
           />
+
+          <button
+            onClick={() => void doEnqueue()}
+            disabled={!text.trim() || sending}
+            title="加入队列（串行执行）"
+            aria-label="加入队列"
+            className={`pressable flex h-9 w-9 shrink-0 items-center justify-center rounded-full transition-colors duration-150 ${
+              text.trim() && !sending
+                ? "text-tertiary hover:bg-hover hover:text-accent"
+                : "text-tertiary opacity-40"
+            }`}
+          >
+            <IconQueue size={18} />
+          </button>
 
           {sending ? (
             <button

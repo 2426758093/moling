@@ -115,6 +115,48 @@ export interface ProxyInputPayload {
   noProxy: string;
 }
 
+export type QueueStatus =
+  "queued" | "running" | "done" | "failed" | "canceled" | "interrupted";
+
+/** 批量队列任务（后端 jobs 表整行，camelCase） */
+export interface QueueJob {
+  id: number;
+  status: QueueStatus;
+  providerId: number;
+  providerName: string;
+  model: string;
+  prompt: string;
+  negativePrompt: string;
+  style: string;
+  width: number;
+  height: number;
+  guidance: number | null;
+  steps: number | null;
+  seed: number | null;
+  count: number;
+  jobKey: string;
+  /** [{historyId, path}]，绝不包含 base64 */
+  imagesJson: string;
+  error: string | null;
+  createdAt: string;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+
+export interface EnqueueJobInput {
+  providerId: number;
+  prompt: string;
+  negativePrompt?: string | null;
+  model: string;
+  style: string;
+  width: number;
+  height: number;
+  guidance?: number | null;
+  steps?: number | null;
+  seed?: number | null;
+  count: number;
+}
+
 export const api = {
   saveProvider: (input: ProviderInput) =>
     invoke<ProviderItem>("save_provider", { input }),
@@ -242,6 +284,21 @@ export const api = {
     }),
   /// 删除单条消息（重试时清掉上一条回复）；返回是否命中
   deleteMessage: (id: number) => invoke<boolean>("delete_message", { id }),
+  /// 从消息中移除一张图片并落库；文件仅在无人引用时回收
+  removeMessageImage: (messageId: number, historyId: number) =>
+    invoke<boolean>("remove_message_image", { messageId, historyId }),
+  enqueueJob: (input: EnqueueJobInput) =>
+    invoke<QueueJob>("enqueue_job", { input }),
+  listJobs: () =>
+    invoke<{
+      jobs: QueueJob[];
+      counts: Record<string, number>;
+      paused: boolean;
+    }>("list_jobs"),
+  cancelQueueJob: (id: number) => invoke<void>("cancel_queue_job", { id }),
+  retryQueueJob: (id: number) => invoke<void>("retry_queue_job", { id }),
+  resumeQueue: () => invoke<{ paused: boolean }>("resume_queue"),
+  clearFinishedJobs: () => invoke<number>("clear_finished_jobs"),
   /// keyset 分页：不传 beforeId 取最新一页，返回按 id 升序，hasMore 表示还有更旧的消息
   listMessages: (
     conversationId: number,

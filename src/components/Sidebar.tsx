@@ -2,10 +2,12 @@ import { useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useAppStore, AppView } from "../stores/appStore";
 import { useChatStore } from "../stores/chatStore";
+import { useQueueStore } from "../stores/queueStore";
 import {
   IconPlus,
   IconChat,
   IconGrid,
+  IconQueue,
   IconGear,
   IconClose,
   IconSun,
@@ -16,6 +18,7 @@ import {
 
 const NAV_ITEMS: { id: AppView; label: string; icon: typeof IconGrid }[] = [
   { id: "gallery", label: "画廊", icon: IconGrid },
+  { id: "queue", label: "队列", icon: IconQueue },
   { id: "settings", label: "设置", icon: IconGear },
 ];
 
@@ -31,6 +34,9 @@ export default function Sidebar() {
   const newConversation = useChatStore((s) => s.newConversation);
   const selectConversation = useChatStore((s) => s.selectConversation);
   const deleteConvo = useChatStore((s) => s.deleteConvo);
+  const queuePending = useQueueStore(
+    (s) => (s.counts.queued ?? 0) + (s.counts.running ?? 0),
+  );
   const [hoveredConvo, setHoveredConvo] = useState<number | null>(null);
 
   const cycleTheme = () => {
@@ -163,7 +169,17 @@ export default function Sidebar() {
               }`}
             >
               <item.icon size={16} />
-              {!collapsed && <span>{item.label}</span>}
+              {!collapsed && (
+                <span className="flex-1 text-left">{item.label}</span>
+              )}
+              {item.id === "queue" && queuePending > 0 && (
+                <span
+                  title={`${queuePending} 个任务待执行`}
+                  className="rounded-full bg-accent-soft px-1.5 py-0.5 text-[10px] font-medium text-accent"
+                >
+                  {queuePending}
+                </span>
+              )}
             </button>
           );
         })}

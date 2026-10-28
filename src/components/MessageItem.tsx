@@ -1,6 +1,6 @@
 import { memo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { DisplayMessage } from "../stores/chatStore";
+import { DisplayMessage, useChatStore } from "../stores/chatStore";
 import { adapterErrorTitle } from "../lib/api";
 import ImageCard from "./ImageCard";
 import SafeImg from "./SafeImg";
@@ -78,6 +78,8 @@ export default memo(function MessageItem({
   message: DisplayMessage;
 }) {
   const isUser = message.role === "user";
+  const sending = useChatStore((s) => s.sending);
+  const retryLast = useChatStore((s) => s.retryLast);
   // 占位只在生成中有效；终态即使数据异常带有 pendingImages 也不渲染骨架
   const showPending =
     message.status === "thinking" || message.status === "generating";
@@ -137,6 +139,7 @@ export default memo(function MessageItem({
                   image={img}
                   siblings={message.images}
                   prompt={message.refined || message.content}
+                  messageId={message.id}
                 />
               ))}
               {Array.from({ length: pendingCount }).map((_, i) => (
@@ -147,11 +150,15 @@ export default memo(function MessageItem({
               ))}
             </div>
             {message.status === "stopped" && message.images.length === 0 && (
-              <div className="mt-2.5 rounded-[var(--radius-card)] border border-theme bg-elevated px-3.5 py-2.5 text-[13px] text-tertiary">
-                已停止生成
-                <span className="ml-1 text-[12px] opacity-80">
-                  · 可点击重试
-                </span>
+              <div className="mt-2.5 flex items-center justify-between gap-3 rounded-[var(--radius-card)] border border-theme bg-elevated px-3.5 py-2.5 text-[13px] text-tertiary">
+                <span>已停止生成</span>
+                <button
+                  onClick={() => void retryLast()}
+                  disabled={sending}
+                  className="rounded-[8px] border border-theme px-2.5 py-1 text-[12px] text-secondary transition-opacity hover:text-accent disabled:opacity-50"
+                >
+                  重试
+                </button>
               </div>
             )}
             {message.status === "error" && message.error && (
@@ -161,8 +168,17 @@ export default memo(function MessageItem({
                 transition={{ duration: 0.2 }}
                 className="mt-2.5 rounded-[var(--radius-card)] border border-danger/25 bg-elevated px-3.5 py-2.5"
               >
-                <div className="text-[13px] font-medium text-danger">
-                  {adapterErrorTitle(message.error)}
+                <div className="flex items-center justify-between gap-3">
+                  <div className="text-[13px] font-medium text-danger">
+                    {adapterErrorTitle(message.error)}
+                  </div>
+                  <button
+                    onClick={() => void retryLast()}
+                    disabled={sending}
+                    className="shrink-0 rounded-[8px] border border-theme px-2.5 py-1 text-[12px] text-secondary transition-opacity hover:text-accent disabled:opacity-50"
+                  >
+                    重试
+                  </button>
                 </div>
                 <div className="mt-0.5 max-h-24 overflow-y-auto break-all text-[12px] text-secondary">
                   {message.error.message}

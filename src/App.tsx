@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
 import GalleryView from "./components/GalleryView";
+import QueueView from "./components/QueueView";
 import SettingsView from "./components/SettingsView";
 import SettingsRail from "./components/SettingsRail";
 import EditorView from "./components/EditorView";
@@ -10,6 +11,7 @@ import OutpaintView from "./components/OutpaintView";
 import { useAppStore } from "./stores/appStore";
 import { useChatStore } from "./stores/chatStore";
 import { useProviderStore } from "./stores/providerStore";
+import { useQueueStore } from "./stores/queueStore";
 import { api } from "./lib/api";
 import {
   readFileAsDataUrl,
@@ -67,6 +69,16 @@ export default function App() {
         }
       })
       .catch(() => undefined);
+    // 队列事件全局订阅：侧栏徽标与队列页共用同一份状态
+    void (async () => {
+      try {
+        await useQueueStore.getState().subscribe();
+        await useQueueStore.getState().load();
+      } catch (e) {
+        toast(`加载队列失败：${String(e)}`, "error");
+      }
+    })();
+    return () => useQueueStore.getState().unsubscribe();
   }, []);
 
   return (
@@ -131,6 +143,8 @@ export default function App() {
               <ChatView />
             ) : view === "gallery" ? (
               <GalleryView />
+            ) : view === "queue" ? (
+              <QueueView />
             ) : (
               <SettingsView />
             )}

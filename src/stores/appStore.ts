@@ -3,7 +3,7 @@ import { ThemeMode, RATIO_OPTIONS } from "../lib/types";
 import { api } from "../lib/api";
 import { toast } from "../lib/notify";
 
-export type AppView = "chat" | "gallery" | "settings";
+export type AppView = "chat" | "gallery" | "queue" | "settings";
 
 export interface GenPrefs {
   ratio: string;

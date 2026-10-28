@@ -6,6 +6,7 @@ import { useAppStore } from "../stores/appStore";
 import { useProviderStore } from "../stores/providerStore";
 import { api } from "../lib/api";
 import { extOf } from "../lib/image";
+import { toast } from "../lib/notify";
 import ImageViewer, { ViewerImage } from "./ImageViewer";
 import ContextMenu, { MenuItem } from "./ContextMenu";
 import SafeImg from "./SafeImg";
@@ -26,10 +27,13 @@ export default function ImageCard({
   image,
   siblings,
   prompt,
+  messageId,
 }: {
   image: ChatImage;
   siblings: ChatImage[];
   prompt: string;
+  /** 所属消息 id：删除必须落库，否则刷新后图片又回来 */
+  messageId: number;
 }) {
   const addAttachment = useChatStore((s) => s.addAttachment);
   const openEditor = useAppStore((s) => s.openEditor);
@@ -77,14 +81,27 @@ export default function ImageCard({
     });
   };
 
-  const removeImage = async () => {
-    await api.deleteHistory(image.historyId).catch(() => undefined);
+  const removeLocal = () =>
     useChatStore.setState((s) => ({
       messages: s.messages.map((m) => ({
         ...m,
         images: m.images.filter((i) => i.historyId !== image.historyId),
       })),
     }));
+
+  /// 删除：先落库再更新本地，失败时不乐观移除（否则刷新后又出现）
+  const removeImage = async () => {
+    if (messageId <= 0) {
+      // 尚未落库的本地消息（负 id）：只有内存状态可改
+      removeLocal();
+      return;
+    }
+    try {
+      await api.removeMessageImage(messageId, image.historyId);
+      removeLocal();
+    } catch (e) {
+      toast(`删除失败：${String(e)}`, "error");
+    }
   };
 
   const baseTarget = {
