@@ -64,6 +64,8 @@ fn init_storage_with_recovery(data_dir: &std::path::Path) -> Result<(), String> 
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // 应用内自动更新：端点为空时不联网，不影响启动
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // RA-06：生成任务取消注册表（jobId → 取消标记），供 generate_images / cancel_generation 共享
         .manage(commands::GenerationRegistry::default())
         .setup(|app| {
@@ -128,6 +130,8 @@ pub fn run() {
             commands::import_config,
             commands::get_logs_dir,
             commands::export_diagnostics,
+            commands::get_update_status,
+            commands::install_update,
             commands::enqueue_job,
             commands::list_jobs,
             commands::cancel_queue_job,

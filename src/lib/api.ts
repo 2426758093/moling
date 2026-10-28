@@ -157,6 +157,20 @@ export interface EnqueueJobInput {
   count: number;
 }
 
+export interface AvailableUpdate {
+  version: string;
+  notes: string | null;
+  date: string | null;
+}
+
+/** 更新状态：未配置更新源时 configured=false，且不发起网络请求 */
+export interface UpdateStatus {
+  currentVersion: string;
+  configured: boolean;
+  available: AvailableUpdate | null;
+  error: string | null;
+}
+
 export const api = {
   saveProvider: (input: ProviderInput) =>
     invoke<ProviderItem>("save_provider", { input }),
@@ -256,6 +270,9 @@ export const api = {
   getLogsDir: () => invoke<string>("get_logs_dir"),
   /** 导出脱敏诊断包（近 7 天日志 + 元信息），返回 zip 绝对路径 */
   exportDiagnostics: () => invoke<string>("export_diagnostics"),
+  getUpdateStatus: () => invoke<UpdateStatus>("get_update_status"),
+  /** 下载并安装可用更新；成功后进程会重启 */
+  installUpdate: () => invoke<void>("install_update"),
   exportConfig: (includeKeys: boolean) =>
     invoke<Record<string, unknown>>("export_config", { includeKeys }),
   importConfig: (data: Record<string, unknown>) =>

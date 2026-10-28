@@ -6,6 +6,7 @@ pub mod providers;
 pub mod queue;
 pub mod settings;
 pub mod thinking;
+pub mod update;
 
 pub use chat::*;
 pub use diagnostics::*;
@@ -15,3 +16,4 @@ pub use providers::*;
 pub use queue::*;
 pub use settings::*;
 pub use thinking::*;
+pub use update::*;

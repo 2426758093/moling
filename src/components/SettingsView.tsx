@@ -7,6 +7,7 @@ import { toast } from "../lib/notify";
 import ProviderDialog from "./settings/ProviderDialog";
 import ProviderCard from "./settings/ProviderCard";
 import ThinkingSection from "./settings/ThinkingSection";
+import AboutSection from "./settings/AboutSection";
 import NetworkSection from "./settings/NetworkSection";
 
 export default function SettingsView() {
@@ -213,6 +214,8 @@ export default function SettingsView() {
           <ThinkingSection key={thinkingKey} />
 
           <NetworkSection />
+
+          <AboutSection />
 
           <section>
             <h2 className="mb-4 text-lg font-semibold">诊断日志</h2>
