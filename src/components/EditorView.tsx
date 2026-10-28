@@ -5,6 +5,7 @@ import { useChatStore } from "../stores/chatStore";
 import { useProviderStore } from "../stores/providerStore";
 import { api, parseAdapterError, adapterErrorTitle } from "../lib/api";
 import { toast } from "../lib/notify";
+import SafeImg from "./SafeImg";
 
 export default function EditorView() {
   const editTarget = useAppStore((s) => s.editTarget);
@@ -266,7 +267,7 @@ export default function EditorView() {
       >
         {resultUrl ? (
           <div className="flex h-full flex-col items-center gap-3">
-            <img
+            <SafeImg
               src={resultUrl}
               alt="重绘结果"
               className="max-h-full max-w-full rounded-xl object-contain shadow-pop"
@@ -291,11 +292,10 @@ export default function EditorView() {
             className="relative overflow-hidden rounded-xl shadow-pop"
             style={{ width: display.w, height: display.h }}
           >
-            <img
+            <SafeImg
               src={source.dataUrl}
               alt="编辑对象"
               className="absolute inset-0 h-full w-full"
-              draggable={false}
             />
             <canvas
               ref={maskCanvasRef}

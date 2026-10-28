@@ -16,16 +16,15 @@ import {
   genAttachmentId,
   validateImageFile,
 } from "./lib/file";
+import { applyThemeClass } from "./lib/theme";
+import { MAX_REFERENCE_IMAGES } from "./lib/image";
 import { toast } from "./lib/notify";
 
 function useApplyTheme() {
   const theme = useAppStore((s) => s.theme);
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
-    const apply = () => {
-      const dark = theme === "dark" || (theme === "system" && media.matches);
-      document.documentElement.classList.toggle("dark", dark);
-    };
+    const apply = () => applyThemeClass(theme);
     apply();
     media.addEventListener("change", apply);
     return () => media.removeEventListener("change", apply);
@@ -77,21 +76,41 @@ export default function App() {
         if (e.dataTransfer.types.includes("Files")) e.preventDefault();
       }}
       onDrop={(e) => {
-        const file = e.dataTransfer.files?.[0];
-        if (!file || !file.type.startsWith("image/")) return;
+        const files = Array.from(e.dataTransfer.files ?? []).filter((f) =>
+          f.type.startsWith("image/"),
+        );
+        if (files.length === 0) return;
         e.preventDefault();
         void (async () => {
-          const invalid = await validateImageFile(file);
-          if (invalid) {
-            toast(invalid, "error");
+          const remaining =
+            MAX_REFERENCE_IMAGES - useChatStore.getState().attachments.length;
+          if (remaining <= 0) {
+            toast(`最多添加 ${MAX_REFERENCE_IMAGES} 张参考图`, "error");
             return;
           }
-          const dataUrl = await readFileAsDataUrl(file);
-          addAttachment({
-            id: genAttachmentId(),
-            dataUrl,
-            name: file.name,
-          });
+          if (files.length > remaining) {
+            toast(
+              `最多添加 ${MAX_REFERENCE_IMAGES} 张参考图，已忽略多余文件`,
+              "error",
+            );
+          }
+          for (const file of files.slice(0, remaining)) {
+            const invalid = await validateImageFile(file);
+            if (invalid) {
+              toast(invalid, "error");
+              continue;
+            }
+            const dataUrl = await readFileAsDataUrl(file);
+            if (
+              !addAttachment({
+                id: genAttachmentId(),
+                dataUrl,
+                name: file.name,
+              })
+            ) {
+              break;
+            }
+          }
           setView("chat");
         })();
       }}

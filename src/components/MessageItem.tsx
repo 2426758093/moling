@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { DisplayMessage } from "../stores/chatStore";
 import { adapterErrorTitle } from "../lib/api";
 import ImageCard from "./ImageCard";
+import SafeImg from "./SafeImg";
 import { IconBrain, IconChevron } from "./Icons";
 
 function ThinkingCard({ message }: { message: DisplayMessage }) {
@@ -12,6 +13,7 @@ function ThinkingCard({ message }: { message: DisplayMessage }) {
     <div className="mb-2.5 overflow-hidden rounded-[var(--radius-card)] border border-theme bg-elevated">
       <button
         onClick={() => setOpen(!open)}
+        aria-expanded={open}
         className="pressable flex w-full items-center gap-2 px-3.5 py-2.5 text-[13px] text-tertiary"
       >
         <span className="text-accent">
@@ -76,7 +78,11 @@ export default memo(function MessageItem({
   message: DisplayMessage;
 }) {
   const isUser = message.role === "user";
-  const multi = message.images.length + message.pendingImages > 1;
+  // 占位只在生成中有效；终态即使数据异常带有 pendingImages 也不渲染骨架
+  const showPending =
+    message.status === "thinking" || message.status === "generating";
+  const pendingCount = showPending ? message.pendingImages : 0;
+  const multi = message.images.length + pendingCount > 1;
 
   return (
     <motion.div
@@ -92,7 +98,7 @@ export default memo(function MessageItem({
             {message.attachments.length > 0 && (
               <div className="flex justify-end gap-2">
                 {message.attachments.map((a) => (
-                  <img
+                  <SafeImg
                     key={a.id}
                     src={a.dataUrl}
                     alt={a.name}
@@ -133,13 +139,21 @@ export default memo(function MessageItem({
                   prompt={message.refined || message.content}
                 />
               ))}
-              {Array.from({ length: message.pendingImages }).map((_, i) => (
+              {Array.from({ length: pendingCount }).map((_, i) => (
                 <PendingCard
                   key={`pending-${i}`}
                   label={message.status === "thinking" ? "准备中" : "绘制中"}
                 />
               ))}
             </div>
+            {message.status === "stopped" && message.images.length === 0 && (
+              <div className="mt-2.5 rounded-[var(--radius-card)] border border-theme bg-elevated px-3.5 py-2.5 text-[13px] text-tertiary">
+                已停止生成
+                <span className="ml-1 text-[12px] opacity-80">
+                  · 可点击重试
+                </span>
+              </div>
+            )}
             {message.status === "error" && message.error && (
               <motion.div
                 initial={{ opacity: 0, y: 6 }}

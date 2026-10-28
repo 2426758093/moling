@@ -1,2 +1,7 @@
 minimumReleaseAgeExclude:
   - "@tauri-apps/plugin-opener@2.7.0"
+
+# 安全补丁：@tailwindcss/node 间接依赖 source-map-js@1.0.2（GHSA-68fv-2mgg-jv7q，high）。
+# 该版本无破坏性 API 变化，直接提升到已修补的 >=1.2.2。
+overrides:
+  source-map-js: ^1.2.2

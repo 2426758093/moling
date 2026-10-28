@@ -19,6 +19,9 @@ export default function ChatView() {
   const conversations = useChatStore((s) => s.conversations);
   const send = useChatStore((s) => s.send);
   const sending = useChatStore((s) => s.sending);
+  const hasMore = useChatStore((s) => s.hasMore);
+  const loadingOlder = useChatStore((s) => s.loadingOlder);
+  const loadOlder = useChatStore((s) => s.loadOlder);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
 
@@ -36,17 +39,62 @@ export default function ChatView() {
     if (!el) return;
     stickToBottom.current =
       el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    // 接近顶部时续载更早的一页（幂等：store 内部对 hasMore/loadingOlder 去抖）
+    if (el.scrollTop < 120) void loadOlder();
   };
 
+  const prevCount = useRef(messages.length);
+  const prevFirstId = useRef<number | null>(messages[0]?.id ?? null);
+
+  // 消息数变化后决定滚动补偿：
+  // - 末尾追加（发送/生成）：吸底到最新一条；
+  // - 顶部插入（loadOlder 分页）：把原来第一条锚回原来的视觉位置，避免跳动。
+  // 虚拟列表要等 measureElement 写入真实高度，单层 rAF 拿到的仍是估算高度，故用双层 rAF。
+  // 用户上滑查看历史时 stickToBottom 为 false，不强制吸底。
   useEffect(() => {
-    const el = scrollRef.current;
-    if (el && stickToBottom.current) el.scrollTop = el.scrollHeight;
-  }, [messages]);
+    const count = messages.length;
+    const firstId = messages[0]?.id ?? null;
+    const prevFirst = prevFirstId.current;
+    prevFirstId.current = firstId;
+    const grown = count !== prevCount.current;
+    prevCount.current = count;
+    if (!grown) return;
+
+    // 顶部插入：原首条现在的位置就是补偿后的锚点
+    if (prevFirst !== null && firstId !== prevFirst) {
+      const anchor = messages.findIndex((m) => m.id === prevFirst);
+      if (anchor > 0) {
+        let inner = 0;
+        const outer = requestAnimationFrame(() => {
+          inner = requestAnimationFrame(() => {
+            virtualizer.scrollToIndex(anchor, { align: "start" });
+          });
+        });
+        return () => {
+          cancelAnimationFrame(outer);
+          cancelAnimationFrame(inner);
+        };
+      }
+    }
+
+    if (count === 0) return;
+    let raf2 = 0;
+    const raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => {
+        if (!stickToBottom.current) return;
+        virtualizer.scrollToIndex(count - 1, { align: "end" });
+      });
+    });
+    return () => {
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
+    };
+  }, [messages, virtualizer]);
 
   const empty = activeId === null || messages.length === 0;
 
   return (
-    <div className="flex min-w-0 flex-1 flex-col bg-base">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-base">
       {/* Large Title 导航栏（毛玻璃） */}
       <header className="bg-glass z-10 flex h-[52px] shrink-0 items-end border-b border-theme px-6 pb-2">
         <AnimatePresence mode="wait">
@@ -103,6 +151,15 @@ export default function ChatView() {
           </div>
         ) : (
           <div className="mx-auto max-w-2xl px-5 py-6">
+            {(hasMore || loadingOlder) && (
+              <div
+                className="mb-3 text-center text-[12px] text-tertiary"
+                role="status"
+                aria-live="polite"
+              >
+                {loadingOlder ? "正在加载更早的消息…" : "上滑加载更早的消息"}
+              </div>
+            )}
             <div
               className="relative w-full"
               style={{ height: virtualizer.getTotalSize() }}

@@ -9,6 +9,7 @@ import {
 import { readFileAsDataUrl } from "../lib/file";
 import { useChatStore } from "../stores/chatStore";
 import { IconSparkle, IconImage, IconClose, IconTrash } from "./Icons";
+import SafeImg from "./SafeImg";
 
 const SUBJECTS = [
   "一只橘猫",
@@ -303,7 +304,7 @@ export default function PromptAssist({ onClose }: { onClose: () => void }) {
               </button>
             ) : (
               <div className="flex gap-2.5">
-                <img
+                <SafeImg
                   src={reverseImg}
                   alt="反推对象"
                   className="h-16 w-16 shrink-0 rounded-[8px] border border-theme object-cover"

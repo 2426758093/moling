@@ -19,6 +19,8 @@ export interface ProviderItem {
   provider: ProviderInput;
   apiKeyMasked: string;
   hasKey: boolean;
+  // API Key 解密失败标记（R2：密钥损坏时透出前端，禁止静默当作无 Key）
+  keyError: boolean;
 }
 
 export type AdapterError =
@@ -71,7 +73,8 @@ export interface HistoryItem {
     favorite: boolean;
     createdAt: string;
   };
-  dataUrl: string;
+  /** 列表只带缩略图；下载/打包导出需按 id 取原图 */
+  thumbUrl: string;
 }
 
 export interface GeneratedImage {
@@ -99,7 +102,8 @@ export const api = {
       ok: boolean;
       latencyMs?: number;
       modelCount?: number;
-      error?: AdapterError;
+      // 后端返回 AdapterError 的 JSON 字符串（或裸字符串），由 parseAdapterError 兼容
+      error?: string;
     }>("test_connection", { id }),
   generateImages: (input: {
     providerId: number;
@@ -114,7 +118,18 @@ export const api = {
     style: string;
     count: number;
     images?: string[];
-  }) => invoke<{ images: GeneratedImage[] }>("generate_images", { input }),
+    // 生成任务 id：stop() 用它调用 cancel_generation 中断在途生成
+    jobId?: string;
+  }) =>
+    invoke<{ images: GeneratedImage[]; cancelled?: boolean }>(
+      "generate_images",
+      {
+        input,
+      },
+    ),
+  // 请求后端中断指定生成任务：仅尽力而为，cmd 未落地/失败时前端忽略
+  cancelGeneration: (jobId: string) =>
+    invoke<void>("cancel_generation", { jobId }),
   editImage: (input: {
     providerId: number;
     prompt: string;
@@ -128,8 +143,23 @@ export const api = {
       "edit_image",
       { input },
     ),
-  listHistory: (limit?: number, offset?: number, model?: string) =>
-    invoke<{ items: HistoryItem[] }>("list_history", { limit, offset, model }),
+  listHistory: (
+    limit?: number,
+    offset?: number,
+    model?: string,
+    style?: string,
+  ) =>
+    invoke<{ items: HistoryItem[] }>("list_history", {
+      limit,
+      offset,
+      model,
+      style,
+    }),
+  getHistoryImage: (id: number) =>
+    invoke<{ historyId: number; dataUrl: string; filePath: string }>(
+      "get_history_image",
+      { id },
+    ),
   setFavorite: (id: number, favorite: boolean) =>
     invoke<void>("set_favorite", { id, favorite }),
   deleteHistory: (id: number) => invoke<void>("delete_history", { id }),
@@ -137,14 +167,15 @@ export const api = {
     invoke<void>("set_setting", { key, value }),
   getSetting: (key: string) => invoke<string | null>("get_setting", { key }),
   getAppDataDir: () => invoke<string>("get_app_data_dir"),
-  exportConfig: () => invoke<Record<string, unknown>>("export_config"),
+  exportConfig: (includeKeys: boolean) =>
+    invoke<Record<string, unknown>>("export_config", { includeKeys }),
   importConfig: (data: Record<string, unknown>) =>
     invoke<void>("import_config", { data }),
   getThinkingConfig: () => invoke<ThinkingConfig>("get_thinking_config"),
   saveThinkingConfig: (config: ThinkingConfig, apiKey?: string | null) =>
     invoke<ThinkingConfig>("save_thinking_config", { config, apiKey }),
   testThinkingConnection: () =>
-    invoke<{ ok: boolean; latencyMs?: number; error?: AdapterError }>(
+    invoke<{ ok: boolean; latencyMs?: number; error?: string }>(
       "test_thinking_connection",
     ),
   refinePrompt: (raw: string, context?: string | null) =>
@@ -162,8 +193,18 @@ export const api = {
     invoke<{ id: number; imagesJson: string }>("add_message", {
       input: message,
     }),
-  listMessages: (conversationId: number) =>
-    invoke<{ messages: ChatMessage[] }>("list_messages", { conversationId }),
+  /// 删除单条消息（重试时清掉上一条回复）；返回是否命中
+  deleteMessage: (id: number) => invoke<boolean>("delete_message", { id }),
+  /// keyset 分页：不传 beforeId 取最新一页，返回按 id 升序，hasMore 表示还有更旧的消息
+  listMessages: (
+    conversationId: number,
+    opts: { limit?: number; beforeId?: number } = {},
+  ) =>
+    invoke<{ messages: ChatMessage[]; hasMore: boolean }>("list_messages", {
+      conversationId,
+      limit: opts.limit,
+      beforeId: opts.beforeId,
+    }),
   saveChatImage: (dataUrl: string, name?: string) =>
     invoke<{ path: string }>("save_chat_image", { dataUrl, name }),
   getPromptTemplates: () =>

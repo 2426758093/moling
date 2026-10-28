@@ -107,6 +107,8 @@ export default function Sidebar() {
                 <button
                   onClick={() => pickConvo(c.id)}
                   title={c.title}
+                  aria-label={`打开对话：${c.title}`}
+                  aria-current={active ? "page" : undefined}
                   className={`flex w-full items-center gap-2 rounded-[8px] px-2.5 py-[7px] text-left text-[13px] transition-colors duration-150 ${
                     collapsed ? "justify-center px-0" : ""
                   } ${
@@ -129,6 +131,7 @@ export default function Sidebar() {
                       deleteConvo(c.id);
                     }}
                     title="删除对话"
+                    aria-label={`删除对话：${c.title}`}
                     className="absolute right-1.5 top-1/2 -translate-y-1/2 rounded-md p-1 text-tertiary opacity-0 transition-all duration-150 hover:bg-active hover:text-danger group-hover:opacity-100"
                   >
                     <IconClose size={12} />
@@ -149,6 +152,8 @@ export default function Sidebar() {
               key={item.id}
               onClick={() => setView(item.id)}
               title={item.label}
+              aria-label={item.label}
+              aria-current={active ? "page" : undefined}
               className={`flex w-full items-center gap-2.5 rounded-[8px] px-2.5 py-[7px] text-[13px] transition-colors duration-150 ${
                 collapsed ? "justify-center px-0" : ""
               } ${
@@ -165,6 +170,7 @@ export default function Sidebar() {
         <button
           onClick={cycleTheme}
           title="切换主题"
+          aria-label="切换主题"
           className={`flex w-full items-center gap-2.5 rounded-[8px] px-2.5 py-[7px] text-[13px] text-secondary transition-colors duration-150 hover:bg-hover ${
             collapsed ? "justify-center px-0" : ""
           }`}

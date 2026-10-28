@@ -9,6 +9,8 @@ import {
   validateImageFile,
 } from "../lib/file";
 import { toast } from "../lib/notify";
+import { MAX_REFERENCE_IMAGES } from "../lib/image";
+import SafeImg from "./SafeImg";
 import {
   IconImage,
   IconClose,
@@ -62,7 +64,9 @@ export default function Composer() {
 
   const doSend = async () => {
     const value = text;
-    if (!value.trim() || sending) return;
+    // 直接读 store 的实时状态：渲染期闭包里的 sending 可能滞后一帧，
+    // 连点/连按 Enter 会重复触发；sending 期间一律直接 return。
+    if (!value.trim() || sending || useChatStore.getState().sending) return;
     setText("");
     requestAnimationFrame(autoGrow);
     await send(value);
@@ -77,18 +81,35 @@ export default function Composer() {
 
   const onPickFiles = async (files: FileList | null) => {
     if (!files) return;
-    for (const file of Array.from(files).slice(0, 4)) {
+    const all = Array.from(files);
+    const remaining =
+      MAX_REFERENCE_IMAGES - useChatStore.getState().attachments.length;
+    if (remaining <= 0) {
+      toast(`最多添加 ${MAX_REFERENCE_IMAGES} 张参考图`, "error");
+      return;
+    }
+    if (all.length > remaining) {
+      toast(
+        `最多添加 ${MAX_REFERENCE_IMAGES} 张参考图，已忽略多余文件`,
+        "error",
+      );
+    }
+    for (const file of all.slice(0, remaining)) {
       const invalid = await validateImageFile(file);
       if (invalid) {
         toast(invalid, "error");
         continue;
       }
       const dataUrl = await readFileAsDataUrl(file);
-      addAttachment({
-        id: genAttachmentId(),
-        dataUrl,
-        name: file.name,
-      });
+      if (
+        !addAttachment({
+          id: genAttachmentId(),
+          dataUrl,
+          name: file.name,
+        })
+      ) {
+        break;
+      }
     }
   };
 
@@ -116,13 +137,14 @@ export default function Composer() {
                   transition={{ type: "spring", stiffness: 500, damping: 30 }}
                   className="group relative"
                 >
-                  <img
+                  <SafeImg
                     src={a.dataUrl}
                     alt={a.name}
                     className="h-14 w-14 rounded-[10px] border border-theme object-cover shadow-card"
                   />
                   <button
                     onClick={() => removeAttachment(a.id)}
+                    aria-label={`移除附件 ${a.name}`}
                     className="absolute -right-1.5 -top-1.5 flex h-4.5 w-4.5 items-center justify-center rounded-full bg-elevated text-tertiary shadow-card transition-opacity group-hover:flex hidden"
                   >
                     <IconClose size={10} />

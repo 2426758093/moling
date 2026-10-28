@@ -1,5 +1,7 @@
 import { create } from "zustand";
 import { ThemeMode, RATIO_OPTIONS } from "../lib/types";
+import { api } from "../lib/api";
+import { toast } from "../lib/notify";
 
 export type AppView = "chat" | "gallery" | "settings";
 
@@ -58,7 +60,13 @@ export const useAppStore = create<AppState>((set) => ({
   editTarget: null,
   outpaintTarget: null,
   setView: (view) => set({ view }),
-  setTheme: (theme) => set({ theme }),
+  setTheme: (theme) => {
+    set({ theme });
+    // 主题是纯本机偏好：先切 UI 再落库，写失败只提示不阻断（下次启动回退 system）
+    void api
+      .setSetting("theme", theme)
+      .catch((e) => toast(`保存主题失败：${String(e)}`, "error"));
+  },
   toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
   setPrefs: (patch) => set((s) => ({ prefs: { ...s.prefs, ...patch } })),
   applyRatio: (ratioId) =>

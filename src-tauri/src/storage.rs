@@ -5,8 +5,9 @@ use aes_gcm::{
 };
 use base64::Engine;
 use rand::RngCore;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
@@ -79,11 +80,9 @@ pub struct ProviderDraft<'a> {
     pub template_response_path: &'a str,
 }
 
-pub fn init(app_data_dir: PathBuf) -> AppResult<()> {
-    std::fs::create_dir_all(&app_data_dir)?;
-    let conn = Connection::open(app_data_dir.join("moling.db"))?;
-    conn.execute_batch(
-        "
+/// 建表 SQL（迁移 001 的基线）。**发布后不要再改这里**：旧库已经跑过 001，
+/// 后续结构变更请追加一条新的迁移，否则老库永远拿不到新列。
+const SCHEMA_SQL: &str = "
         CREATE TABLE IF NOT EXISTS providers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -132,10 +131,98 @@ pub fn init(app_data_dir: PathBuf) -> AppResult<()> {
             params_json TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL DEFAULT ''
         );
-        ",
-    )?;
+";
+
+/// 索引（迁移 002）。会话消息按 (conversation_id, id) 翻页、画廊按时间倒序、
+/// 按模型过滤，都是高频路径；没有索引时数据量一上来就是全表扫。
+const INDEXES_SQL: &str = "
+        CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, id);
+        CREATE INDEX IF NOT EXISTS idx_history_created ON history(created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_history_model ON history(model);
+";
+
+/// (名称, SQL)，按顺序执行；`PRAGMA user_version` 记录已应用到的序号（从 1 起）。
+const MIGRATIONS: &[(&str, &str)] = &[("001_tables", SCHEMA_SQL), ("002_indexes", INDEXES_SQL)];
+
+/// 当前 schema 版本 = 迁移条数
+const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
+
+pub fn init(app_data_dir: PathBuf) -> AppResult<()> {
+    std::fs::create_dir_all(&app_data_dir)?;
+    let conn = open_and_migrate(&app_data_dir.join("moling.db"))?;
     DB.set(Mutex::new(conn))
         .map_err(|_| AppError::Other("storage already initialized".into()))
+}
+
+/// 打开数据库并应用迁移（init 与单测共用）。
+///
+/// 旧库升级前先留一份快照：迁移失败本身会回滚，但跨版本升级后旧代码就再也
+/// 打不开新 schema 了，留一份可回退的副本比事后补救便宜。
+pub(crate) fn open_and_migrate(db_path: &std::path::Path) -> AppResult<Connection> {
+    let mut conn = Connection::open(db_path)?;
+    let version = current_version(&conn)?;
+    // 全新的空库（还没有 providers 表）没有数据可备份，跳过以免产生噪声文件
+    if version < SCHEMA_VERSION && !table_missing(&conn, "providers") {
+        backup_before_migration(db_path);
+    }
+    apply_migrations(&mut conn)?;
+    Ok(conn)
+}
+
+fn current_version(conn: &Connection) -> AppResult<i64> {
+    Ok(conn.query_row("PRAGMA user_version", [], |r| r.get(0))?)
+}
+
+fn table_missing(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+        params![name],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|n| n == 0)
+    .unwrap_or(true)
+}
+
+fn backup_before_migration(db_path: &std::path::Path) {
+    let ts = timestamp_millis().replace('.', "-");
+    let backup = db_path.with_file_name(format!("moling.db.bak-migrate-{ts}"));
+    match std::fs::copy(db_path, &backup) {
+        Ok(bytes) => tracing::warn!("数据库迁移前已备份到 {}（{bytes} 字节）", backup.display()),
+        Err(e) => tracing::warn!("数据库迁移前备份失败（{e}），继续迁移"),
+    }
+}
+
+pub(crate) fn apply_migrations(conn: &mut Connection) -> AppResult<()> {
+    apply_migrations_with(conn, MIGRATIONS)
+}
+
+/// 每条迁移单独一个事务：失败即回滚该步，且不推进 user_version（下次启动重试）。
+fn apply_migrations_with(conn: &mut Connection, migrations: &[(&str, &str)]) -> AppResult<()> {
+    for (i, (name, sql)) in migrations.iter().enumerate() {
+        let target = (i + 1) as i64;
+        if target <= current_version(conn)? {
+            continue;
+        }
+        let tx = conn.transaction()?;
+        tx.execute_batch(sql)
+            .map_err(|e| AppError::Other(format!("迁移 {name} 失败: {e}")))?;
+        tx.pragma_update(None, "user_version", target)?;
+        tx.commit()?;
+        tracing::info!("已应用数据库迁移 {name}（schema v{target}）");
+    }
+    Ok(())
+}
+
+/// 是否属于「数据库文件本身损坏」——只有这类错误才允许改名重建，
+/// 其余错误（锁占用、磁盘满、迁移失败）必须上抛，绝不能把用户数据搬走。
+pub fn is_corruption(e: &AppError) -> bool {
+    match e {
+        AppError::Sqlite(rusqlite::Error::SqliteFailure(err, _)) => matches!(
+            err.code,
+            rusqlite::ErrorCode::DatabaseCorrupt | rusqlite::ErrorCode::NotADatabase
+        ),
+        _ => false,
+    }
 }
 
 fn conn() -> AppResult<std::sync::MutexGuard<'static, Connection>> {
@@ -382,17 +469,180 @@ pub fn get_setting(key: &str) -> AppResult<Option<String>> {
     Ok(rows.next().transpose()?)
 }
 
+/// 删除设置项（不存在时静默成功）。用于清理指向已删除服务商的 defaultProviderId。
+pub fn delete_setting(key: &str) -> AppResult<()> {
+    conn()?.execute("DELETE FROM settings WHERE key = ?1", params![key])?;
+    Ok(())
+}
+
+/// 取导入文件中的 providers 数组；缺失或类型不对直接报错。
+/// 必须在任何 DELETE 之前调用（P0-2：否则会先清空用户旧配置再报错/静默成功）。
+fn require_providers(data: &serde_json::Value) -> AppResult<&[serde_json::Value]> {
+    data.get("providers")
+        .and_then(|p| p.as_array())
+        .map(|p| p.as_slice())
+        .ok_or_else(|| AppError::Other("导入文件缺少 providers 数组，已取消导入".into()))
+}
+
+/// 导入时允许写入的设置项。v1 只有旧版导出的两项；v2 增加主题与自定义模板。
+const IMPORT_SETTINGS_V1: &[&str] = &["defaultProviderId", "defaultParams"];
+const IMPORT_SETTINGS_V2: &[&str] = &[
+    "defaultProviderId",
+    "defaultParams",
+    "theme",
+    "promptTemplates",
+];
+
+fn invalid_import(msg: &str) -> AppError {
+    AppError::Other(format!("{msg}，已取消导入"))
+}
+
+/// v2 新增设置项的结构校验，必须在事务与 DELETE 之前调用。
+fn validate_import_settings(
+    settings: Option<&serde_json::Map<String, serde_json::Value>>,
+    version: u64,
+) -> AppResult<()> {
+    let Some(settings) = settings else {
+        return Ok(());
+    };
+    // v1 导出没有这些字段，保持原有的宽松导入行为
+    if version < 2 {
+        return Ok(());
+    }
+    if let Some(theme) = settings.get("theme") {
+        let ok = theme
+            .as_str()
+            .is_some_and(|t| matches!(t, "system" | "light" | "dark"));
+        if !ok {
+            return Err(invalid_import("导入文件中的主题取值非法"));
+        }
+    }
+    if let Some(templates) = settings.get("promptTemplates") {
+        validate_import_templates(templates)?;
+    }
+    Ok(())
+}
+
+/// 自定义模板在 settings 中以 JSON 字符串保存，必须是 `[{id,title,text}]` 数组。
+fn validate_import_templates(value: &serde_json::Value) -> AppResult<()> {
+    let raw = value
+        .as_str()
+        .ok_or_else(|| invalid_import("自定义模板必须是 JSON 字符串"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| invalid_import("自定义模板不是合法 JSON"))?;
+    let list = parsed
+        .as_array()
+        .ok_or_else(|| invalid_import("自定义模板必须是数组"))?;
+    for item in list {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| invalid_import("自定义模板项必须是对象"))?;
+        for key in ["id", "title", "text"] {
+            let ok = obj
+                .get(key)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty());
+            if !ok {
+                return Err(invalid_import("自定义模板项缺少 id/title/text"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_import_thinking(value: &serde_json::Value) -> AppResult<()> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| invalid_import("思考模型配置必须是对象"))?;
+    if obj.get("enabled").is_some_and(|v| !v.is_boolean()) {
+        return Err(invalid_import("思考模型 enabled 必须是布尔值"));
+    }
+    if let Some(mode) = obj.get("mode") {
+        let ok = mode
+            .as_str()
+            .is_some_and(|m| matches!(m, "standalone" | "reuse"));
+        if !ok {
+            return Err(invalid_import("思考模型 mode 只能是 standalone 或 reuse"));
+        }
+    }
+    if let Some(pid) = obj.get("providerId") {
+        if !(pid.is_null() || pid.as_i64().is_some()) {
+            return Err(invalid_import("思考模型 providerId 必须是整数或 null"));
+        }
+    }
+    for key in ["baseUrl", "model"] {
+        if obj.get(key).is_some_and(|v| v.as_str().is_none()) {
+            return Err(invalid_import("思考模型配置字段类型非法"));
+        }
+    }
+    Ok(())
+}
+
 /// 事务内导入配置（替换语义，R5）：先清空旧 providers 及其 extraParams 设置项，
 /// 再写入全部导入内容；中途任何失败整体回滚，不留半导入状态。
 /// `data` 为前端导出的 JSON（version 校验由调用方完成），返回导入的服务商数量。
 pub fn import_config(data: &serde_json::Value) -> AppResult<usize> {
-    let providers = data
-        .get("providers")
-        .and_then(|p| p.as_array())
-        .cloned()
-        .unwrap_or_default();
     let mut c = conn()?;
+    import_config_in(&mut c, data)
+}
+
+/// import_config 的可测接缝：在给定连接上执行导入（单测用内存库，避免共享全局 DB）。
+/// 入参校验放在事务与 DELETE 之前，非法导入绝不触碰表内旧数据。
+fn import_config_in(c: &mut Connection, data: &serde_json::Value) -> AppResult<usize> {
+    let version = data.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
+    let providers = require_providers(data)?;
+    let settings = match data.get("settings") {
+        Some(v) => {
+            let obj = v.as_object();
+            if version >= 2 && obj.is_none() {
+                return Err(invalid_import("导入文件中的 settings 必须是对象"));
+            }
+            obj
+        }
+        None => None,
+    };
+    validate_import_settings(settings, version)?;
+    let thinking = if version >= 2 {
+        data.get("thinking")
+    } else {
+        None
+    };
+    if let Some(t) = thinking {
+        validate_import_thinking(t)?;
+    }
+
     let tx = c.transaction()?;
+    // v2 默认不导出明文 Key：删除前记录旧密文，导入项 apiKey 为空且
+    // name+baseUrl 一致时复用，避免「不含 Key 的备份」在换机/回滚时清空密钥。
+    let old_keys: HashMap<(String, String), String> = {
+        let mut stmt = tx.prepare("SELECT name, base_url, api_key_enc FROM providers")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                (r.get::<_, String>(0)?, r.get::<_, String>(1)?),
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?.into_iter().collect()
+    };
+    // thinkingConfig 不参与替换，但 v2 导出从不含 Key，导入时必须沿用本机密文
+    let old_thinking_enc = if thinking.is_some() {
+        tx.query_row(
+            "SELECT value FROM settings WHERE key = 'thinkingConfig'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| {
+            v.get("apiKeyEnc")
+                .and_then(|s| s.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
     // 替换语义：删除旧服务商及与之关联的 extraParams 设置
     let old_ids: Vec<i64> = {
         let mut stmt = tx.prepare("SELECT id FROM providers")?;
@@ -406,21 +656,33 @@ pub fn import_config(data: &serde_json::Value) -> AppResult<usize> {
             params![format!("extraParams:{id}")],
         )?;
     }
-    for p in &providers {
+    // 导出时的旧服务商 id → 导入后的新 id（自增 id 会变，设置项需据此重映射）
+    let mut id_map: HashMap<i64, i64> = HashMap::new();
+    for p in providers {
         let get = |k: &str| {
             p.get(k)
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string()
         };
-        let enc = encrypt_secret(&get("apiKey"))?;
+        let name = get("name");
+        let base_url = get("baseUrl");
+        let api_key = get("apiKey");
+        let enc = if api_key.trim().is_empty() {
+            match old_keys.get(&(name.clone(), base_url.clone())) {
+                Some(old_enc) => old_enc.clone(),
+                None => encrypt_secret("")?,
+            }
+        } else {
+            encrypt_secret(&api_key)?
+        };
         tx.execute(
             "INSERT INTO providers (name, base_url, api_key_enc, kind, models_json,
              default_model, timeout_secs, template_url, template_body, template_response_path)
              VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![
-                get("name"),
-                get("baseUrl"),
+                name,
+                base_url,
                 enc,
                 get("kind"),
                 get("modelsJson"),
@@ -432,6 +694,10 @@ pub fn import_config(data: &serde_json::Value) -> AppResult<usize> {
             ],
         )?;
         let new_id = tx.last_insert_rowid();
+        // 仅新版导出（provider 带整数 id）才能建立旧→新映射；旧导出无 id 则无从映射
+        if let Some(old_id) = p.get("id").and_then(|v| v.as_i64()) {
+            id_map.insert(old_id, new_id);
+        }
         // 恢复透传参数（extraParams 存于 settings KV，导入时必须一并恢复）
         if let Some(ep) = p.get("extraParams").and_then(|v| v.as_str()) {
             tx.execute(
@@ -441,16 +707,69 @@ pub fn import_config(data: &serde_json::Value) -> AppResult<usize> {
             )?;
         }
     }
-    if let Some(settings) = data.get("settings").and_then(|s| s.as_object()) {
-        for (k, v) in settings {
-            if let Some(s) = v.as_str() {
-                tx.execute(
-                    "INSERT INTO settings (key, value) VALUES (?1, ?2)
-                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                    params![k, s],
-                )?;
+    if let Some(settings) = settings {
+        let allowed = if version >= 2 {
+            IMPORT_SETTINGS_V2
+        } else {
+            IMPORT_SETTINGS_V1
+        };
+        for k in allowed {
+            let Some(value) = settings.get(*k).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            // P0-2：defaultProviderId 存的是服务商 id，导入后 id 已变，必须重映射；
+            // 无法映射（旧格式导出 / 指向不存在的服务商）时删除该设置，避免默认服务商悬空
+            if *k == "defaultProviderId" {
+                let mapped = value
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+                    .and_then(|old_id| id_map.get(&old_id).copied());
+                match mapped {
+                    Some(new_id) => {
+                        tx.execute(
+                            "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                            params![k, new_id.to_string()],
+                        )?;
+                    }
+                    None => {
+                        tx.execute("DELETE FROM settings WHERE key = ?1", params![k])?;
+                        tracing::warn!(
+                            "配置导入：defaultProviderId={value} 无法映射到导入后的服务商，已清除该设置"
+                        );
+                    }
+                }
+                continue;
             }
+            tx.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![k, value],
+            )?;
         }
+    }
+    // 思考模型：只覆盖导出的非密钥字段，providerId 按 id_map 重映射，密文沿用本机
+    if let Some(t) = thinking {
+        let obj = t.as_object().expect("思考模型配置已在事务前校验为对象");
+        let old_pid = obj.get("providerId").and_then(|v| v.as_i64());
+        let provider_id = old_pid.and_then(|old| id_map.get(&old).copied());
+        if old_pid.is_some() && provider_id.is_none() {
+            tracing::warn!("配置导入：思考模型 providerId 无法映射到导入后的服务商，已清空");
+        }
+        let value = serde_json::json!({
+            "enabled": obj.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+            "mode": obj.get("mode").and_then(|v| v.as_str()).unwrap_or("reuse"),
+            "providerId": provider_id,
+            "baseUrl": obj.get("baseUrl").and_then(|v| v.as_str()).unwrap_or_default(),
+            "apiKeyEnc": old_thinking_enc,
+            "model": obj.get("model").and_then(|v| v.as_str()).unwrap_or_default(),
+        });
+        tx.execute(
+            "INSERT INTO settings (key, value) VALUES ('thinkingConfig', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![value.to_string()],
+        )?;
     }
     tx.commit()?;
     Ok(providers.len())
@@ -481,26 +800,50 @@ pub fn add_history(h: &HistoryRow) -> AppResult<i64> {
     Ok(c.last_insert_rowid())
 }
 
-pub fn list_history(limit: i64, offset: i64, model_filter: &str) -> AppResult<Vec<HistoryRow>> {
+pub fn list_history(
+    limit: i64,
+    offset: i64,
+    model_filter: &str,
+    style_filter: &str,
+) -> AppResult<Vec<HistoryRow>> {
     let c = conn()?;
-    let sql = if model_filter.is_empty() {
-        "SELECT id, prompt, negative_prompt, model, provider_name, seed, width, height,
-         guidance, steps, style, file_path, favorite, created_at
-         FROM history ORDER BY id DESC LIMIT ?1 OFFSET ?2"
-            .to_string()
+    let mut conditions = Vec::new();
+    if !model_filter.is_empty() {
+        conditions.push("model = ?");
+    }
+    if !style_filter.is_empty() {
+        conditions.push("style = ?");
+    }
+    let where_clause = if conditions.is_empty() {
+        String::new()
     } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+    let sql = format!(
         "SELECT id, prompt, negative_prompt, model, provider_name, seed, width, height,
          guidance, steps, style, file_path, favorite, created_at
-         FROM history WHERE model = ?3 ORDER BY id DESC LIMIT ?1 OFFSET ?2"
-            .to_string()
-    };
+         FROM history{where_clause} ORDER BY id DESC LIMIT ? OFFSET ?"
+    );
     let mut stmt = c.prepare(&sql)?;
-    let rows = if model_filter.is_empty() {
-        stmt.query_map(params![limit, offset], history_from_row)?
-    } else {
-        stmt.query_map(params![limit, offset, model_filter], history_from_row)?
-    };
+    let mut values: Vec<&dyn rusqlite::ToSql> = Vec::new();
+    if !model_filter.is_empty() {
+        values.push(&model_filter);
+    }
+    if !style_filter.is_empty() {
+        values.push(&style_filter);
+    }
+    values.push(&limit);
+    values.push(&offset);
+    let rows = stmt.query_map(values.as_slice(), history_from_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+/// 画廊记录的原图路径（get_history_image 用）；记录不存在返回 None
+pub fn history_file_path(id: i64) -> AppResult<Option<String>> {
+    let c = conn()?;
+    let mut stmt = c.prepare("SELECT file_path FROM history WHERE id = ?1")?;
+    let mut rows = stmt.query_map(params![id], |r| r.get(0))?;
+    Ok(rows.next().transpose()?)
 }
 
 fn history_from_row(row: &rusqlite::Row) -> rusqlite::Result<HistoryRow> {
@@ -530,17 +873,87 @@ pub fn set_favorite(id: i64, favorite: bool) -> AppResult<()> {
     Ok(())
 }
 
-pub fn delete_history(id: i64) -> AppResult<Option<String>> {
+/// 文件删除决策：调用方据此决定是否回收磁盘文件。
+pub struct HistoryDeletion {
+    pub file_path: Option<String>,
+    /// true = 仍有 messages 或其它 history 行引用该文件，**不得删除文件**
+    pub still_referenced: bool,
+}
+
+pub fn delete_history(id: i64) -> AppResult<HistoryDeletion> {
     let c = conn()?;
-    let path: Option<String> = c
+    delete_history_in(&c, id)
+}
+
+/// 先删行、再取引用集合：被删的那一行不能为文件"自我担保"，
+/// 否则任何删除都会被判定为"仍被引用"。整个过程在一个事务内，
+/// 避免与并发的消息写入交错导致漏判。
+pub(crate) fn delete_history_in(c: &Connection, id: i64) -> AppResult<HistoryDeletion> {
+    let tx = c.unchecked_transaction()?;
+    let path: Option<String> = tx
         .query_row(
             "SELECT file_path FROM history WHERE id = ?1",
             params![id],
             |r| r.get(0),
         )
         .ok();
-    c.execute("DELETE FROM history WHERE id = ?1", params![id])?;
-    Ok(path)
+    tx.execute("DELETE FROM history WHERE id = ?1", params![id])?;
+    let still_referenced = match path.as_deref() {
+        Some(p) if !p.is_empty() => {
+            collect_referenced_paths_in(&tx)?.contains(&normalize_path_key(p))
+        }
+        _ => false,
+    };
+    tx.commit()?;
+    Ok(HistoryDeletion {
+        file_path: path,
+        still_referenced,
+    })
+}
+
+/// 路径比较键：分隔符统一为 `\`、忽略大小写。
+///
+/// Windows 上同一文件可能写成 `C:/a/b.png` 或 `c:\A\B.PNG`，直接字符串比较
+/// 会漏判"仍被引用"，进而误删聊天里正在显示的图。
+pub(crate) fn normalize_path_key(p: &str) -> String {
+    p.trim().replace('/', "\\").to_lowercase()
+}
+
+/// 引用集合 = `history.file_path` ∪ `messages.images_json[].path`。
+///
+/// 用 JSON 结构化解析而不是 LIKE：JSON 里的 Windows 路径是转义双反斜杠，
+/// LIKE 匹配不上；子串匹配还会让 `a.png` 命中 `xa.png`。
+/// `CASE + json_valid` 是必需的：`json_each` 遇到坏 JSON 会让整条查询报错，
+/// 一行脏数据就能让回收链路全线失效。
+pub(crate) fn collect_referenced_paths_in(c: &Connection) -> AppResult<HashSet<String>> {
+    const SQL: &str = "
+        SELECT file_path FROM history WHERE file_path <> ''
+        UNION
+        SELECT json_extract(j.value, '$.path')
+        FROM messages m
+        JOIN json_each(CASE WHEN json_valid(m.images_json)
+                            THEN m.images_json ELSE '[]' END) AS j
+        WHERE json_type(j.value, '$.path') = 'text'
+    ";
+    let mut stmt = c.prepare(SQL)?;
+    let rows = stmt.query_map([], |r| r.get::<_, Option<String>>(0))?;
+    let mut out = HashSet::new();
+    for row in rows {
+        if let Some(p) = row? {
+            let key = normalize_path_key(&p);
+            if !key.is_empty() {
+                out.insert(key);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 供启动扫描使用的快照入口：内部短暂持锁，返回后即释放，
+/// 扫描线程不在遍历磁盘期间占用数据库锁。
+pub(crate) fn referenced_image_paths_snapshot() -> AppResult<HashSet<String>> {
+    let c = conn()?;
+    collect_referenced_paths_in(&c)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -554,6 +967,8 @@ pub struct ConversationRow {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageRow {
+    /// id 由数据库生成；#[serde(default)] 作为纵深防御，避免 IPC 入参缺 id 时反序列化失败
+    #[serde(default)]
     pub id: i64,
     pub conversation_id: i64,
     pub role: String,
@@ -588,12 +1003,32 @@ pub fn list_conversations() -> AppResult<Vec<ConversationRow>> {
 
 pub fn delete_conversation(id: i64) -> AppResult<()> {
     let c = conn()?;
-    c.execute(
+    delete_conversation_in(&c, id)
+}
+
+/// 会话与其消息必须同时消失：中途失败留下孤儿 messages，
+/// 之后既不会出现在界面里，也不会被任何清理逻辑回收。
+pub(crate) fn delete_conversation_in(c: &Connection, id: i64) -> AppResult<()> {
+    let tx = c.unchecked_transaction()?;
+    tx.execute(
         "DELETE FROM messages WHERE conversation_id = ?1",
         params![id],
     )?;
-    c.execute("DELETE FROM conversations WHERE id = ?1", params![id])?;
+    tx.execute("DELETE FROM conversations WHERE id = ?1", params![id])?;
+    tx.commit()?;
     Ok(())
+}
+
+/// 删除单条消息，返回是否命中。**不删图片文件**：同一个 path 可能还被
+/// history（画廊）引用，删文件必须走画廊/附件各自的回收逻辑。
+pub fn delete_message(id: i64) -> AppResult<bool> {
+    let c = conn()?;
+    delete_message_in(&c, id)
+}
+
+pub(crate) fn delete_message_in(c: &Connection, id: i64) -> AppResult<bool> {
+    let affected = c.execute("DELETE FROM messages WHERE id = ?1", params![id])?;
+    Ok(affected > 0)
 }
 
 pub fn add_message(m: &MessageRow) -> AppResult<i64> {
@@ -614,25 +1049,55 @@ pub fn add_message(m: &MessageRow) -> AppResult<i64> {
     Ok(c.last_insert_rowid())
 }
 
-pub fn list_messages(conversation_id: i64) -> AppResult<Vec<MessageRow>> {
+/// 按会话取一页消息：`before_id` 为空表示最新一页，否则取该 id 之前（更旧）的消息。
+///
+/// 用 keyset 分页（id < before_id）而不是 OFFSET：OFFSET 在长会话里越翻越慢，
+/// 且翻页期间新增消息会让窗口错位。返回值按 id 升序（渲染顺序），`has_more`
+/// 表示还有更旧的消息可加载。
+pub fn list_messages(
+    conversation_id: i64,
+    limit: i64,
+    before_id: Option<i64>,
+) -> AppResult<(Vec<MessageRow>, bool)> {
     let c = conn()?;
+    list_messages_in(&c, conversation_id, limit, before_id)
+}
+
+pub(crate) fn list_messages_in(
+    c: &Connection,
+    conversation_id: i64,
+    limit: i64,
+    before_id: Option<i64>,
+) -> AppResult<(Vec<MessageRow>, bool)> {
+    let limit = limit.clamp(1, 200);
+    // id <= 0 是前端占位消息的本地 id，不能当游标
+    let before = before_id.filter(|id| *id > 0);
     let mut stmt = c.prepare(
         "SELECT id, conversation_id, role, content, refined_content, images_json,
-         params_json, created_at FROM messages WHERE conversation_id = ?1 ORDER BY id",
+         params_json, created_at FROM messages
+         WHERE conversation_id = ?1 AND (?2 IS NULL OR id < ?2)
+         ORDER BY id DESC LIMIT ?3",
     )?;
-    let rows = stmt.query_map(params![conversation_id], |r| {
-        Ok(MessageRow {
-            id: r.get(0)?,
-            conversation_id: r.get(1)?,
-            role: r.get(2)?,
-            content: r.get(3)?,
-            refined_content: r.get(4)?,
-            images_json: r.get(5)?,
-            params_json: r.get(6)?,
-            created_at: r.get(7)?,
-        })
-    })?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+    // 多取一条用来判断是否还有更旧的页
+    let mut rows = stmt
+        .query_map(params![conversation_id, before, limit + 1], |r| {
+            Ok(MessageRow {
+                id: r.get(0)?,
+                conversation_id: r.get(1)?,
+                role: r.get(2)?,
+                content: r.get(3)?,
+                refined_content: r.get(4)?,
+                images_json: r.get(5)?,
+                params_json: r.get(6)?,
+                created_at: r.get(7)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AppError::from)?;
+    let has_more = rows.len() as i64 > limit;
+    rows.truncate(limit as usize);
+    rows.reverse();
+    Ok((rows, has_more))
 }
 
 /// 可排序的毫秒时间戳（秒.毫秒格式），不依赖 chrono
@@ -654,13 +1119,21 @@ pub fn update_message_images(id: i64, images_json: &str) -> AppResult<()> {
 
 // 避免引入 hex crate 的小工具
 mod hex {
+    /// 按字节两两解析，并显式拒绝非 ASCII 输入。
+    /// 旧实现先按字节长度判断偶数、再用 `&s[i..i + 2]` 切片，遇到多字节字符
+    /// （例如把 MOLING_MASTER_KEY_HEX 误设成中文）会在 UTF-8 边界 panic。
     pub fn decode_inner(s: &str) -> Result<Vec<u8>, String> {
-        if !s.len().is_multiple_of(2) {
+        let bytes = s.as_bytes();
+        if !bytes.len().is_multiple_of(2) {
             return Err("hex 长度异常".into());
         }
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| e.to_string()))
+        bytes
+            .chunks(2)
+            .map(|pair| {
+                let text =
+                    std::str::from_utf8(pair).map_err(|_| "hex 含非 ASCII 字符".to_string())?;
+                u8::from_str_radix(text, 16).map_err(|e| e.to_string())
+            })
             .collect()
     }
 }
@@ -674,6 +1147,62 @@ mod tests {
 
     fn test_dir() -> PathBuf {
         std::env::temp_dir().join(format!("moling-test-{}", std::process::id()))
+    }
+
+    /// 单测用内存库：跑与线上完全相同的迁移序列，避免测试库 schema 漂移。
+    /// （全局 DB 是 OnceLock，无法在测试里重复 init）
+    fn mem_conn() -> Connection {
+        let mut c = Connection::open_in_memory().expect("open in-memory db");
+        apply_migrations(&mut c).expect("apply migrations");
+        c
+    }
+
+    fn user_version_of(c: &Connection) -> i64 {
+        c.query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("read user_version")
+    }
+
+    fn index_exists(c: &Connection, name: &str) -> bool {
+        c.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            params![name],
+            |r| r.get::<_, i64>(0),
+        )
+        .expect("query sqlite_master")
+            > 0
+    }
+
+    fn insert_message(c: &Connection, conversation_id: i64, content: &str) -> i64 {
+        c.execute(
+            "INSERT INTO messages (conversation_id, role, content, refined_content,
+             images_json, params_json, created_at) VALUES (?1,'user',?2,'','[]','{}','0.000')",
+            params![conversation_id, content],
+        )
+        .expect("insert message");
+        c.last_insert_rowid()
+    }
+
+    fn count_providers(c: &Connection) -> i64 {
+        c.query_row("SELECT COUNT(*) FROM providers", [], |r| r.get(0))
+            .expect("count providers")
+    }
+
+    fn provider_id_by_name(c: &Connection, name: &str) -> i64 {
+        c.query_row(
+            "SELECT id FROM providers WHERE name = ?1",
+            params![name],
+            |r| r.get(0),
+        )
+        .expect("provider id")
+    }
+
+    fn setting_of(c: &Connection, key: &str) -> Option<String> {
+        c.query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .ok()
     }
 
     fn draft<'a>(
@@ -821,10 +1350,8 @@ mod tests {
                 .as_deref(),
             Some(r#"{"quality":"high"}"#)
         );
-        assert_eq!(
-            get_setting("defaultProviderId").unwrap().as_deref(),
-            Some("7")
-        );
+        // P0-2：旧格式导出（provider 无 id）无法映射 defaultProviderId，导入后应清除而非悬空
+        assert!(get_setting("defaultProviderId").unwrap().is_none());
 
         // 替换语义：导入空 providers 数组 = 清空全部服务商
         let empty = serde_json::json!({ "version": 1, "providers": [] });
@@ -849,20 +1376,598 @@ mod tests {
             created_at: "1".into(),
         })
         .unwrap();
-        let history = list_history(10, 0, "").unwrap();
+        let history = list_history(10, 0, "", "").unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].id, hid);
         assert_eq!(history[0].seed, Some(7));
         set_favorite(hid, true).unwrap();
-        assert!(list_history(10, 0, "").unwrap()[0].favorite);
-        let path = delete_history(hid).unwrap();
-        assert_eq!(path.as_deref(), Some("/tmp/x.png"));
-        assert!(list_history(10, 0, "").unwrap().is_empty());
+        assert!(list_history(10, 0, "", "").unwrap()[0].favorite);
+        let plan = delete_history(hid).unwrap();
+        assert_eq!(plan.file_path.as_deref(), Some("/tmp/x.png"));
+        assert!(!plan.still_referenced, "无消息引用时应允许回收文件");
+        assert!(list_history(10, 0, "", "").unwrap().is_empty());
 
         delete_provider(after[0].id).unwrap();
         assert!(list_providers().unwrap().is_empty());
 
         std::env::remove_var(MASTER_KEY_ENV);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P0-2：缺 providers 数组必须在任何 DELETE 之前拒绝，表内旧数据保持不变
+    #[test]
+    fn import_config_requires_providers_array() {
+        let mut c = mem_conn();
+        c.execute(
+            "INSERT INTO providers (name, base_url, api_key_enc) VALUES ('旧服务商', '', '')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO settings (key, value) VALUES ('defaultProviderId', '1')",
+            [],
+        )
+        .unwrap();
+        // 缺失与类型错误都必须报错，且错误文案指明已取消导入
+        for bad in [
+            serde_json::json!({ "version": 1 }),
+            serde_json::json!({ "version": 1, "providers": "oops" }),
+        ] {
+            let err = import_config_in(&mut c, &bad).expect_err("providers 非法应报错");
+            assert!(err.to_string().contains("缺少 providers 数组"), "{err}");
+            assert_eq!(count_providers(&c), 1);
+            assert_eq!(setting_of(&c, "defaultProviderId").as_deref(), Some("1"));
+        }
+    }
+
+    /// P0-2：导入后 extraParams 必须挂到新自增 id 上，不能留在旧 id
+    #[test]
+    fn import_config_realigns_extra_params_to_new_ids() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(MASTER_KEY_ENV, "aa".repeat(32));
+        let mut c = mem_conn();
+        c.execute(
+            "INSERT INTO providers (name, base_url, api_key_enc) VALUES ('旧服务商', '', '')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO settings (key, value) VALUES ('extraParams:1', '{\"old\":true}')",
+            [],
+        )
+        .unwrap();
+        let data = serde_json::json!({
+            "version": 1,
+            "providers": [{
+                "id": 5,
+                "name": "新服务商",
+                "extraParams": r#"{"quality":"high"}"#,
+            }],
+        });
+        import_config_in(&mut c, &data).expect("import");
+        let new_id = provider_id_by_name(&c, "新服务商");
+        assert_ne!(new_id, 1);
+        assert_eq!(
+            setting_of(&c, &format!("extraParams:{new_id}")).as_deref(),
+            Some(r#"{"quality":"high"}"#)
+        );
+        // 旧 id 的 extraParams 随替换语义一并删除
+        assert!(setting_of(&c, "extraParams:1").is_none());
+        std::env::remove_var(MASTER_KEY_ENV);
+    }
+
+    /// P0-2：defaultProviderId 按旧 id → 新 id 重映射，其它设置原样恢复
+    #[test]
+    fn import_config_maps_default_provider_id_to_new_id() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(MASTER_KEY_ENV, "aa".repeat(32));
+        let mut c = mem_conn();
+        let data = serde_json::json!({
+            "version": 1,
+            "providers": [
+                { "id": 5, "name": "A" },
+                { "id": 9, "name": "B" },
+            ],
+            "settings": { "defaultProviderId": "9", "defaultParams": "{\"steps\":30}" },
+        });
+        import_config_in(&mut c, &data).expect("import");
+        let b_id = provider_id_by_name(&c, "B").to_string();
+        assert_eq!(
+            setting_of(&c, "defaultProviderId").as_deref(),
+            Some(b_id.as_str())
+        );
+        assert_eq!(
+            setting_of(&c, "defaultParams").as_deref(),
+            Some("{\"steps\":30}")
+        );
+        std::env::remove_var(MASTER_KEY_ENV);
+    }
+
+    /// P0-2：旧格式导出（provider 无 id）无法映射 defaultProviderId，导入后清除该设置
+    #[test]
+    fn import_config_clears_default_provider_id_for_legacy_export() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(MASTER_KEY_ENV, "aa".repeat(32));
+        let mut c = mem_conn();
+        c.execute(
+            "INSERT INTO settings (key, value) VALUES ('defaultProviderId', '7')",
+            [],
+        )
+        .unwrap();
+        let data = serde_json::json!({
+            "version": 1,
+            "providers": [{ "name": "旧格式服务商" }],
+            "settings": { "defaultProviderId": "7", "defaultParams": "{}" },
+        });
+        import_config_in(&mut c, &data).expect("import");
+        assert!(setting_of(&c, "defaultProviderId").is_none());
+        // 其它设置项照旧写入
+        assert_eq!(setting_of(&c, "defaultParams").as_deref(), Some("{}"));
+        std::env::remove_var(MASTER_KEY_ENV);
+    }
+
+    /// v2：无 Key 导入按 name+baseUrl 复用旧密文；主题 / 模板 / 思考配置恢复，
+    /// 思考模型 providerId 重映射到新 id 且密文保留
+    #[test]
+    fn import_config_v2_reuses_keys_and_restores_settings() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(MASTER_KEY_ENV, "aa".repeat(32));
+        let mut c = mem_conn();
+        let old_enc = encrypt_secret("sk-old-secret").unwrap();
+        c.execute(
+            "INSERT INTO providers (name, base_url, api_key_enc)
+             VALUES ('同机服务商', 'https://api.example.com', ?1)",
+            params![old_enc],
+        )
+        .unwrap();
+        let old_pid: i64 = c.last_insert_rowid();
+        let thinking = serde_json::json!({
+            "enabled": true,
+            "mode": "reuse",
+            "providerId": old_pid,
+            "baseUrl": "https://api.example.com",
+            "model": "gpt-4o-mini",
+            "apiKeyEnc": encrypt_secret("thinking-secret").unwrap(),
+        });
+        c.execute(
+            "INSERT INTO settings (key, value) VALUES ('thinkingConfig', ?1)",
+            params![thinking.to_string()],
+        )
+        .unwrap();
+
+        let data = serde_json::json!({
+            "version": 2,
+            "exportedAt": "1.000",
+            "providers": [
+                {
+                    "id": 9,
+                    "name": "同机服务商",
+                    "baseUrl": "https://api.example.com",
+                    "apiKey": "",
+                    "hasKey": true,
+                    "kind": "openai",
+                    "defaultModel": "gpt-image-1",
+                },
+                {
+                    "id": 10,
+                    "name": "新服务商",
+                    "baseUrl": "https://new.example.com",
+                    "apiKey": "sk-new-secret",
+                    "kind": "openai",
+                },
+            ],
+            "settings": {
+                "defaultProviderId": "9",
+                "theme": "dark",
+                "promptTemplates": r#"[{"id":"my","title":"我的模板","text":"a {subject}"}]"#,
+                "unknownKey": "ignored",
+            },
+            "thinking": {
+                "enabled": true,
+                "mode": "reuse",
+                "providerId": 9,
+                "baseUrl": "https://api.example.com",
+                "model": "gpt-4o-mini",
+            },
+        });
+        import_config_in(&mut c, &data).expect("import v2");
+
+        let reused_id = provider_id_by_name(&c, "同机服务商");
+        let reused_enc: String = c
+            .query_row(
+                "SELECT api_key_enc FROM providers WHERE id = ?1",
+                params![reused_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(decrypt_secret(&reused_enc).unwrap(), "sk-old-secret");
+        let new_id = provider_id_by_name(&c, "新服务商");
+        let new_enc: String = c
+            .query_row(
+                "SELECT api_key_enc FROM providers WHERE id = ?1",
+                params![new_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(decrypt_secret(&new_enc).unwrap(), "sk-new-secret");
+
+        assert_eq!(setting_of(&c, "theme").as_deref(), Some("dark"));
+        let default_id = setting_of(&c, "defaultProviderId").expect("默认服务商已恢复");
+        assert_eq!(default_id, reused_id.to_string());
+        assert!(setting_of(&c, "promptTemplates")
+            .expect("模板已导入")
+            .contains("我的模板"));
+        // 白名单外的设置项不落库
+        assert!(setting_of(&c, "unknownKey").is_none());
+
+        let raw = setting_of(&c, "thinkingConfig").expect("思考配置已导入");
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["providerId"].as_i64(), Some(reused_id));
+        assert_eq!(v["model"].as_str(), Some("gpt-4o-mini"));
+        // 密文沿用本机旧值，换机导入不会丢思考模型 Key
+        assert_eq!(
+            decrypt_secret(v["apiKeyEnc"].as_str().unwrap()).unwrap(),
+            "thinking-secret"
+        );
+        std::env::remove_var(MASTER_KEY_ENV);
+    }
+
+    /// v2：非法主题 / 模板 / 思考配置必须在 DELETE 前拒绝，旧数据保持不变
+    #[test]
+    fn import_config_v2_validates_before_delete() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var(MASTER_KEY_ENV, "aa".repeat(32));
+        let mut c = mem_conn();
+        c.execute(
+            "INSERT INTO providers (name, base_url, api_key_enc) VALUES ('旧服务商', '', '')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO settings (key, value) VALUES ('theme', 'light')",
+            [],
+        )
+        .unwrap();
+        let bad_settings = [
+            (serde_json::json!({ "theme": "purple" }), "主题取值非法"),
+            (
+                serde_json::json!({ "promptTemplates": "not-json" }),
+                "自定义模板",
+            ),
+            (
+                serde_json::json!({ "promptTemplates": "[{\"id\":\"a\"}]" }),
+                "自定义模板",
+            ),
+        ];
+        for (settings, needle) in bad_settings {
+            let data = serde_json::json!({
+                "version": 2,
+                "providers": [{ "name": "新服务商" }],
+                "settings": settings,
+            });
+            let err = import_config_in(&mut c, &data).expect_err("应拒绝导入");
+            assert!(err.to_string().contains(needle), "{err}");
+            assert_eq!(count_providers(&c), 1);
+            assert_eq!(setting_of(&c, "theme").as_deref(), Some("light"));
+        }
+        let bad_thinking = serde_json::json!({
+            "version": 2,
+            "providers": [],
+            "thinking": { "enabled": true, "mode": "weird" },
+        });
+        let err = import_config_in(&mut c, &bad_thinking).expect_err("应拒绝导入");
+        assert!(err.to_string().contains("思考模型"), "{err}");
+        assert_eq!(count_providers(&c), 1);
+        std::env::remove_var(MASTER_KEY_ENV);
+    }
+
+    /// A1：迁移跑完 user_version 等于迁移条数，且三张高频索引都存在
+    #[test]
+    fn migrations_set_schema_version_and_indexes() {
+        let c = mem_conn();
+        assert_eq!(user_version_of(&c), SCHEMA_VERSION);
+        for name in [
+            "idx_messages_conversation",
+            "idx_history_created",
+            "idx_history_model",
+        ] {
+            assert!(index_exists(&c, name), "缺少索引 {name}");
+        }
+    }
+
+    /// A1：重复执行迁移是幂等的（每次启动都会跑一遍）
+    #[test]
+    fn migrations_are_idempotent() {
+        let mut c = mem_conn();
+        apply_migrations(&mut c).expect("second run");
+        assert_eq!(user_version_of(&c), SCHEMA_VERSION);
+    }
+
+    /// A1：旧库（user_version=0，只有表没有索引）升级后数据原样保留
+    #[test]
+    fn legacy_database_upgrade_preserves_rows() {
+        let mut c = Connection::open_in_memory().unwrap();
+        c.execute_batch(SCHEMA_SQL).expect("legacy tables");
+        assert_eq!(user_version_of(&c), 0);
+        c.execute(
+            "INSERT INTO providers (name, base_url, api_key_enc) VALUES ('旧服务商', '', '')",
+            [],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO conversations (title, created_at) VALUES ('旧会话', '0.000')",
+            [],
+        )
+        .unwrap();
+        let cid = c.last_insert_rowid();
+        insert_message(&c, cid, "旧消息");
+
+        apply_migrations(&mut c).expect("upgrade");
+
+        assert_eq!(user_version_of(&c), SCHEMA_VERSION);
+        assert!(index_exists(&c, "idx_messages_conversation"));
+        assert_eq!(count_providers(&c), 1);
+        let (messages, has_more) = list_messages_in(&c, cid, 50, None).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content, "旧消息");
+        assert!(!has_more);
+    }
+
+    /// A1：迁移失败必须整体回滚，且不推进 user_version（否则下次启动会跳过它）
+    #[test]
+    fn failed_migration_rolls_back_and_keeps_version() {
+        let mut c = Connection::open_in_memory().unwrap();
+        let bad = "CREATE TABLE half_done (id INTEGER); INSERT INTO nope VALUES (1);";
+        let err = apply_migrations_with(&mut c, &[("999_bad", bad)]).expect_err("必须失败");
+        assert!(err.to_string().contains("999_bad"), "{err}");
+        assert_eq!(user_version_of(&c), 0);
+        let half_table: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='half_done'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(half_table, 0, "失败迁移创建的表应被回滚");
+    }
+
+    /// A1：升级已有数据的库文件前会留一份 moling.db.bak-migrate-* 快照
+    #[test]
+    fn legacy_file_is_backed_up_before_migration() {
+        let dir = std::env::temp_dir().join(format!("moling-migrate-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("moling.db");
+        {
+            let c = Connection::open(&db_path).unwrap();
+            c.execute_batch(SCHEMA_SQL).unwrap();
+            c.execute(
+                "INSERT INTO providers (name, base_url, api_key_enc) VALUES ('老库', '', '')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let upgraded = open_and_migrate(&db_path).expect("upgrade legacy file");
+        assert_eq!(user_version_of(&upgraded), SCHEMA_VERSION);
+        assert_eq!(count_providers(&upgraded), 1);
+        drop(upgraded);
+
+        let backups: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("moling.db.bak-migrate-"))
+            .collect();
+        assert_eq!(backups.len(), 1, "应有一份迁移前备份：{backups:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A3：删除会话时中途失败要整体回滚，不能留下孤儿 messages
+    #[test]
+    fn delete_conversation_rolls_back_on_failure() {
+        let c = mem_conn();
+        c.execute_batch(
+            "CREATE TRIGGER fail_message_delete BEFORE DELETE ON messages
+             BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO conversations (title, created_at) VALUES ('会话', '0.000')",
+            [],
+        )
+        .unwrap();
+        let cid = c.last_insert_rowid();
+        insert_message(&c, cid, "hi");
+
+        let err = delete_conversation_in(&c, cid).expect_err("应触发回滚");
+        assert!(err.to_string().contains("boom"), "{err}");
+        let messages: i64 = c
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        let conversations: i64 = c
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(messages, 1, "回滚后消息必须还在");
+        assert_eq!(conversations, 1);
+    }
+
+    /// A2：keyset 分页从新到旧逐页取，顺序为渲染顺序（id 升序），不串会话
+    #[test]
+    fn keyset_pagination_walks_backwards() {
+        let c = mem_conn();
+        c.execute(
+            "INSERT INTO conversations (title, created_at) VALUES ('A', '0.000')",
+            [],
+        )
+        .unwrap();
+        let a = c.last_insert_rowid();
+        c.execute(
+            "INSERT INTO conversations (title, created_at) VALUES ('B', '0.000')",
+            [],
+        )
+        .unwrap();
+        let b = c.last_insert_rowid();
+        for i in 1..=120 {
+            insert_message(&c, a, &format!("m{i}"));
+        }
+        insert_message(&c, b, "other");
+
+        let (page1, more1) = list_messages_in(&c, a, 50, None).unwrap();
+        assert_eq!(page1.len(), 50);
+        assert!(more1);
+        assert_eq!(page1.first().unwrap().content, "m71");
+        assert_eq!(page1.last().unwrap().content, "m120");
+
+        let (page2, more2) = list_messages_in(&c, a, 50, Some(page1.first().unwrap().id)).unwrap();
+        assert_eq!(page2.len(), 50);
+        assert!(more2);
+        assert_eq!(page2.first().unwrap().content, "m21");
+        assert_eq!(page2.last().unwrap().content, "m70");
+
+        let (page3, more3) = list_messages_in(&c, a, 50, Some(page2.first().unwrap().id)).unwrap();
+        assert_eq!(page3.len(), 20);
+        assert!(!more3);
+        assert_eq!(page3.first().unwrap().content, "m1");
+        assert_eq!(page3.last().unwrap().content, "m20");
+        assert!(page1.iter().all(|m| m.conversation_id == a));
+        // 本地占位消息的负数 id 不能当游标（等价于取最新一页）
+        let (fresh, _) = list_messages_in(&c, a, 5, Some(-1)).unwrap();
+        assert_eq!(fresh.last().unwrap().content, "m120");
+        // limit 越界时收敛到 1..=200
+        let (clamped, _) = list_messages_in(&c, a, 10_000, None).unwrap();
+        assert_eq!(clamped.len(), 120);
+    }
+
+    /// A3：delete_message 只删目标行，返回是否命中
+    #[test]
+    fn delete_message_removes_only_target_row() {
+        let c = mem_conn();
+        c.execute(
+            "INSERT INTO conversations (title, created_at) VALUES ('A', '0.000')",
+            [],
+        )
+        .unwrap();
+        let cid = c.last_insert_rowid();
+        let first = insert_message(&c, cid, "a");
+        let second = insert_message(&c, cid, "b");
+        let third = insert_message(&c, cid, "c");
+
+        assert!(delete_message_in(&c, second).unwrap());
+        assert!(
+            !delete_message_in(&c, second).unwrap(),
+            "重复删除应返回 false"
+        );
+        let (left, _) = list_messages_in(&c, cid, 50, None).unwrap();
+        let ids: Vec<i64> = left.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![first, third]);
+    }
+
+    /// B1 同类：非 ASCII 主密钥必须报错而不是在 UTF-8 边界 panic
+    #[test]
+    fn hex_key_parsing_rejects_non_ascii() {
+        assert!(parse_hex_key("密钥密钥").is_err());
+        assert!(parse_hex_key("aa密").is_err());
+    }
+
+    fn insert_history_row(c: &Connection, file_path: &str) -> i64 {
+        c.execute(
+            "INSERT INTO history (prompt, negative_prompt, model, provider_name, seed, width,
+             height, guidance, steps, style, file_path, favorite, created_at)
+             VALUES ('p','','m','pv',NULL,1024,1024,0,0,'', ?1, 0, '0.000')",
+            params![file_path],
+        )
+        .expect("insert history");
+        c.last_insert_rowid()
+    }
+
+    fn set_message_images(c: &Connection, id: i64, images_json: &str) {
+        c.execute(
+            "UPDATE messages SET images_json = ?2 WHERE id = ?1",
+            params![id, images_json],
+        )
+        .expect("update images_json");
+    }
+
+    fn count_history_rows(c: &Connection) -> i64 {
+        c.query_row("SELECT COUNT(*) FROM history", [], |r| r.get(0))
+            .expect("count history")
+    }
+
+    /// 路径归一化：分隔符与大小写差异不得影响"是否仍被引用"的判定
+    #[test]
+    fn normalize_path_key_unifies_separators_and_case() {
+        assert_eq!(
+            normalize_path_key("C:/Users/A/b.PNG"),
+            normalize_path_key(r"C:\users\a\B.png")
+        );
+        assert_eq!(normalize_path_key("  x  "), "x");
+    }
+
+    /// 引用集合必须覆盖 history.file_path 与 messages 里的两种 path 形态
+    /// （生成图 `{historyId,path}`、附件 `{id,name,path}`）
+    #[test]
+    fn referenced_paths_cover_history_and_messages() {
+        let c = mem_conn();
+        insert_history_row(&c, r"C:\data\images\a.png");
+        let generated = insert_message(&c, 1, "hi");
+        set_message_images(
+            &c,
+            generated,
+            r#"[{"historyId":1,"path":"C:\\data\\images\\b.png"}]"#,
+        );
+        let attachment = insert_message(&c, 1, "ref");
+        set_message_images(
+            &c,
+            attachment,
+            r#"[{"id":"x","name":"n","path":"C:\\data\\images\\c.png"}]"#,
+        );
+        let set = collect_referenced_paths_in(&c).expect("collect");
+        for p in [
+            r"C:\data\images\a.png",
+            r"C:\data\images\b.png",
+            r"C:\data\images\c.png",
+        ] {
+            assert!(set.contains(&normalize_path_key(p)), "缺少引用: {p}");
+        }
+        assert_eq!(set.len(), 3, "同路径重复出现应去重");
+    }
+
+    /// 坏 JSON 不能拖垮整条查询：一行脏数据就会让回收链路全线失效
+    #[test]
+    fn referenced_paths_survive_corrupt_images_json() {
+        let c = mem_conn();
+        insert_history_row(&c, "/tmp/keep.png");
+        let bad = insert_message(&c, 1, "bad");
+        set_message_images(&c, bad, "not-json");
+        let set = collect_referenced_paths_in(&c).expect("坏 JSON 不应导致查询失败");
+        assert_eq!(set.len(), 1);
+        assert!(set.contains(&normalize_path_key("/tmp/keep.png")));
+    }
+
+    /// 删除判定：被消息引用必须保留；无引用才允许回收；删行不影响判定自身的引用
+    #[test]
+    fn delete_history_keeps_file_when_still_referenced() {
+        let c = mem_conn();
+        let shared = insert_history_row(&c, r"C:\data\images\shared.png");
+        let msg = insert_message(&c, 1, "ref");
+        set_message_images(
+            &c,
+            msg,
+            r#"[{"historyId":1,"path":"C:\\data\\images\\shared.png"}]"#,
+        );
+
+        let plan = delete_history_in(&c, shared).expect("delete shared");
+        assert!(plan.still_referenced, "消息仍引用时必须保留文件");
+        assert_eq!(count_history_rows(&c), 0, "画廊行本身仍应删掉");
+
+        let solo = insert_history_row(&c, r"C:\data\images\solo.png");
+        let plan = delete_history_in(&c, solo).expect("delete solo");
+        assert!(!plan.still_referenced, "无其它引用时应允许回收文件");
+        assert_eq!(
+            plan.file_path.as_deref(),
+            Some(r"C:\data\images\solo.png"),
+            "返回值必须是原始路径，不能被归一化改写"
+        );
     }
 }

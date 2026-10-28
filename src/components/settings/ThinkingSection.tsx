@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api, ThinkingConfig } from "../../lib/api";
+import { api, parseAdapterError, ThinkingConfig } from "../../lib/api";
 import { useProviderStore } from "../../stores/providerStore";
 import { inputCls } from "./ui";
 
@@ -31,7 +31,7 @@ export default function ThinkingSection() {
       setStatus(
         r.ok
           ? `连接正常 · ${r.latencyMs}ms`
-          : `连接失败：${r.error?.message ?? "未知"}`,
+          : `连接失败：${r.error ? parseAdapterError(r.error).message : "未知"}`,
       );
     } catch (e) {
       setStatus(`连接失败：${String(e)}`);

@@ -6,6 +6,7 @@ import { useProviderStore } from "../stores/providerStore";
 import { api, parseAdapterError, adapterErrorTitle } from "../lib/api";
 import { toast } from "../lib/notify";
 import { IconClose } from "./Icons";
+import SafeImg from "./SafeImg";
 
 type Side = "top" | "right" | "bottom" | "left";
 
@@ -106,6 +107,15 @@ export default function OutpaintView() {
     e.currentTarget.setPointerCapture(e.pointerId);
     dragSide.current = side;
     dragStart.current = { x: e.clientX, y: e.clientY, offsets };
+  };
+
+  /** 键盘微调：手柄拿到焦点后用方向键推 8px（拖拽之外的第二条操作路径） */
+  const nudge = (side: Side, delta: number) => {
+    setPreset("free");
+    setOffsets((o) => ({
+      ...o,
+      [side]: Math.max(0, Math.min(4096, o[side] + delta)),
+    }));
   };
 
   const onPointerMove = (e: React.PointerEvent) => {
@@ -330,18 +340,43 @@ export default function OutpaintView() {
               className="relative overflow-hidden rounded-lg shadow-pop"
               style={{ width: display.w, height: display.h }}
             >
-              <img
+              <SafeImg
                 src={target.dataUrl}
                 alt="扩图对象"
                 className="absolute inset-0 h-full w-full"
-                draggable={false}
               />
             </div>
             {handles.map((h) => (
               <div
                 key={h.side}
                 style={h.style}
-                onPointerDown={startDrag(h.side)}
+                role="slider"
+                aria-label={`向${h.side === "left" ? "左" : h.side === "right" ? "右" : h.side === "top" ? "上" : "下"}扩图`}
+                aria-valuenow={0}
+                tabIndex={0}
+                onKeyDown={(e) => {
+                  // 键盘兜底：方向键按 8px 步进取值（视觉手柄原本只能拖拽）
+                  const step = 8;
+                  const map: Record<string, () => void> = {
+                    ArrowLeft: () => nudge("left", -step),
+                    ArrowRight: () => nudge("right", step),
+                    ArrowUp: () => nudge("top", -step),
+                    ArrowDown: () => nudge("bottom", step),
+                  };
+                  const fn = map[e.key];
+                  if (fn) {
+                    e.preventDefault();
+                    fn();
+                  }
+                }}
+                onPointerDown={(e) => {
+                  // 指针捕获在 startDrag 内完成；这里补 release，避免捕获状态泄漏
+                  startDrag(h.side)(e);
+                }}
+                onPointerUp={(e) => {
+                  if (e.currentTarget.hasPointerCapture(e.pointerId))
+                    e.currentTarget.releasePointerCapture(e.pointerId);
+                }}
                 className="absolute z-10 h-3.5 w-12 touch-none rounded-full border border-theme bg-elevated shadow-card"
               />
             ))}

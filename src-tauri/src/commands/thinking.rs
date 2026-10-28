@@ -58,6 +58,30 @@ pub async fn get_thinking_config() -> Result<ThinkingConfig, String> {
     Ok(read_thinking_config()?.0)
 }
 
+/// 备份导出用视图：只包含非密钥字段。API Key（明文或密文）绝不写入备份文件；
+/// 配置损坏时降级为默认值并记日志，不阻断整个备份。
+pub(crate) fn backup_value() -> serde_json::Value {
+    match read_thinking_config() {
+        Ok((cfg, _)) => serde_json::json!({
+            "enabled": cfg.enabled,
+            "mode": cfg.mode,
+            "providerId": cfg.provider_id,
+            "baseUrl": cfg.base_url,
+            "model": cfg.model,
+        }),
+        Err(e) => {
+            tracing::warn!("导出：思考模型配置读取失败，按未配置导出: {}", e);
+            serde_json::json!({
+                "enabled": false,
+                "mode": "reuse",
+                "providerId": null,
+                "baseUrl": "",
+                "model": "",
+            })
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn save_thinking_config(
     mut config: ThinkingConfig,

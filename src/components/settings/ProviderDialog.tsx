@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   api,
   EMPTY_PROVIDER,
@@ -31,6 +31,19 @@ export default function ProviderDialog({
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const dialogRef = useRef<HTMLDivElement>(null);
+
+  // 无障碍：Esc 关闭，打开时把焦点交给第一个可编辑控件
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    dialogRef.current
+      ?.querySelector<HTMLElement>("input,select,textarea")
+      ?.focus();
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
 
   const patch = (p: Partial<ProviderInput>) => setForm((f) => ({ ...f, ...p }));
 
@@ -71,6 +84,10 @@ export default function ProviderDialog({
       onClick={onClose}
     >
       <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={initial?.provider.id ? "编辑服务商" : "新增服务商"}
         className="w-[480px] rounded-[var(--radius-pop)] bg-elevated p-5 shadow-pop"
         onClick={(e) => e.stopPropagation()}
       >
@@ -143,8 +160,15 @@ export default function ProviderDialog({
                     type="password"
                     value={form.apiKey ?? ""}
                     onChange={(e) => patch({ apiKey: e.target.value })}
-                    placeholder="sk-..."
+                    placeholder={
+                      initial?.hasKey ? "留空则继续使用已保存的 Key" : "sk-..."
+                    }
                   />
+                  {initial?.hasKey && (
+                    <div className="mt-1 text-[11px] text-tertiary">
+                      出于安全考虑不回填明文 Key；留空保存即保持不变。
+                    </div>
+                  )}
                 </div>
               </>
             )}
@@ -152,7 +176,8 @@ export default function ProviderDialog({
               <>
                 <div>
                   <div className="mb-1 text-xs text-secondary">
-                    请求地址模板（可用 {"{{prompt}} {{size}} {{key}}"} 占位符）
+                    请求地址模板（可用 {"{{prompt}} {{image}} {{size}} {{key}}"}{" "}
+                    等占位符）
                   </div>
                   <input
                     className={inputCls}
@@ -172,6 +197,12 @@ export default function ProviderDialog({
                     onChange={(e) => patch({ templateBody: e.target.value })}
                     placeholder={'{"prompt":"{{prompt}}","size":"{{size}}"}'}
                   />
+                  <div className="mt-1 text-[11px] leading-relaxed text-tertiary">
+                    可用变量：prompt / negative_prompt / size / width / height /
+                    model / seed / count / key / image / images / image_count。
+                    image 为第一张参考图的 base64；模板接口暂不支持局部重绘、 AI
+                    消除与扩图。
+                  </div>
                 </div>
               </>
             )}
@@ -265,7 +296,7 @@ export default function ProviderDialog({
         )}
 
         {error && (
-          <div className="mt-3 rounded-[10px] bg-red-50 p-2 text-xs text-red-600 dark:bg-red-950 dark:text-red-300">
+          <div className="mt-3 rounded-[10px] border border-danger/25 bg-danger/10 p-2 text-xs text-danger">
             {error}
           </div>
         )}

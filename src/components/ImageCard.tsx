@@ -3,9 +3,12 @@ import { createPortal } from "react-dom";
 import { motion } from "framer-motion";
 import { ChatImage, useChatStore } from "../stores/chatStore";
 import { useAppStore } from "../stores/appStore";
+import { useProviderStore } from "../stores/providerStore";
 import { api } from "../lib/api";
+import { extOf } from "../lib/image";
 import ImageViewer, { ViewerImage } from "./ImageViewer";
 import ContextMenu, { MenuItem } from "./ContextMenu";
+import SafeImg from "./SafeImg";
 import {
   IconDownload,
   IconCopy,
@@ -31,6 +34,13 @@ export default function ImageCard({
   const addAttachment = useChatStore((s) => s.addAttachment);
   const openEditor = useAppStore((s) => s.openEditor);
   const openOutpaint = useAppStore((s) => s.openOutpaint);
+  // 模板适配器没有编辑端点：隐藏入口，避免用户点进去才收到「暂不支持」
+  const isTemplateProvider = useProviderStore((s) => {
+    const current = s.providers.find(
+      (p) => p.provider.id === s.defaultProviderId,
+    );
+    return current?.provider.kind === "template";
+  });
   const [viewerIndex, setViewerIndex] = useState<number | null>(null);
   const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
   const [copied, setCopied] = useState(false);
@@ -47,7 +57,8 @@ export default function ImageCard({
   const download = () => {
     const a = document.createElement("a");
     a.href = image.dataUrl;
-    a.download = `moling_${image.historyId}.png`;
+    // 用真实扩展名：mock/模板服务商可能出 SVG，固定 .png 会导致双击打不开
+    a.download = `moling_${image.historyId}.${extOf(image.path ?? "")}`;
     a.click();
   };
 
@@ -82,6 +93,26 @@ export default function ImageCard({
     prompt,
   };
 
+  const editItems: MenuItem[] = isTemplateProvider
+    ? []
+    : [
+        {
+          label: "局部重绘",
+          icon: <IconBrush size={14} />,
+          onClick: () => openEditor({ ...baseTarget, mode: "inpaint" }),
+        },
+        {
+          label: "AI 消除",
+          icon: <IconEraser size={14} />,
+          onClick: () => openEditor({ ...baseTarget, mode: "erase" }),
+        },
+        {
+          label: "扩图",
+          icon: <IconExpand size={14} />,
+          onClick: () => openOutpaint(baseTarget),
+        },
+      ];
+
   const menuItems: MenuItem[] = [
     {
       label: copied ? "已复制提示词" : "复制提示词",
@@ -93,21 +124,7 @@ export default function ImageCard({
       icon: <IconQuote size={14} />,
       onClick: reference,
     },
-    {
-      label: "局部重绘",
-      icon: <IconBrush size={14} />,
-      onClick: () => openEditor({ ...baseTarget, mode: "inpaint" }),
-    },
-    {
-      label: "AI 消除",
-      icon: <IconEraser size={14} />,
-      onClick: () => openEditor({ ...baseTarget, mode: "erase" }),
-    },
-    {
-      label: "扩图",
-      icon: <IconExpand size={14} />,
-      onClick: () => openOutpaint(baseTarget),
-    },
+    ...editItems,
     { label: "下载", icon: <IconDownload size={14} />, onClick: download },
     {
       label: "删除",
@@ -122,6 +139,9 @@ export default function ImageCard({
     title: prompt,
   }));
 
+  const openViewer = () =>
+    setViewerIndex(siblings.findIndex((i) => i.historyId === image.historyId));
+
   return (
     <>
       <motion.div
@@ -129,19 +149,24 @@ export default function ImageCard({
         initial={{ opacity: 0, scale: 0.95 }}
         animate={{ opacity: 1, scale: 1 }}
         transition={{ duration: 0.24, ease: [0.25, 0.1, 0.25, 1] }}
+        role="button"
+        tabIndex={0}
+        aria-label={`查看大图：${prompt}`}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            openViewer();
+          }
+        }}
         className="group relative cursor-zoom-in overflow-hidden rounded-[var(--radius-card)] shadow-card"
-        onClick={() =>
-          setViewerIndex(
-            siblings.findIndex((i) => i.historyId === image.historyId),
-          )
-        }
+        onClick={openViewer}
         onContextMenu={(e) => {
           e.preventDefault();
           e.stopPropagation();
           setMenuPos({ x: e.clientX, y: e.clientY });
         }}
       >
-        <img
+        <SafeImg
           src={image.dataUrl}
           alt={prompt}
           className="block w-full object-cover transition-transform duration-300 ease-out group-hover:scale-[1.02]"
@@ -159,6 +184,7 @@ export default function ImageCard({
           </button>
           <button
             title="更多操作"
+            aria-label="更多操作"
             onClick={(e) => {
               e.stopPropagation();
               const rect = e.currentTarget.getBoundingClientRect();

@@ -1,13 +1,16 @@
 use crate::storage;
 use tauri::Manager;
 
-/// 通用 set/get_setting 白名单（m12）：未知 key 拒绝读写，
-/// 避免直通 thinkingConfig 等敏感密文 KV。
+/// 通用 set/get_setting 白名单（m12）：未知 key 拒绝读写。
+///
+/// 这里**不能**放 thinkingConfig：它包含加密后的思考模型 API Key，写入路径
+/// 必须走 commands::thinking::save_thinking_config（先校验再加密），否则前端
+/// 拿到一个可以直写任意字符串的后门，绕过校验把密文写坏。
 const ALLOWED_SETTING_KEYS: &[&str] = &[
     "defaultProviderId",
     "defaultParams",
-    "thinkingConfig",
     "promptTemplates",
+    "theme",
 ];
 
 fn check_setting_key(key: &str) -> Result<(), String> {
@@ -18,9 +21,21 @@ fn check_setting_key(key: &str) -> Result<(), String> {
     }
 }
 
+/// 枚举型设置的取值校验。目前只有 theme：写入脏值后启动恢复会静默回退到
+/// system，用户只会看到"设置没保存"却无从排查，因此在写入端直接拒绝。
+fn check_setting_value(key: &str, value: &str) -> Result<(), String> {
+    match key {
+        "theme" if !matches!(value, "system" | "light" | "dark") => {
+            Err(format!("主题取值非法: {value}"))
+        }
+        _ => Ok(()),
+    }
+}
+
 #[tauri::command]
 pub async fn set_setting(key: String, value: String) -> Result<(), String> {
     check_setting_key(&key)?;
+    check_setting_value(&key, &value)?;
     storage::set_setting(&key, &value)?;
     Ok(())
 }
@@ -94,10 +109,28 @@ mod tests {
     fn setting_key_whitelist() {
         assert!(check_setting_key("defaultProviderId").is_ok());
         assert!(check_setting_key("defaultParams").is_ok());
-        assert!(check_setting_key("thinkingConfig").is_ok());
         assert!(check_setting_key("promptTemplates").is_ok());
+        assert!(check_setting_key("theme").is_ok());
         assert!(check_setting_key("extraParams:1").is_err());
         assert!(check_setting_key("任意 key").is_err());
+    }
+
+    /// 主题只接受三态值：脏值会让启动恢复静默回退，故写入端直接拒绝
+    #[test]
+    fn theme_value_validation() {
+        for ok in ["system", "light", "dark"] {
+            assert!(check_setting_value("theme", ok).is_ok(), "{ok} 应被接受");
+        }
+        assert!(check_setting_value("theme", "purple").is_err());
+        assert!(check_setting_value("theme", "").is_err());
+        // 其它 key 不做枚举校验（自由文本 / JSON）
+        assert!(check_setting_value("defaultParams", "anything").is_ok());
+    }
+
+    /// A4：thinkingConfig 含加密 Key，只能经 save_thinking_config 写入
+    #[test]
+    fn whitelist_rejects_thinking_config() {
+        assert!(check_setting_key("thinkingConfig").is_err());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "moling"
-version = "0.3.0"
+version = "0.4.0"
 description = "MoLing - AI drawing client for any API"
 authors = ["MoLing Contributors"]
 edition = "2021"
@@ -33,6 +33,13 @@ keyring = { version = "3", features = ["windows-native"] }
 base64 = "0.22"
 rand = "0.8"
 rusqlite = { version = "0.32", features = ["bundled"] }
+# 画廊缩略图：只启用光栅解码，SVG 由前端直接显示原图
+image = { version = "0.25", default-features = false, features = [
+  "png",
+  "jpeg",
+  "webp",
+  "gif",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"

@@ -2,6 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import JSZip from "jszip";
 import { api, HistoryItem } from "../lib/api";
+import { extOf } from "../lib/image";
+import { STYLE_PRESETS } from "../lib/types";
+import SafeImg from "./SafeImg";
 import { useAppStore } from "../stores/appStore";
 import { useChatStore } from "../stores/chatStore";
 
@@ -24,30 +27,46 @@ function paramsOf(item: HistoryItem) {
   };
 }
 
-async function exportZip(items: HistoryItem[]) {
+/** 打包导出。返回因缺图被跳过的数量，调用方负责提示与异常处理。
+ *  列表只持有缩略图，这里按 id 逐张读取原图，避免把缩略图打包给用户。 */
+async function exportZip(items: HistoryItem[]): Promise<number> {
   const zip = new JSZip();
   const manifest: unknown[] = [];
-  items.forEach((item, i) => {
+  let skipped = 0;
+  for (let i = 0; i < items.length; i += 1) {
+    const item = items[i];
     const h = item.history;
-    const ext = h.filePath.split(".").pop() ?? "png";
-    const name = `${String(i + 1).padStart(3, "0")}_${h.id}.${ext}`;
-    zip.file(name, item.dataUrl.split(",")[1] ?? "", { base64: true });
-    manifest.push({ file: name, ...paramsOf(item) });
-  });
+    try {
+      const { dataUrl } = await api.getHistoryImage(h.id);
+      const b64 = dataUrl.split(",")[1];
+      if (!b64) {
+        skipped += 1;
+        continue;
+      }
+      const name = `${String(i + 1).padStart(3, "0")}_${h.id}.${extOf(h.filePath)}`;
+      zip.file(name, b64, { base64: true });
+      manifest.push({ file: name, ...paramsOf(item) });
+    } catch {
+      skipped += 1;
+    }
+  }
   zip.file("params.json", JSON.stringify(manifest, null, 2));
   const blob = await zip.generateAsync({ type: "blob" });
+  const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
-  a.href = URL.createObjectURL(blob);
+  a.href = url;
   a.download = `moling_export_${Date.now()}.zip`;
   a.click();
-  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  return skipped;
 }
 
-function downloadOne(item: HistoryItem, withParams: boolean) {
+async function downloadOne(item: HistoryItem, withParams: boolean) {
   const h = item.history;
-  const ext = h.filePath.split(".").pop() ?? "png";
+  const ext = extOf(h.filePath);
+  const { dataUrl } = await api.getHistoryImage(h.id);
   const a = document.createElement("a");
-  a.href = item.dataUrl;
+  a.href = dataUrl;
   a.download = `moling_${h.id}.${ext}`;
   a.click();
   if (withParams) {
@@ -70,9 +89,11 @@ export default function GalleryView() {
   const [items, setItems] = useState<HistoryItem[]>([]);
   const [hasMore, setHasMore] = useState(true);
   const [modelFilter, setModelFilter] = useState("");
+  const [styleFilter, setStyleFilter] = useState("");
   const [favOnly, setFavOnly] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [loading, setLoading] = useState(false);
+  const [exporting, setExporting] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const parentRef = useRef<HTMLDivElement>(null);
   const loadSeq = useRef(0);
@@ -86,35 +107,60 @@ export default function GalleryView() {
     [],
   );
 
-  const showNotice = (text: string) => {
+  const showNotice = useCallback((text: string) => {
     setNotice(text);
     if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current);
     noticeTimer.current = window.setTimeout(() => setNotice(null), 2500);
-  };
-
-  const load = useCallback(async (offset: number, model: string) => {
-    const seq = ++loadSeq.current;
-    setLoading(true);
-    try {
-      const { items: page } = await api.listHistory(PAGE_SIZE, offset, model);
-      if (seq !== loadSeq.current) return;
-      setHasMore(page.length === PAGE_SIZE);
-      setItems((prev) => (offset === 0 ? page : [...prev, ...page]));
-    } finally {
-      if (seq === loadSeq.current) setLoading(false);
-    }
   }, []);
 
+  const load = useCallback(
+    async (offset: number, model: string, style: string) => {
+      const seq = ++loadSeq.current;
+      setLoading(true);
+      try {
+        const { items: page } = await api.listHistory(
+          PAGE_SIZE,
+          offset,
+          model,
+          style,
+        );
+        if (seq !== loadSeq.current) return;
+        setHasMore(page.length === PAGE_SIZE);
+        setItems((prev) => (offset === 0 ? page : [...prev, ...page]));
+      } catch {
+        // 原实现没有 catch：数据库文件被占用/损坏时是一条未捕获的 rejection，
+        // 界面停在「加载中」且没有任何反馈。
+        if (seq === loadSeq.current) showNotice("加载画廊失败，请稍后重试");
+      } finally {
+        if (seq === loadSeq.current) setLoading(false);
+      }
+    },
+    [showNotice],
+  );
+
   useEffect(() => {
-    load(0, modelFilter);
+    load(0, modelFilter, styleFilter);
     setSelected(new Set());
-  }, [modelFilter, load]);
+  }, [modelFilter, styleFilter, load]);
 
   const models = useMemo(
     () =>
       Array.from(new Set(items.map((i) => i.history.model).filter(Boolean))),
     [items],
   );
+
+  // 风格选项：预设 + 当前已加载数据里出现的未知风格（筛选由后端执行）
+  const styles = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const s of STYLE_PRESETS) {
+      if (s.id) map.set(s.id, s.label);
+    }
+    for (const item of items) {
+      const s = item.history.style;
+      if (s && !map.has(s)) map.set(s, s);
+    }
+    return Array.from(map, ([id, label]) => ({ id, label }));
+  }, [items]);
 
   const filtered = useMemo(
     () => (favOnly ? items.filter((i) => i.history.favorite) : items),
@@ -161,6 +207,25 @@ export default function GalleryView() {
     }
   };
 
+  const doExport = async () => {
+    const picked = filtered.filter((i) => selected.has(i.history.id));
+    if (picked.length === 0) return;
+    setExporting(true);
+    try {
+      const skipped = await exportZip(picked);
+      const ok = picked.length - skipped;
+      showNotice(
+        skipped > 0
+          ? `已导出 ${ok} 张，${skipped} 张因缺图被跳过`
+          : `已导出 ${ok} 张`,
+      );
+    } catch {
+      showNotice("打包导出失败，请重试");
+    } finally {
+      setExporting(false);
+    }
+  };
+
   const reuse = (item: HistoryItem) => {
     const p = paramsOf(item);
     const { setPrefs, setView } = useAppStore.getState();
@@ -188,6 +253,7 @@ export default function GalleryView() {
       <div className="bg-glass flex shrink-0 flex-wrap items-center gap-2 border-b border-theme px-4 py-2">
         <select
           value={modelFilter}
+          aria-label="按模型筛选"
           onChange={(e) => setModelFilter(e.target.value)}
           className="rounded-[8px] border border-theme bg-transparent px-2 py-1 text-xs"
         >
@@ -195,6 +261,19 @@ export default function GalleryView() {
           {models.map((m) => (
             <option key={m} value={m}>
               {m}
+            </option>
+          ))}
+        </select>
+        <select
+          value={styleFilter}
+          aria-label="按风格筛选"
+          onChange={(e) => setStyleFilter(e.target.value)}
+          className="rounded-[8px] border border-theme bg-transparent px-2 py-1 text-xs"
+        >
+          <option value="">全部风格</option>
+          {styles.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.label}
             </option>
           ))}
         </select>
@@ -208,16 +287,16 @@ export default function GalleryView() {
         </label>
         <div className="ml-auto flex gap-2">
           <button
-            onClick={() =>
-              exportZip(filtered.filter((i) => selected.has(i.history.id)))
-            }
-            disabled={selected.size === 0}
+            onClick={doExport}
+            disabled={selected.size === 0 || exporting}
+            aria-label={`打包导出已选 ${selected.size} 张作品`}
             className="pressable rounded-[8px] border border-theme px-2.5 py-1 text-xs disabled:opacity-40"
           >
-            打包导出（{selected.size}）
+            {exporting ? "打包中…" : `打包导出（${selected.size}）`}
           </button>
           <button
-            onClick={() => load(0, modelFilter)}
+            onClick={() => load(0, modelFilter, styleFilter)}
+            aria-label="刷新画廊"
             className="pressable rounded-[8px] border border-theme px-2.5 py-1 text-xs"
           >
             刷新
@@ -251,14 +330,16 @@ export default function GalleryView() {
                     key={item.history.id}
                     className="group relative h-52 overflow-hidden rounded-lg bg-sunken"
                   >
-                    <img
-                      src={item.dataUrl}
+                    <SafeImg
+                      src={item.thumbUrl}
                       alt={item.history.prompt}
                       className="h-full w-full object-cover"
                       loading="lazy"
+                      decoding="async"
                     />
                     <input
                       type="checkbox"
+                      aria-label="选择该作品"
                       checked={selected.has(item.history.id)}
                       onChange={(e) => {
                         const next = new Set(selected);
@@ -270,6 +351,7 @@ export default function GalleryView() {
                     />
                     <button
                       onClick={() => toggleFav(item)}
+                      aria-label={item.history.favorite ? "取消收藏" : "收藏"}
                       className="absolute right-2 top-2 rounded bg-black/40 px-1.5 py-0.5 text-xs opacity-0 group-hover:opacity-100"
                     >
                       {item.history.favorite ? "★" : "☆"}
@@ -282,7 +364,11 @@ export default function GalleryView() {
                         复用参数
                       </button>
                       <button
-                        onClick={() => downloadOne(item, true)}
+                        onClick={() =>
+                          void downloadOne(item, true).catch(() =>
+                            showNotice("下载失败：原图不可用"),
+                          )
+                        }
                         className="rounded bg-white/15 px-2 py-0.5 hover:bg-white/30"
                       >
                         下载
@@ -303,7 +389,7 @@ export default function GalleryView() {
         {hasMore && !loading && items.length > 0 && (
           <div className="py-3 text-center">
             <button
-              onClick={() => load(items.length, modelFilter)}
+              onClick={() => load(items.length, modelFilter, styleFilter)}
               className="text-xs text-tertiary hover:text-secondary"
             >
               加载更多

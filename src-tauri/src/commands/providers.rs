@@ -131,7 +131,14 @@ pub async fn list_providers() -> Result<serde_json::Value, String> {
 #[tauri::command]
 pub async fn delete_provider(id: i64) -> Result<(), String> {
     storage::delete_provider(id)?;
+    // 保留原有行为：清理该服务商的透传参数
     storage::set_setting(&format!("extraParams:{}", id), "")?;
+    // RC-03：默认服务商若指向被删服务商，默认设置会悬空；一并清除，前端回落到未选择状态
+    let default_id = storage::get_setting("defaultProviderId")?.unwrap_or_default();
+    if default_id.trim().parse::<i64>().ok() == Some(id) {
+        storage::delete_setting("defaultProviderId")?;
+        tracing::warn!("默认服务商（id={id}）已被删除，已清除 defaultProviderId 设置");
+    }
     Ok(())
 }
 
@@ -193,27 +200,36 @@ pub async fn test_connection(id: i64) -> Result<serde_json::Value, String> {
     }
 }
 
+/// 导出配置（备份 v2）：`include_keys` 默认 false，不把明文 API Key 写进文件；
+/// 服务商仍带 id，供导入时把 defaultProviderId / 思考模型 providerId 重映射到新自增 id。
 #[tauri::command]
-pub async fn export_config() -> Result<serde_json::Value, String> {
+pub async fn export_config(include_keys: Option<bool>) -> Result<serde_json::Value, String> {
+    let include_keys = include_keys.unwrap_or(false);
     let rows = storage::list_providers()?;
     let providers: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
-            let key = match storage::decrypt_secret(&r.api_key_enc) {
-                Ok(k) => k,
-                Err(e) => {
-                    tracing::warn!(
-                        "导出：服务商「{}」的 API Key 解密失败，导出为空串: {}",
-                        r.name,
-                        e
-                    );
-                    String::new()
+            let key = if include_keys {
+                match storage::decrypt_secret(&r.api_key_enc) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        tracing::warn!(
+                            "导出：服务商「{}」的 API Key 解密失败，导出为空串: {}",
+                            r.name,
+                            e
+                        );
+                        String::new()
+                    }
                 }
+            } else {
+                String::new()
             };
             serde_json::json!({
+                "id": r.id,
                 "name": r.name,
                 "baseUrl": r.base_url,
                 "apiKey": key,
+                "hasKey": r.has_key,
                 "kind": r.kind,
                 "modelsJson": r.models_json,
                 "defaultModel": r.default_model,
@@ -225,29 +241,39 @@ pub async fn export_config() -> Result<serde_json::Value, String> {
             })
         })
         .collect();
-    let settings = ["defaultProviderId", "defaultParams"]
-        .iter()
-        .filter_map(|k| {
-            storage::get_setting(k)
-                .ok()
-                .flatten()
-                .map(|v| (k.to_string(), serde_json::Value::String(v)))
-        })
-        .collect::<serde_json::Map<String, serde_json::Value>>();
+    let settings = [
+        "defaultProviderId",
+        "defaultParams",
+        "theme",
+        "promptTemplates",
+    ]
+    .iter()
+    .filter_map(|k| {
+        storage::get_setting(k)
+            .ok()
+            .flatten()
+            .map(|v| (k.to_string(), serde_json::Value::String(v)))
+    })
+    .collect::<serde_json::Map<String, serde_json::Value>>();
     Ok(serde_json::json!({
-        "version": 1,
+        "version": 2,
+        "exportedAt": storage::timestamp_millis(),
         "providers": providers,
         "settings": serde_json::Value::Object(settings),
+        // 思考模型只导出非密钥字段，绝不导出 API Key（明文或密文）
+        "thinking": super::thinking::backup_value(),
     }))
 }
 
-/// 导入配置（替换语义）：version 必须为 1；整体在一个事务内完成，
+/// 导入配置（替换语义）：version 1 / 2 都接受；整体在一个事务内完成，
 /// 先删除旧服务商再写入，中途失败回滚不留半导入状态（R5）。
-/// 同时恢复每个服务商的 extraParams 透传参数（M7）。
+/// v2 额外恢复设置、主题、自定义模板与思考模型配置；不含 Key 时按
+/// name+baseUrl 复用本机旧密文（见 storage::import_config_in）。
 #[tauri::command]
 pub async fn import_config(data: serde_json::Value) -> Result<(), String> {
-    if data.get("version").and_then(|v| v.as_u64()) != Some(1) {
-        return Err("配置版本不受支持，仅支持 version=1".to_string());
+    match data.get("version").and_then(|v| v.as_u64()) {
+        Some(1) | Some(2) => {}
+        _ => return Err("配置版本不受支持，仅支持 version=1 或 2".to_string()),
     }
     let count = storage::import_config(&data).map_err(|e| -> String {
         tracing::warn!("配置导入失败，已整体回滚: {e}");

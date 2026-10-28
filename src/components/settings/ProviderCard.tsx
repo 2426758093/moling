@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { api, ProviderItem } from "../../lib/api";
+import { api, parseAdapterError, ProviderItem } from "../../lib/api";
 import { useProviderStore } from "../../stores/providerStore";
 import { KIND_OPTIONS } from "./ui";
 
@@ -23,7 +23,7 @@ export default function ProviderCard({
       setStatus(
         r.ok
           ? `连接正常 · ${r.latencyMs}ms · ${r.modelCount} 个模型`
-          : `连接失败：${r.error?.message ?? "未知错误"}`,
+          : `连接失败：${r.error ? parseAdapterError(r.error).message : "未知错误"}`,
       );
     } catch (e) {
       setStatus(`连接失败：${String(e)}`);
@@ -44,6 +44,11 @@ export default function ProviderCard({
             {p.baseUrl || "（无地址）"} · Key: {item.apiKeyMasked}
             {p.defaultModel && ` · 默认: ${p.defaultModel}`}
           </div>
+          {item.keyError && (
+            <div className="mt-1 inline-flex items-center gap-1 rounded-full border border-danger/25 bg-danger/10 px-2 py-0.5 text-[11px] text-danger">
+              Key 失效：请重新填写
+            </div>
+          )}
           {status && (
             <div className="mt-1 text-xs text-secondary">{status}</div>
           )}
@@ -60,18 +65,21 @@ export default function ProviderCard({
           </label>
           <button
             onClick={onEdit}
+            aria-label={`编辑服务商 ${p.name}`}
             className="rounded-[8px] border border-theme px-2 py-1"
           >
             编辑
           </button>
           <button
             onClick={doTest}
+            aria-label={`测试服务商 ${p.name}`}
             className="rounded-[8px] border border-theme px-2 py-1"
           >
             测试
           </button>
           <button
             onClick={() => p.id && remove(p.id)}
+            aria-label={`删除服务商 ${p.name}`}
             className="rounded-[8px] border border-theme px-2 py-1 text-danger"
           >
             删除

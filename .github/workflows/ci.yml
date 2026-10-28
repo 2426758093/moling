@@ -11,14 +11,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
+        with:
+          version: 11
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          # Vite 8 要求 Node ^20.19.0 || >=22.12.0；pnpm 11 与本地开发一致用 22
+          node-version: 22
           cache: pnpm
-      - run: pnpm install
+      - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm format:check
       - run: pnpm build
+      # 依赖审计：生产依赖不得出现 high/critical
+      - run: pnpm audit --prod --audit-level high
 
   rust:
     runs-on: windows-latest

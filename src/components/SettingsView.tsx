@@ -19,6 +19,10 @@ export default function SettingsView() {
   const setPrefs = useAppStore((s) => s.setPrefs);
   const [dataDir, setDataDir] = useState("");
   const [backupMsg, setBackupMsg] = useState("");
+  // 默认不导出明文 Key；勾选后才写进备份文件
+  const [includeKeys, setIncludeKeys] = useState(false);
+  // 导入后强制重挂思考模型区，重新读取导入的配置
+  const [thinkingKey, setThinkingKey] = useState(0);
 
   useEffect(() => {
     if (!loaded) refresh();
@@ -35,7 +39,7 @@ export default function SettingsView() {
 
   const doExport = async () => {
     try {
-      const data = await api.exportConfig();
+      const data = await api.exportConfig(includeKeys);
       const blob = new Blob([JSON.stringify(data, null, 2)], {
         type: "application/json",
       });
@@ -44,9 +48,33 @@ export default function SettingsView() {
       a.download = `moling_backup_${Date.now()}.json`;
       a.click();
       URL.revokeObjectURL(a.href);
-      setBackupMsg("已导出（文件包含明文凭据，请妥善保管）");
+      setBackupMsg(
+        includeKeys
+          ? "已导出（包含明文 API Key，请勿分享或上传）"
+          : "已导出（不含 API Key）",
+      );
     } catch (e) {
       setBackupMsg(`导出失败：${String(e)}`);
+    }
+  };
+
+  /// 导入成功后把本机 UI 状态同步到新配置：主题立即生效，默认参数写回 store
+  const reloadImportedSettings = async () => {
+    const savedTheme = await api.getSetting("theme");
+    if (
+      savedTheme === "system" ||
+      savedTheme === "light" ||
+      savedTheme === "dark"
+    ) {
+      setTheme(savedTheme);
+    }
+    const savedPrefs = await api.getSetting("defaultParams");
+    if (!savedPrefs) return;
+    try {
+      const patch = JSON.parse(savedPrefs);
+      setPrefs({ ...prefs, ...patch });
+    } catch {
+      // 忽略损坏的默认参数
     }
   };
 
@@ -55,6 +83,8 @@ export default function SettingsView() {
       const data = JSON.parse(await file.text());
       await api.importConfig(data);
       await refresh();
+      await reloadImportedSettings();
+      setThinkingKey((k) => k + 1);
       setBackupMsg("导入成功");
     } catch (e) {
       setBackupMsg(`导入失败：${String(e)}`);
@@ -160,11 +190,11 @@ export default function SettingsView() {
             </div>
           </section>
 
-          <ThinkingSection />
+          <ThinkingSection key={thinkingKey} />
 
           <section>
             <h2 className="mb-4 text-lg font-semibold">数据备份</h2>
-            <div className="flex items-center gap-2 rounded-[var(--radius-card)] border border-theme p-4">
+            <div className="flex flex-wrap items-center gap-2 rounded-[var(--radius-card)] border border-theme p-4">
               <button
                 onClick={() => doExport().catch(() => undefined)}
                 className="rounded-[8px] border border-theme px-3 py-1.5 text-xs"
@@ -184,8 +214,23 @@ export default function SettingsView() {
                   }}
                 />
               </label>
+              <label className="flex items-center gap-1.5 text-xs text-secondary">
+                <input
+                  type="checkbox"
+                  checked={includeKeys}
+                  onChange={(e) => setIncludeKeys(e.target.checked)}
+                />
+                同时导出 API Key（明文，仅用于本机迁移）
+              </label>
+              {includeKeys && (
+                <span className="text-xs text-danger">
+                  导出文件将包含明文密钥，请勿分享或上传
+                </span>
+              )}
               {backupMsg && (
-                <span className="text-xs text-tertiary">{backupMsg}</span>
+                <span className="w-full text-xs text-tertiary">
+                  {backupMsg}
+                </span>
               )}
             </div>
           </section>

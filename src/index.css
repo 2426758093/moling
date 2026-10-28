@@ -2,6 +2,31 @@
 
 @custom-variant dark (&:where(.dark, .dark *));
 
+/* ---------------- Tailwind 设计令牌 ---------------- */
+/* 关键：组件里大量使用 bg-accent / text-danger / bg-danger / bg-success /
+   border-separator / hover:bg-hover 等语义类，必须注册到 @theme 才会生成对应
+   工具类（含 hover:/focus: 变体与 /10 透明度修饰符）。值引用下方 :root 变量，
+   因此 .dark 覆盖变量后深浅色自动生效，组件零改动。 */
+@theme {
+  --color-base: var(--bg-base);
+  --color-elevated: var(--bg-elevated);
+  --color-sunken: var(--bg-sunken);
+  --color-grouped: var(--bg-grouped);
+  --color-hover: var(--bg-hover);
+  --color-active: var(--bg-active);
+  --color-accent: var(--accent);
+  --color-accent-strong: var(--accent-strong);
+  --color-accent-soft: var(--accent-soft);
+  --color-danger: var(--danger);
+  --color-success: var(--success);
+  --color-separator: var(--separator);
+  --color-primary: var(--text-primary);
+  --color-secondary: var(--text-secondary);
+  --color-tertiary: var(--text-tertiary);
+  --shadow-card: var(--shadow-card);
+  --shadow-pop: var(--shadow-pop);
+}
+
 /* ---------------- Apple HIG 设计令牌 ---------------- */
 /* 浅色：iOS 系统色；深色：iOS 深色模式色。全 App 单一强调色。 */
 :root {
@@ -81,51 +106,14 @@ body {
     color 0.25s ease;
 }
 
-/* 语义类 */
-.bg-base {
-  background-color: var(--bg-base);
-}
-.bg-elevated {
-  background-color: var(--bg-elevated);
-}
-.bg-sunken {
-  background-color: var(--bg-sunken);
-}
-.bg-grouped {
-  background-color: var(--bg-grouped);
-}
-.bg-hover {
-  background-color: var(--bg-hover);
-}
-.bg-accent-soft {
-  background-color: var(--accent-soft);
-}
-.text-primary {
-  color: var(--text-primary);
-}
-.text-secondary {
-  color: var(--text-secondary);
-}
-.text-tertiary {
-  color: var(--text-tertiary);
-}
-.text-accent {
-  color: var(--accent);
-}
+/* ---------------- 语义类（Tailwind 令牌覆盖不到的少量特类） ---------------- */
+/* 颜色/阴影令牌已在 @theme 注册并生成工具类；以下两个类名不在令牌命名空间内，
+   但被全站大量引用，保留为手写类。 */
 .border-theme {
   border-color: var(--border);
 }
 .border-strong {
   border-color: var(--border-strong);
-}
-.shadow-card {
-  box-shadow: var(--shadow-card);
-}
-.shadow-pop {
-  box-shadow: var(--shadow-pop);
-}
-.bg-accent-grad {
-  background-color: var(--accent);
 }
 
 /* 毛玻璃 */
@@ -205,4 +193,21 @@ body {
 }
 .thinking-dot:nth-child(3) {
   animation-delay: 0.3s;
+}
+
+/* ---------------- 无障碍：键盘焦点环与动效降级 ---------------- */
+/* 只用 outline，不改变布局；鼠标点击不会出现（:focus-visible 语义） */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
