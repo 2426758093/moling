@@ -35,7 +35,7 @@ impl GenerationRegistry {
     }
 
     /// 置位取消标记；jobId 不存在时返回 false（幂等，静默忽略）
-    fn cancel(&self, job_id: &str) -> bool {
+    pub(crate) fn cancel(&self, job_id: &str) -> bool {
         match lock_cancel_map(&self.0).get(job_id) {
             Some(token) => {
                 token.store(true, Ordering::SeqCst);
@@ -48,14 +48,17 @@ impl GenerationRegistry {
 
 /// 取消登记守卫（RA-06）：generate_images 无论正常返回、提前 return 还是 `?` 出错，
 /// 都会在 drop 时把自身 jobId 从注册表移除，避免 token 泄漏。
-struct CancelRegistration {
+pub(crate) struct CancelRegistration {
     map: Option<std::sync::Arc<CancelMap>>,
     job_id: Option<String>,
 }
 
 impl CancelRegistration {
     /// 有 jobId 时注册 token；无 jobId 时不注册，返回 None（行为与旧版完全一致）
-    fn new(registry: &GenerationRegistry, job_id: Option<&String>) -> (Self, Option<CancelToken>) {
+    pub(crate) fn new(
+        registry: &GenerationRegistry,
+        job_id: Option<&String>,
+    ) -> (Self, Option<CancelToken>) {
         match job_id {
             Some(id) => {
                 let token = registry.register(id);
@@ -157,6 +160,30 @@ pub async fn generate_images(
     state: tauri::State<'_, GenerationRegistry>,
     input: GenerateCommandInput,
 ) -> Result<serde_json::Value, String> {
+    // RA-06：注册取消 token（不传 jobId 时不注册，行为与旧版完全一致）；
+    // _registration 守卫在函数退出（含出错提前返回）时自动移除 token。
+    let (_registration, cancel_token) = CancelRegistration::new(&state, input.job_id.as_ref());
+    let outcome = generate_core(&app, &input, cancel_token, |_, _| {}).await?;
+    Ok(serde_json::json!({ "images": outcome.images, "cancelled": outcome.cancelled }))
+}
+
+/// 生成结果（聊天命令与队列 worker 共用）
+pub(crate) struct GenerateOutcome {
+    pub images: Vec<GeneratedImage>,
+    pub cancelled: bool,
+}
+
+/// 生成 + 逐张落盘/入库的核心流程；取消 token 由调用方注册与回收。
+/// `on_progress(done, total)` 在每张图落盘入库后调用一次（队列据此发进度事件）。
+pub(crate) async fn generate_core<F>(
+    app: &tauri::AppHandle,
+    input: &GenerateCommandInput,
+    cancel_token: Option<CancelToken>,
+    mut on_progress: F,
+) -> Result<GenerateOutcome, String>
+where
+    F: FnMut(usize, usize),
+{
     let row =
         storage::get_provider(input.provider_id)?.ok_or_else(|| "服务商不存在".to_string())?;
     let candidates = key_pool::candidates(input.provider_id)?;
@@ -164,11 +191,7 @@ pub async fn generate_images(
         return Err("该服务商还没有配置 API Key".to_string());
     }
 
-    // RA-06：注册取消 token（不传 jobId 时不注册，行为与旧版完全一致）；
-    // _registration 守卫在函数退出（含出错提前返回）时自动移除 token。
-    let (_registration, cancel_token) = CancelRegistration::new(&state, input.job_id.as_ref());
-
-    let full_prompt = build_prompt(&input);
+    let full_prompt = build_prompt(input);
     let req = GenerateRequest {
         prompt: full_prompt.clone(),
         negative_prompt: input.negative_prompt.clone(),
@@ -259,6 +282,7 @@ pub async fn generate_images(
     let now = storage::timestamp_millis();
     let mut out = Vec::new();
     if let Some(images) = images {
+        let total = images.len();
         for (i, b64) in images.iter().enumerate() {
             // 每张图落盘/入库前检查取消：已取消则立即跳出，返回已生成结果
             if is_cancelled(&cancel_token) {
@@ -266,7 +290,7 @@ pub async fn generate_images(
                 break;
             }
             let name = image_store::unique_name("", &now, i);
-            let (path, data_url) = image_store::save_b64_image(&app, b64, &name)?;
+            let (path, data_url) = image_store::save_b64_image(app, b64, &name)?;
             // 生成即建缩略图：画廊首屏只传缩略图，避免每页几十 MB 的原图 base64
             image_store::ensure_thumb(std::path::Path::new(&path));
             let seed_val = Some(input.seed.map(|s| s as i64).unwrap_or_else(rand::random));
@@ -294,6 +318,7 @@ pub async fn generate_images(
                 model: input.model.clone(),
                 seed: seed_val,
             });
+            on_progress(out.len(), total);
         }
     } else if !cancelled {
         // 未取消却没有图片：只可能是所有 Key 均鉴权失败或重试耗尽
@@ -301,7 +326,10 @@ pub async fn generate_images(
             last_err.expect("无图片且未取消必有错误"),
         ));
     }
-    Ok(serde_json::json!({ "images": out, "cancelled": cancelled }))
+    Ok(GenerateOutcome {
+        images: out,
+        cancelled,
+    })
 }
 
 /// 取消进行中的生成任务（RA-06）：jobId 不存在时静默忽略（幂等）。

@@ -144,6 +144,19 @@ pub async fn delete_message(id: i64) -> Result<bool, String> {
     Ok(storage::delete_message(id)?)
 }
 
+/// 从消息里移除一张生成的图片（缺陷 2：只改前端的话刷新后又会出现）。
+///
+/// 顺序固定：先改消息的 images_json，再走 `delete_history` 做引用判定与文件回收。
+/// 反过来的话，本消息自己的引用会让文件永远判为「仍被引用」。
+#[tauri::command]
+pub async fn remove_message_image(message_id: i64, history_id: i64) -> Result<bool, String> {
+    let removed = storage::remove_message_image(message_id, history_id)?;
+    if removed {
+        crate::commands::image::delete_history(history_id).await?;
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

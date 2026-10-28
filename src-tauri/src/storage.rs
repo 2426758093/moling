@@ -182,11 +182,40 @@ const PROVIDER_KEYS_SQL: &str = "
         ALTER TABLE providers ADD COLUMN api_keys_enc TEXT NOT NULL DEFAULT '';
 ";
 
+/// 迁移 004：批量队列。所有状态迁移都必须带前置状态条件（见 jobs::transition_*），
+/// 否则「取消」与「完成」并发时后写的一方会覆盖先写的终态。
+const JOBS_SQL: &str = "
+        CREATE TABLE IF NOT EXISTS jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            status TEXT NOT NULL DEFAULT 'queued',
+            provider_id INTEGER NOT NULL,
+            provider_name TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            prompt TEXT NOT NULL DEFAULT '',
+            negative_prompt TEXT NOT NULL DEFAULT '',
+            style TEXT NOT NULL DEFAULT '',
+            width INTEGER NOT NULL DEFAULT 1024,
+            height INTEGER NOT NULL DEFAULT 1024,
+            guidance REAL,
+            steps INTEGER,
+            seed INTEGER,
+            count INTEGER NOT NULL DEFAULT 1,
+            job_key TEXT NOT NULL DEFAULT '',
+            images_json TEXT NOT NULL DEFAULT '[]',
+            error TEXT,
+            created_at TEXT NOT NULL,
+            started_at TEXT,
+            finished_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, id);
+";
+
 /// (名称, SQL)，按顺序执行；`PRAGMA user_version` 记录已应用到的序号（从 1 起）。
 const MIGRATIONS: &[(&str, &str)] = &[
     ("001_tables", SCHEMA_SQL),
     ("002_indexes", INDEXES_SQL),
     ("003_provider_keys", PROVIDER_KEYS_SQL),
+    ("004_jobs", JOBS_SQL),
 ];
 
 /// 当前 schema 版本 = 迁移条数
@@ -1532,6 +1561,291 @@ pub fn update_message_images(id: i64, images_json: &str) -> AppResult<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// 批量队列（迁移 004）
+// ---------------------------------------------------------------------------
+
+/// 终态：到达这些状态的 job 不会被 worker 再次取用。
+pub const JOB_TERMINAL_STATUSES: &[&str] = &["done", "failed", "canceled", "interrupted"];
+
+const JOB_COLUMNS: &str = "id, status, provider_id, provider_name, model, prompt, \
+     negative_prompt, style, width, height, guidance, steps, seed, count, job_key, \
+     images_json, error, created_at, started_at, finished_at";
+
+/// 队列任务。`images_json` 只存 `[{historyId,path}]`，绝不存 base64。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobRow {
+    pub id: i64,
+    pub status: String,
+    pub provider_id: i64,
+    pub provider_name: String,
+    pub model: String,
+    pub prompt: String,
+    pub negative_prompt: String,
+    pub style: String,
+    pub width: i64,
+    pub height: i64,
+    pub guidance: Option<f64>,
+    pub steps: Option<i64>,
+    pub seed: Option<i64>,
+    pub count: i64,
+    /// 取消注册表键（`queue:<id>`），worker 与 cancel_queue_job 共用
+    pub job_key: String,
+    pub images_json: String,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+}
+
+/// 入队参数快照（入队后不再与聊天输入联动）
+pub struct NewJob<'a> {
+    pub provider_id: i64,
+    pub provider_name: &'a str,
+    pub model: &'a str,
+    pub prompt: &'a str,
+    pub negative_prompt: &'a str,
+    pub style: &'a str,
+    pub width: i64,
+    pub height: i64,
+    pub guidance: Option<f64>,
+    pub steps: Option<i64>,
+    pub seed: Option<i64>,
+    pub count: i64,
+}
+
+fn job_from_row(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
+    Ok(JobRow {
+        id: row.get(0)?,
+        status: row.get(1)?,
+        provider_id: row.get(2)?,
+        provider_name: row.get(3)?,
+        model: row.get(4)?,
+        prompt: row.get(5)?,
+        negative_prompt: row.get(6)?,
+        style: row.get(7)?,
+        width: row.get(8)?,
+        height: row.get(9)?,
+        guidance: row.get(10)?,
+        steps: row.get(11)?,
+        seed: row.get(12)?,
+        count: row.get(13)?,
+        job_key: row.get(14)?,
+        images_json: row.get(15)?,
+        error: row.get(16)?,
+        created_at: row.get(17)?,
+        started_at: row.get(18)?,
+        finished_at: row.get(19)?,
+    })
+}
+
+pub fn insert_job(job: &NewJob) -> AppResult<i64> {
+    let c = conn()?;
+    insert_job_in(&c, job)
+}
+
+fn insert_job_in(c: &Connection, job: &NewJob) -> AppResult<i64> {
+    c.execute(
+        "INSERT INTO jobs (status, provider_id, provider_name, model, prompt, negative_prompt,
+         style, width, height, guidance, steps, seed, count, created_at)
+         VALUES ('queued', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        params![
+            job.provider_id,
+            job.provider_name,
+            job.model,
+            job.prompt,
+            job.negative_prompt,
+            job.style,
+            job.width,
+            job.height,
+            job.guidance,
+            job.steps,
+            job.seed,
+            job.count,
+            timestamp_millis(),
+        ],
+    )?;
+    Ok(c.last_insert_rowid())
+}
+
+/// 取消注册表键固定在 id 生成后写入（`queue:<id>`），保证重启后仍可取消
+pub fn set_job_key(id: i64, key: &str) -> AppResult<()> {
+    conn()?.execute(
+        "UPDATE jobs SET job_key = ?2 WHERE id = ?1",
+        params![id, key],
+    )?;
+    Ok(())
+}
+
+pub fn get_job(id: i64) -> AppResult<Option<JobRow>> {
+    let c = conn()?;
+    get_job_in(&c, id)
+}
+
+fn get_job_in(c: &Connection, id: i64) -> AppResult<Option<JobRow>> {
+    let sql = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE id = ?1");
+    Ok(c.query_row(&sql, params![id], job_from_row).optional()?)
+}
+
+pub fn list_jobs() -> AppResult<Vec<JobRow>> {
+    let c = conn()?;
+    let sql = format!("SELECT {JOB_COLUMNS} FROM jobs ORDER BY id DESC");
+    let mut stmt = c.prepare(&sql)?;
+    let rows = stmt.query_map([], job_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+/// 各状态计数（含数量为 0 的状态由调用方补齐）
+pub fn job_counts() -> AppResult<Vec<(String, i64)>> {
+    let c = conn()?;
+    let mut stmt = c.prepare("SELECT status, COUNT(*) FROM jobs GROUP BY status")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+pub fn next_queued_job() -> AppResult<Option<JobRow>> {
+    let c = conn()?;
+    next_queued_job_in(&c)
+}
+
+fn next_queued_job_in(c: &Connection) -> AppResult<Option<JobRow>> {
+    let sql =
+        format!("SELECT {JOB_COLUMNS} FROM jobs WHERE status = 'queued' ORDER BY id ASC LIMIT 1");
+    Ok(c.query_row(&sql, [], job_from_row).optional()?)
+}
+
+/// queued → running。返回 false 表示该 job 已被取消/被其它 worker 取走。
+pub fn start_job(id: i64) -> AppResult<bool> {
+    let c = conn()?;
+    start_job_in(&c, id)
+}
+
+fn start_job_in(c: &Connection, id: i64) -> AppResult<bool> {
+    let affected = c.execute(
+        "UPDATE jobs SET status = 'running', started_at = ?2 WHERE id = ?1 AND status = 'queued'",
+        params![id, timestamp_millis()],
+    )?;
+    Ok(affected > 0)
+}
+
+/// running → 终态。只允许从 running 迁移，防止已 canceled 的行被 done 覆盖。
+pub fn finish_job(
+    id: i64,
+    status: &str,
+    images_json: &str,
+    error: Option<&str>,
+) -> AppResult<bool> {
+    let c = conn()?;
+    finish_job_in(&c, id, status, images_json, error)
+}
+
+fn finish_job_in(
+    c: &Connection,
+    id: i64,
+    status: &str,
+    images_json: &str,
+    error: Option<&str>,
+) -> AppResult<bool> {
+    debug_assert!(JOB_TERMINAL_STATUSES.contains(&status));
+    let affected = c.execute(
+        "UPDATE jobs SET status = ?2, images_json = ?3, error = ?4, finished_at = ?5
+         WHERE id = ?1 AND status = 'running'",
+        params![id, status, images_json, error, timestamp_millis()],
+    )?;
+    Ok(affected > 0)
+}
+
+/// queued → canceled（立即生效，worker 不会再来取）。
+pub fn cancel_queued_job(id: i64) -> AppResult<bool> {
+    let c = conn()?;
+    cancel_queued_job_in(&c, id)
+}
+
+fn cancel_queued_job_in(c: &Connection, id: i64) -> AppResult<bool> {
+    let affected = c.execute(
+        "UPDATE jobs SET status = 'canceled', finished_at = ?2 WHERE id = ?1 AND status = 'queued'",
+        params![id, timestamp_millis()],
+    )?;
+    Ok(affected > 0)
+}
+
+/// 失败/取消/中断的任务重新入队（清空上次的错误与结果）。
+pub fn requeue_job(id: i64) -> AppResult<bool> {
+    let c = conn()?;
+    requeue_job_in(&c, id)
+}
+
+fn requeue_job_in(c: &Connection, id: i64) -> AppResult<bool> {
+    let affected = c.execute(
+        "UPDATE jobs SET status = 'queued', error = NULL, images_json = '[]',
+         started_at = NULL, finished_at = NULL
+         WHERE id = ?1 AND status IN ('failed', 'canceled', 'interrupted')",
+        params![id],
+    )?;
+    Ok(affected > 0)
+}
+
+/// 启动时把上次残留的 running 标为 interrupted：不自动重跑，避免重启即扣费。
+pub fn mark_running_interrupted() -> AppResult<usize> {
+    let c = conn()?;
+    mark_running_interrupted_in(&c)
+}
+
+fn mark_running_interrupted_in(c: &Connection) -> AppResult<usize> {
+    Ok(c.execute(
+        "UPDATE jobs SET status = 'interrupted', finished_at = ?1 WHERE status = 'running'",
+        params![timestamp_millis()],
+    )?)
+}
+
+/// 清空终态任务，返回删除行数
+pub fn clear_finished_jobs() -> AppResult<usize> {
+    let c = conn()?;
+    clear_finished_jobs_in(&c)
+}
+
+fn clear_finished_jobs_in(c: &Connection) -> AppResult<usize> {
+    Ok(c.execute(
+        "DELETE FROM jobs WHERE status IN ('done', 'failed', 'canceled', 'interrupted')",
+        [],
+    )?)
+}
+
+/// 从消息的 images_json 中移除一条图片引用。
+///
+/// 必须先改消息、再由调用方走 `delete_history` 做引用判定：顺序反了的话，
+/// 本消息自己的引用会让文件被判为「仍被引用」而永远保留。
+pub fn remove_message_image(message_id: i64, history_id: i64) -> AppResult<bool> {
+    let c = conn()?;
+    remove_message_image_in(&c, message_id, history_id)
+}
+
+fn remove_message_image_in(c: &Connection, message_id: i64, history_id: i64) -> AppResult<bool> {
+    let json: Option<String> = c
+        .query_row(
+            "SELECT images_json FROM messages WHERE id = ?1",
+            params![message_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(json) = json else { return Ok(false) };
+    let Ok(mut entries) = serde_json::from_str::<Vec<serde_json::Value>>(&json) else {
+        return Ok(false);
+    };
+    let before = entries.len();
+    entries.retain(|e| e.get("historyId").and_then(|v| v.as_i64()) != Some(history_id));
+    if entries.len() == before {
+        return Ok(false);
+    }
+    let updated = serde_json::to_string(&entries).map_err(|e| AppError::Other(e.to_string()))?;
+    c.execute(
+        "UPDATE messages SET images_json = ?2 WHERE id = ?1",
+        params![message_id, updated],
+    )?;
+    Ok(true)
+}
+
 // 避免引入 hex crate 的小工具
 mod hex {
     /// 按字节两两解析，并显式拒绝非 ASCII 输入。
@@ -2562,5 +2876,134 @@ mod tests {
             import_config_in(&mut c, &bad).expect_err("非法 Key/代理配置应拒绝导入");
             assert_eq!(count_providers(&c), 1, "拒绝时不得删除旧数据");
         }
+    }
+
+    fn new_job<'a>(prompt: &'a str) -> NewJob<'a> {
+        NewJob {
+            provider_id: 1,
+            provider_name: "P",
+            model: "m",
+            prompt,
+            negative_prompt: "",
+            style: "",
+            width: 1024,
+            height: 1024,
+            guidance: None,
+            steps: None,
+            seed: None,
+            count: 1,
+        }
+    }
+
+    /// C4：启动时残留的 running 必须标为 interrupted，且不回到 queued
+    #[test]
+    fn startup_marks_running_interrupted() {
+        let c = mem_conn();
+        let running = insert_job_in(&c, &new_job("running")).unwrap();
+        let queued = insert_job_in(&c, &new_job("queued")).unwrap();
+        assert!(start_job_in(&c, running).unwrap());
+        assert_eq!(mark_running_interrupted_in(&c).unwrap(), 1);
+        assert_eq!(
+            get_job_in(&c, running).unwrap().unwrap().status,
+            "interrupted"
+        );
+        assert_eq!(
+            get_job_in(&c, queued).unwrap().unwrap().status,
+            "queued",
+            "排队中的任务不应被启动逻辑改写"
+        );
+    }
+
+    /// C4：状态迁移必须带前置状态条件，已取消的任务不能被完成覆盖
+    #[test]
+    fn queue_transition_requires_expected_state() {
+        let c = mem_conn();
+        let id = insert_job_in(&c, &new_job("job")).unwrap();
+        // 未启动时不能直接 finish（只有 running 才能收尾）
+        assert!(!finish_job_in(&c, id, "done", "[]", None).unwrap());
+        assert!(start_job_in(&c, id).unwrap());
+        // 重复启动（worker 竞争）必须失败
+        assert!(!start_job_in(&c, id).unwrap());
+        assert!(finish_job_in(&c, id, "done", "[]", None).unwrap());
+        // 终态不可再次迁移
+        assert!(!finish_job_in(&c, id, "canceled", "[]", None).unwrap());
+        assert_eq!(get_job_in(&c, id).unwrap().unwrap().status, "done");
+    }
+
+    /// C4：失败任务重试回 queued，终态与运行中任务不能重试
+    #[test]
+    fn retry_requeues_failed() {
+        let c = mem_conn();
+        let id = insert_job_in(&c, &new_job("job")).unwrap();
+        assert!(!requeue_job_in(&c, id).unwrap(), "queued 任务无需重试");
+        assert!(start_job_in(&c, id).unwrap());
+        assert!(!requeue_job_in(&c, id).unwrap(), "running 任务不能重试");
+        assert!(finish_job_in(&c, id, "failed", "[]", Some("boom")).unwrap());
+        assert!(requeue_job_in(&c, id).unwrap());
+        let row = get_job_in(&c, id).unwrap().unwrap();
+        assert_eq!(row.status, "queued");
+        assert!(row.error.is_none());
+        assert_eq!(row.images_json, "[]");
+        assert!(row.started_at.is_none());
+        assert!(row.finished_at.is_none());
+    }
+
+    /// C4：取消排队任务立即生效，worker 之后取不到它
+    #[test]
+    fn cancel_queued_is_immediate() {
+        let c = mem_conn();
+        let first = insert_job_in(&c, &new_job("first")).unwrap();
+        let second = insert_job_in(&c, &new_job("second")).unwrap();
+        assert!(cancel_queued_job_in(&c, first).unwrap());
+        assert!(!cancel_queued_job_in(&c, first).unwrap(), "取消应幂等");
+        let next = next_queued_job_in(&c).unwrap().expect("仍有排队任务");
+        assert_eq!(next.id, second, "被取消的任务不能再被取到");
+        let row = get_job_in(&c, first).unwrap().unwrap();
+        assert_eq!(row.status, "canceled");
+        assert!(row.finished_at.is_some());
+    }
+
+    /// C4 缺陷 2：消息内移除图片引用后才能回收文件；其它消息仍引用时必须保留
+    #[test]
+    fn remove_message_image_keeps_shared_file() {
+        let c = mem_conn();
+        let shared = c
+            .execute(
+                "INSERT INTO history (prompt, file_path, created_at) VALUES ('p', 'shared.png', '0.000')",
+                [],
+            )
+            .map(|_| c.last_insert_rowid())
+            .unwrap();
+        let images = serde_json::json!([{ "historyId": shared, "path": "shared.png" }]).to_string();
+        let keep = insert_message(&c, 1, "keep");
+        c.execute(
+            "UPDATE messages SET images_json = ?2 WHERE id = ?1",
+            params![keep, images],
+        )
+        .unwrap();
+        let target = insert_message(&c, 1, "target");
+        c.execute(
+            "UPDATE messages SET images_json = ?2 WHERE id = ?1",
+            params![target, images],
+        )
+        .unwrap();
+
+        assert!(remove_message_image_in(&c, target, shared).unwrap());
+        assert!(
+            !remove_message_image_in(&c, target, shared).unwrap(),
+            "重复移除应返回 false"
+        );
+        let remaining: String = c
+            .query_row(
+                "SELECT images_json FROM messages WHERE id = ?1",
+                params![target],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(remaining, "[]");
+
+        // 另一条消息仍引用 → 文件保留
+        let deletion = delete_history_in(&c, shared).unwrap();
+        assert!(deletion.still_referenced, "仍有消息引用时不得回收文件");
     }
 }

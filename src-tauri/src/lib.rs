@@ -77,6 +77,16 @@ pub fn run() {
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             // 代理需在首个生成请求前生效；配置损坏只落日志，不阻断启动
             adapters::http::init_from_storage();
+            // 队列：上次残留的 running 一律标 interrupted（不自动重跑），
+            // 且默认暂停，等用户点「开始队列」后才执行。
+            match storage::mark_running_interrupted() {
+                Ok(0) => {}
+                Ok(n) => tracing::warn!("已将 {n} 个中断的队列任务标记为 interrupted"),
+                Err(e) => tracing::warn!("标记中断队列任务失败: {e}"),
+            }
+            let queue_state = std::sync::Arc::new(commands::QueueState::default());
+            app.manage(queue_state.clone());
+            commands::spawn_worker(app.handle().clone(), queue_state);
             // 孤儿图片回收：后台执行，不阻塞首屏；内部自带失败兜底与两道安全哨兵，
             // 任何异常都只落日志，不影响启动。显式 drop 句柄 = 刻意 detach。
             let gc_dir = data_dir.clone();
@@ -118,6 +128,12 @@ pub fn run() {
             commands::import_config,
             commands::get_logs_dir,
             commands::export_diagnostics,
+            commands::enqueue_job,
+            commands::list_jobs,
+            commands::cancel_queue_job,
+            commands::retry_queue_job,
+            commands::resume_queue,
+            commands::clear_finished_jobs,
             commands::get_thinking_config,
             commands::save_thinking_config,
             commands::test_thinking_connection,
@@ -126,6 +142,7 @@ pub fn run() {
             commands::list_conversations,
             commands::delete_conversation,
             commands::delete_message,
+            commands::remove_message_image,
             commands::add_message,
             commands::list_messages,
             commands::save_chat_image,
