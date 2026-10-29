@@ -57,6 +57,26 @@ function ThinkingCard({ message }: { message: DisplayMessage }) {
   );
 }
 
+function StreamingThinkingCard({ text }: { text: string }) {
+  return (
+    <div className="mb-2.5 rounded-[var(--radius-card)] border border-theme bg-elevated px-3.5 py-2.5">
+      <div className="flex items-center gap-2 text-[11px] font-medium tracking-wide text-tertiary">
+        <span className="text-accent">
+          <IconBrain size={14} />
+        </span>
+        <span>思考模型优化中</span>
+      </div>
+      <div
+        className="mt-1.5 whitespace-pre-wrap break-words text-[13px] leading-relaxed text-secondary"
+        aria-live="polite"
+      >
+        {text}
+        <span className="thinking-caret" aria-hidden="true" />
+      </div>
+    </div>
+  );
+}
+
 function PendingCard({ label }: { label: string }) {
   return (
     <div className="shimmer relative aspect-square overflow-hidden rounded-[var(--radius-card)]">
@@ -116,7 +136,11 @@ export default memo(function MessageItem({
           </div>
         ) : (
           <div className="w-full">
-            <ThinkingCard message={message} />
+            {message.status === "thinking" && message.streamText ? (
+              <StreamingThinkingCard text={message.streamText} />
+            ) : (
+              <ThinkingCard message={message} />
+            )}
             {(message.status === "thinking" ||
               message.status === "generating") && (
               <div className="mb-2.5 flex items-center gap-2 text-[13px] text-tertiary">

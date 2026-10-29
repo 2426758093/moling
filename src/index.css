@@ -195,6 +195,33 @@ body {
   animation-delay: 0.3s;
 }
 
+/* 思考流式光标：1px 竖条，250ms 明暗；减少动态时静止 */
+@keyframes caret-blink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0.2;
+  }
+}
+.thinking-caret {
+  display: inline-block;
+  width: 1px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -0.15em;
+  background: var(--accent);
+  animation: caret-blink 250ms step-end infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .thinking-caret {
+    animation: none;
+    opacity: 1;
+  }
+}
+
 /* ---------------- 无障碍：键盘焦点环与动效降级 ---------------- */
 /* 只用 outline，不改变布局；鼠标点击不会出现（:focus-visible 语义） */
 :focus-visible {

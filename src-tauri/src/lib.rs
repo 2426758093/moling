@@ -142,6 +142,7 @@ pub fn run() {
             commands::save_thinking_config,
             commands::test_thinking_connection,
             commands::refine_prompt,
+            commands::cancel_refine,
             commands::create_conversation,
             commands::list_conversations,
             commands::delete_conversation,

@@ -1,10 +1,12 @@
 import { create } from "zustand";
+import { listen } from "@tauri-apps/api/event";
 import {
   api,
   AdapterError,
   ChatMessage,
   Conversation,
   parseAdapterError,
+  ThinkingDelta,
 } from "../lib/api";
 import { toast } from "../lib/notify";
 import { MAX_REFERENCE_IMAGES } from "../lib/image";
@@ -37,6 +39,8 @@ export interface DisplayMessage {
   pendingImages: number;
   status: "thinking" | "generating" | "done" | "stopped" | "error";
   error: AdapterError | null;
+  /// 思考模型的流式增量（仅 status=thinking 期间有值，落定后清空）
+  streamText?: string;
 }
 
 interface ChatState {
@@ -51,7 +55,6 @@ interface ChatState {
   attachments: Attachment[];
   sending: boolean;
   stopRequested: boolean;
-  thinkingText: string;
   draftPrompt: string | null;
   setDraftPrompt: (text: string | null) => void;
   loadConversations: () => Promise<void>;
@@ -119,6 +122,18 @@ let sendSeq = 0;
 let convSeq = 0;
 // 当前在途生成任务 id：stop() 用它请求后端取消（同一时刻只有一路生成）
 let activeJobId: string | null = null;
+// 当前在途思考请求 id：增量事件按它过滤，stop() 用它取消
+let activeRefineId: string | null = null;
+// 思考增量的退订函数（每轮请求重订阅，StrictMode 双订阅无副作用）
+let detachThinking: (() => void) | null = null;
+
+/// 退订思考增量并清空活动 id；不清空已落定的 refined 内容
+function detachThinkingStream(): void {
+  const off = detachThinking;
+  detachThinking = null;
+  activeRefineId = null;
+  off?.();
+}
 
 export const useChatStore = create<ChatState>((set, get) => {
   // 抽出的「生成 + 持久化 assistant」流程，send()（新消息）与 retryLast()（重试）共用：
@@ -139,7 +154,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         ),
       });
     const finalize = () => {
-      if (isCurrent()) set({ sending: false, thinkingText: "" });
+      if (isCurrent()) set({ sending: false });
     };
 
     // 持久化助手消息（只存 {historyId, path}）；markError=false 时保留调用方已设置的 status
@@ -208,22 +223,46 @@ export const useChatStore = create<ChatState>((set, get) => {
       .find(
         (m) => m.role === "assistant" && m.refined && m.id !== assistantLocalId,
       );
+    // 先订阅再发起：增量只写入本轮占位，且停止/过期后不再落任何片段
+    detachThinkingStream();
+    const refineId = crypto.randomUUID();
+    activeRefineId = refineId;
+    const off = await listen<ThinkingDelta>("thinking:delta", (event) => {
+      const { requestId, delta } = event.payload;
+      if (requestId !== refineId || requestId !== activeRefineId) return;
+      if (!isCurrent() || get().stopRequested) return;
+      const current = get().messages.find((m) => m.id === assistantLocalId);
+      if (!current) return;
+      updateAssistant({ streamText: (current.streamText ?? "") + delta });
+    });
+    detachThinking = () => {
+      off();
+      if (activeRefineId === refineId) activeRefineId = null;
+    };
     try {
       const result = await api.refinePrompt(
         userMsg.content,
         lastAssistant?.refined ?? null,
+        refineId,
+        convId,
       );
       if (!isCurrent()) return;
-      if (result.used) {
+      if (result.used && !get().stopRequested) {
         updateAssistant({
           refined: result.refined,
           thinkingUsed: true,
           content: result.refined,
+          streamText: undefined,
         });
-        set({ thinkingText: result.refined });
+      } else {
+        updateAssistant({ streamText: undefined });
       }
     } catch {
       // 思考失败静默降级为原文
+      updateAssistant({ streamText: undefined });
+    } finally {
+      // 只有本次仍是活动思考请求时才退订，避免误杀下一轮已建好的订阅
+      if (activeRefineId === refineId) detachThinkingStream();
     }
     if (!isCurrent()) return;
     if (get().stopRequested) {
@@ -326,7 +365,6 @@ export const useChatStore = create<ChatState>((set, get) => {
     attachments: [],
     sending: false,
     stopRequested: false,
-    thinkingText: "",
     draftPrompt: null,
     setDraftPrompt: (text) => set({ draftPrompt: text }),
 
@@ -346,6 +384,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       try {
         const id = await api.createConversation("新对话");
         convSeq++;
+        detachThinkingStream();
         await get().loadConversations();
         set({
           activeId: id,
@@ -361,6 +400,7 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     selectConversation: async (id) => {
       // 只加载最新一页；更早的消息由 loadOlder() 按需续载
+      detachThinkingStream();
       const myConvSeq = ++convSeq;
       try {
         const { messages, hasMore } = await api.listMessages(id, {
@@ -374,7 +414,6 @@ export const useChatStore = create<ChatState>((set, get) => {
           hasMore,
           loadingOlder: false,
           attachments: [],
-          thinkingText: "",
         });
       } catch (e) {
         if (convSeq === myConvSeq) {
@@ -460,7 +499,7 @@ export const useChatStore = create<ChatState>((set, get) => {
 
       // 校验通过后立即同步上锁再进入 await：后面有 createConversation 与附件落盘两次异步，
       // 若像原来那样等到生成前才置 sending，连点/连按 Enter 会穿透校验造成双发。
-      set({ sending: true, stopRequested: false, thinkingText: "" });
+      set({ sending: true, stopRequested: false });
       const mySeq = ++sendSeq;
       const isMine = () => sendSeq === mySeq;
 
@@ -574,14 +613,19 @@ export const useChatStore = create<ChatState>((set, get) => {
       } finally {
         // 成功/异常/停止都复位；仅当本次仍是当前发送时复位，
         // 避免上一轮收尾把新一轮发送的锁清掉
-        if (isMine()) set({ sending: false, thinkingText: "" });
+        if (isMine()) set({ sending: false });
       }
     },
 
     stop: () => {
       // 停止语义：立即回到空闲 UI，并尽力请求后端中断在途生成。
-      // jobId 由 runGeneration 生成；cancelGeneration 为 fire-and-forget，
+      // jobId / 思考 requestId 均由 runGeneration 生成；取消命令为 fire-and-forget，
       // 后端未落地该命令（invoke 拒绝）时静默忽略，不阻塞停止操作。
+      const refineId = activeRefineId;
+      if (refineId) {
+        detachThinkingStream();
+        void api.cancelRefine(refineId).catch(() => undefined);
+      }
       const jobId = activeJobId;
       if (jobId) {
         activeJobId = null;
@@ -590,7 +634,6 @@ export const useChatStore = create<ChatState>((set, get) => {
       set((s) => ({
         stopRequested: true,
         sending: false,
-        thinkingText: "",
         // 在途占位立刻标记 stopped：否则停止后马上发新消息时，
         // 旧请求返回会被序号校验丢弃，旧气泡会一直转圈
         messages: s.messages.map((m) =>
@@ -648,7 +691,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         error: null,
       };
 
-      set({ sending: true, stopRequested: false, thinkingText: "" });
+      set({ sending: true, stopRequested: false });
       const mySeq = ++sendSeq;
       const isMine = () => sendSeq === mySeq;
       try {
@@ -686,7 +729,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           toast(`重试失败：${parseAdapterError(String(e)).message}`, "error");
         }
       } finally {
-        if (isMine()) set({ sending: false, thinkingText: "" });
+        if (isMine()) set({ sending: false });
       }
     },
 

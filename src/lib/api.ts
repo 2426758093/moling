@@ -163,6 +163,13 @@ export interface AvailableUpdate {
   date: string | null;
 }
 
+/** 思考模型流式增量（Tauri 事件 thinking:delta） */
+export interface ThinkingDelta {
+  requestId: string;
+  conversationId: number | null;
+  delta: string;
+}
+
 /** 更新状态：未配置更新源时 configured=false，且不发起网络请求 */
 export interface UpdateStatus {
   currentVersion: string;
@@ -284,11 +291,19 @@ export const api = {
     invoke<{ ok: boolean; latencyMs?: number; error?: string }>(
       "test_thinking_connection",
     ),
-  refinePrompt: (raw: string, context?: string | null) =>
+  refinePrompt: (
+    raw: string,
+    context?: string | null,
+    requestId?: string | null,
+    conversationId?: number | null,
+  ) =>
     invoke<{ refined: string; used: boolean; error?: AdapterError }>(
       "refine_prompt",
-      { input: { raw, context } },
+      { input: { raw, context, requestId, conversationId } },
     ),
+  /// 取消在途思考优化（幂等：未注册/已结束返回 false）
+  cancelRefine: (requestId: string) =>
+    invoke<boolean>("cancel_refine", { requestId }),
   createConversation: (title: string) =>
     invoke<number>("create_conversation", { title }),
   listConversations: () =>

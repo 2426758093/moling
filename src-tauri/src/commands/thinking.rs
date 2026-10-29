@@ -1,5 +1,6 @@
 use crate::adapters::{self, ProviderConfig};
 use crate::storage;
+use tauri::Emitter;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -201,10 +202,48 @@ pub async fn test_thinking_connection() -> Result<serde_json::Value, String> {
 pub struct RefineInput {
     pub raw: String,
     pub context: Option<String>,
+    /// 前端生成的思考请求 id：用于流式增量过滤与取消；不传时退回非流式行为
+    #[serde(default)]
+    pub request_id: Option<String>,
+    /// 前端当前会话 id：随增量事件回传，便于前端做二次过滤
+    #[serde(default)]
+    pub conversation_id: Option<i64>,
+}
+
+/// 流式增量事件（前端按 requestId + 当前会话双重过滤）
+fn emit_thinking_delta(
+    app: &tauri::AppHandle,
+    request_id: &str,
+    conversation_id: Option<i64>,
+    delta: &str,
+) {
+    let _ = app.emit(
+        "thinking:delta",
+        serde_json::json!({
+            "requestId": request_id,
+            "conversationId": conversation_id,
+            "delta": delta,
+        }),
+    );
+}
+
+/// mock 分段流式：无网也能验收逐字效果与停止行为
+const MOCK_REFINE_SEGMENTS: usize = 5;
+const MOCK_REFINE_INTERVAL_MS: u64 = 120;
+
+fn mock_refine_chunks(raw: &str) -> String {
+    format!(
+        "(mock 思考优化) {}，masterpiece, highly detailed, professional lighting",
+        raw
+    )
 }
 
 #[tauri::command]
-pub async fn refine_prompt(input: RefineInput) -> Result<serde_json::Value, String> {
+pub async fn refine_prompt(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, crate::commands::GenerationRegistry>,
+    input: RefineInput,
+) -> Result<serde_json::Value, String> {
     let resolved = resolve_thinking_provider()?;
     let Some((config, model)) = resolved else {
         return Ok(serde_json::json!({
@@ -213,14 +252,44 @@ pub async fn refine_prompt(input: RefineInput) -> Result<serde_json::Value, Stri
         }));
     };
     let user = adapters::chat::build_refine_user_input(&input.raw, input.context.as_deref());
+    // 取消 token 复用生成注册表，键加 `refine:` 前缀与生成任务隔离
+    let cancel_key = input.request_id.as_ref().map(|id| format!("refine:{id}"));
+    let (_registration, cancel_token) =
+        crate::commands::CancelRegistration::new(&state, cancel_key.as_ref());
+    let stream_id = input.request_id.as_deref();
+    let conv_id = input.conversation_id;
+
     let result = if config.kind == adapters::KIND_MOCK {
-        Ok(format!(
-            "(mock 思考优化) {}，masterpiece, highly detailed, professional lighting",
-            input.raw
-        ))
+        let full = mock_refine_chunks(&input.raw);
+        let chars: Vec<char> = full.chars().collect();
+        let step = chars.len().div_ceil(MOCK_REFINE_SEGMENTS).max(1);
+        for piece in chars.chunks(step) {
+            if cancel_token
+                .as_ref()
+                .is_some_and(|t| t.load(std::sync::atomic::Ordering::SeqCst))
+            {
+                return Err("思考优化已取消".into());
+            }
+            if let Some(id) = stream_id {
+                emit_thinking_delta(&app, id, conv_id, &piece.iter().collect::<String>());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(MOCK_REFINE_INTERVAL_MS)).await;
+        }
+        Ok(full)
     } else {
-        adapters::chat::chat_complete(&config, &model, adapters::chat::REFINE_SYSTEM_PROMPT, &user)
-            .await
+        adapters::chat::chat_stream(
+            &config,
+            &model,
+            adapters::chat::REFINE_SYSTEM_PROMPT,
+            &user,
+            cancel_token.as_ref(),
+            |delta| {
+                if let Some(id) = stream_id {
+                    emit_thinking_delta(&app, id, conv_id, delta);
+                }
+            },
+        )
+        .await
     };
     match result {
         Ok(text) => Ok(serde_json::json!({
@@ -236,6 +305,15 @@ pub async fn refine_prompt(input: RefineInput) -> Result<serde_json::Value, Stri
             }))
         }
     }
+}
+
+/// 取消在途思考优化：置位注册表里的 token（幂等，未注册返回 false）
+#[tauri::command]
+pub fn cancel_refine(
+    request_id: String,
+    state: tauri::State<'_, crate::commands::GenerationRegistry>,
+) -> bool {
+    state.cancel(&format!("refine:{request_id}"))
 }
 
 #[tauri::command]
