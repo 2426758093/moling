@@ -3,6 +3,7 @@ use crate::image_store::{self, SAFE_NAME_MAX_CHARS};
 use crate::key_pool;
 use crate::storage;
 use std::sync::atomic::Ordering;
+use tauri::Emitter;
 
 /// 取消标记类型：jobId → 是否已取消
 pub type CancelToken = std::sync::Arc<std::sync::atomic::AtomicBool>;
@@ -154,6 +155,23 @@ fn build_prompt(input: &GenerateCommandInput) -> String {
     }
 }
 
+/// 聊天内逐张进度的载荷；队列路径不带 jobId，返回 None（避免与 queue:progress 重复）
+fn progress_payload(
+    job_id: Option<&str>,
+    done: usize,
+    total: usize,
+    requested: u32,
+) -> Option<serde_json::Value> {
+    let job_id = job_id?;
+    Some(serde_json::json!({
+        "jobId": job_id,
+        "done": done,
+        // total 与 done 同源（服务商实际返回张数），保证 i/n 自洽
+        "total": total,
+        "requested": requested,
+    }))
+}
+
 #[tauri::command]
 pub async fn generate_images(
     app: tauri::AppHandle,
@@ -163,7 +181,16 @@ pub async fn generate_images(
     // RA-06：注册取消 token（不传 jobId 时不注册，行为与旧版完全一致）；
     // _registration 守卫在函数退出（含出错提前返回）时自动移除 token。
     let (_registration, cancel_token) = CancelRegistration::new(&state, input.job_id.as_ref());
-    let outcome = generate_core(&app, &input, cancel_token, |_, _| {}).await?;
+    let progress_app = app.clone();
+    let job_id = input.job_id.clone();
+    let requested = input.count;
+    let outcome = generate_core(&app, &input, cancel_token, move |done, total| {
+        // 事件发不出去（窗口已关）不影响生成
+        if let Some(payload) = progress_payload(job_id.as_deref(), done, total, requested) {
+            let _ = progress_app.emit("image:progress", payload);
+        }
+    })
+    .await?;
     Ok(serde_json::json!({ "images": outcome.images, "cancelled": outcome.cancelled }))
 }
 
@@ -617,5 +644,16 @@ mod tests {
         assert!(lock_cancel_map(&registry.0).contains_key("job-2"));
         drop(guard);
         assert!(!lock_cancel_map(&registry.0).contains_key("job-2"));
+    }
+
+    /// 聊天内逐张进度：payload 形状固定；无 jobId（队列路径）不发事件
+    #[test]
+    fn progress_payload_shape_and_job_guard() {
+        assert!(progress_payload(None, 1, 2, 4).is_none());
+        let value = progress_payload(Some("job-9"), 3, 4, 4).expect("有 jobId 时必须有载荷");
+        assert_eq!(value["jobId"], "job-9");
+        assert_eq!(value["done"], 3);
+        assert_eq!(value["total"], 4);
+        assert_eq!(value["requested"], 4);
     }
 }

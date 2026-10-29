@@ -170,6 +170,17 @@ export interface ThinkingDelta {
   delta: string;
 }
 
+/**
+ * 逐张生成进度（Tauri 事件 image:progress）
+ * total 是服务商实际返回张数（与 done 同源），requested 是本次请求的 count。
+ */
+export interface ImageProgress {
+  jobId: string;
+  done: number;
+  total: number;
+  requested: number;
+}
+
 /** 更新状态：未配置更新源时 configured=false，且不发起网络请求 */
 export interface UpdateStatus {
   currentVersion: string;

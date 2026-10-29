@@ -151,7 +151,9 @@ export default memo(function MessageItem({
                 </span>
                 {message.status === "thinking"
                   ? "正在思考…"
-                  : `正在绘制 · 剩余 ${message.pendingImages} 张`}
+                  : message.progress
+                    ? `正在绘制 · ${message.progress.done}/${message.progress.total}`
+                    : `正在绘制 · 剩余 ${message.pendingImages} 张`}
               </div>
             )}
             <div

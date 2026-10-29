@@ -5,6 +5,7 @@ import {
   AdapterError,
   ChatMessage,
   Conversation,
+  ImageProgress,
   parseAdapterError,
   ThinkingDelta,
 } from "../lib/api";
@@ -48,6 +49,8 @@ export interface DisplayMessage {
   error: AdapterError | null;
   /// 思考模型的流式增量（仅 status=thinking 期间有值，落定后清空）
   streamText?: string;
+  /// 逐张生成进度（后端 image:progress 事件）；无事件时退回 pendingImages 文案
+  progress?: { done: number; total: number };
 }
 
 interface ChatState {
@@ -293,6 +296,20 @@ export const useChatStore = create<ChatState>((set, get) => {
     let cancelled = false;
     const jobId = crypto.randomUUID();
     activeJobId = jobId;
+    // 先订阅再发起：后端每落盘一张就发一次 image:progress；
+    // 迟到事件因 activeJobId 已清空（stop/结束）被丢弃
+    const offProgress = await listen<ImageProgress>(
+      "image:progress",
+      (event) => {
+        const { jobId: eventJobId, done, total } = event.payload;
+        if (eventJobId !== jobId || eventJobId !== activeJobId) return;
+        if (!isCurrent() || get().stopRequested) return;
+        updateAssistant({
+          progress: { done, total },
+          pendingImages: Math.max(0, count - done),
+        });
+      },
+    );
     try {
       const resp = await api.generateImages({
         providerId: defaultProviderId,
@@ -326,13 +343,18 @@ export const useChatStore = create<ChatState>((set, get) => {
       if (!isCurrent()) return;
       genError = parseAdapterError(String(e));
     } finally {
+      offProgress();
       // 任务已结束：清理活动任务 id（仅当仍是本次任务，避免误清新任务）
       if (activeJobId === jobId) activeJobId = null;
     }
     if (!isCurrent()) return;
     // 终态清算占位：服务商可能少于请求数量（模板接口常见只返回单图），
     // 差额不能留成永久骨架。
-    updateAssistant({ images: [...images], pendingImages: 0 });
+    updateAssistant({
+      images: [...images],
+      pendingImages: 0,
+      progress: undefined,
+    });
     if (
       !cancelled &&
       !get().stopRequested &&
