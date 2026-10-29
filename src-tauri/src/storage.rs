@@ -2762,7 +2762,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(decrypt_secret(&first).unwrap(), "k1");
-        assert!(!keys_enc.contains("k1"), "Key 列表必须整体加密");
+        // 密文是 base64（随机 nonce + 密文），短子串可能偶然出现，只能断言不是明文 JSON
+        assert!(!keys_enc.starts_with('['), "Key 列表必须整体加密");
         let decoded = decode_keys(&keys_enc, &first).unwrap();
         assert_eq!(
             decoded.iter().map(|k| k.key.as_str()).collect::<Vec<_>>(),
