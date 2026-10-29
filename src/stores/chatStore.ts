@@ -10,6 +10,11 @@ import {
 } from "../lib/api";
 import { toast } from "../lib/notify";
 import { MAX_REFERENCE_IMAGES } from "../lib/image";
+import {
+  compressDataUrl,
+  genAttachmentId,
+  prepareImageAttachment,
+} from "../lib/file";
 import { useAppStore } from "./appStore";
 import { useProviderStore } from "./providerStore";
 
@@ -18,6 +23,8 @@ export interface Attachment {
   dataUrl: string;
   name: string;
   path?: string;
+  /** 已做降采样（仅内存显示角标，不入库） */
+  compressed?: boolean;
 }
 
 export interface ChatImage {
@@ -64,6 +71,10 @@ interface ChatState {
   loadOlder: () => Promise<void>;
   deleteConvo: (id: number) => Promise<void>;
   addAttachment: (att: Attachment) => boolean;
+  /** 文件入口：校验后的图片读成 dataUrl，必要时压缩后再加入 */
+  addFileAttachment: (file: File) => Promise<boolean>;
+  /** dataUrl 入口（引用生成图）：同样按需压缩 */
+  addDataUrlAttachment: (dataUrl: string, name: string) => Promise<boolean>;
   removeAttachment: (id: string) => void;
   clearAttachments: () => void;
   send: (text: string) => Promise<void>;
@@ -479,6 +490,24 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
       set((s) => ({ attachments: [...s.attachments, att] }));
       return true;
+    },
+    addFileAttachment: async (file) => {
+      const prepared = await prepareImageAttachment(file);
+      return get().addAttachment({
+        id: genAttachmentId(),
+        dataUrl: prepared.dataUrl,
+        name: file.name,
+        compressed: prepared.compressed || undefined,
+      });
+    },
+    addDataUrlAttachment: async (dataUrl, name) => {
+      const prepared = await compressDataUrl(dataUrl, name);
+      return get().addAttachment({
+        id: genAttachmentId(),
+        dataUrl: prepared.dataUrl,
+        name,
+        compressed: prepared.compressed || undefined,
+      });
     },
     removeAttachment: (id) =>
       set((s) => ({ attachments: s.attachments.filter((a) => a.id !== id) })),

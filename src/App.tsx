@@ -13,11 +13,7 @@ import { useChatStore } from "./stores/chatStore";
 import { useProviderStore } from "./stores/providerStore";
 import { useQueueStore } from "./stores/queueStore";
 import { api } from "./lib/api";
-import {
-  readFileAsDataUrl,
-  genAttachmentId,
-  validateImageFile,
-} from "./lib/file";
+import { validateImageFile } from "./lib/file";
 import { applyThemeClass } from "./lib/theme";
 import { MAX_REFERENCE_IMAGES } from "./lib/image";
 import { toast } from "./lib/notify";
@@ -44,7 +40,7 @@ export default function App() {
   const view = useAppStore((s) => s.view);
   const editTarget = useAppStore((s) => s.editTarget);
   const outpaintTarget = useAppStore((s) => s.outpaintTarget);
-  const addAttachment = useChatStore((s) => s.addAttachment);
+  const addFileAttachment = useChatStore((s) => s.addFileAttachment);
   const setView = useAppStore((s) => s.setView);
 
   useEffect(() => {
@@ -112,16 +108,7 @@ export default function App() {
               toast(invalid, "error");
               continue;
             }
-            const dataUrl = await readFileAsDataUrl(file);
-            if (
-              !addAttachment({
-                id: genAttachmentId(),
-                dataUrl,
-                name: file.name,
-              })
-            ) {
-              break;
-            }
+            if (!(await addFileAttachment(file))) break;
           }
           setView("chat");
         })();

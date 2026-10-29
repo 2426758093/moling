@@ -5,11 +5,7 @@ import { useAppStore } from "../stores/appStore";
 import { useProviderStore } from "../stores/providerStore";
 import { useQueueStore } from "../stores/queueStore";
 import { RATIO_OPTIONS, STYLE_PRESETS } from "../lib/types";
-import {
-  readFileAsDataUrl,
-  genAttachmentId,
-  validateImageFile,
-} from "../lib/file";
+import { validateImageFile } from "../lib/file";
 import { toast } from "../lib/notify";
 import { MAX_REFERENCE_IMAGES } from "../lib/image";
 import SafeImg from "./SafeImg";
@@ -31,7 +27,7 @@ export default function Composer() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const attachments = useChatStore((s) => s.attachments);
-  const addAttachment = useChatStore((s) => s.addAttachment);
+  const addFileAttachment = useChatStore((s) => s.addFileAttachment);
   const removeAttachment = useChatStore((s) => s.removeAttachment);
   const sending = useChatStore((s) => s.sending);
   const stop = useChatStore((s) => s.stop);
@@ -136,16 +132,7 @@ export default function Composer() {
         toast(invalid, "error");
         continue;
       }
-      const dataUrl = await readFileAsDataUrl(file);
-      if (
-        !addAttachment({
-          id: genAttachmentId(),
-          dataUrl,
-          name: file.name,
-        })
-      ) {
-        break;
-      }
+      if (!(await addFileAttachment(file))) break;
     }
   };
 
@@ -178,6 +165,11 @@ export default function Composer() {
                     alt={a.name}
                     className="h-14 w-14 rounded-[10px] border border-theme object-cover shadow-card"
                   />
+                  {a.compressed && (
+                    <span className="pointer-events-none absolute bottom-0 left-0 rounded-bl-[10px] rounded-tr-[8px] border-r border-t border-theme bg-elevated/95 px-1 py-px text-[10px] leading-none text-tertiary">
+                      已压缩
+                    </span>
+                  )}
                   <button
                     onClick={() => removeAttachment(a.id)}
                     aria-label={`移除附件 ${a.name}`}

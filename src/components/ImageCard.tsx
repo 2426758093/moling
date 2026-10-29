@@ -21,8 +21,6 @@ import {
   IconChevron,
 } from "./Icons";
 
-let viewerSeq = 0;
-
 export default function ImageCard({
   image,
   siblings,
@@ -35,7 +33,7 @@ export default function ImageCard({
   /** 所属消息 id：删除必须落库，否则刷新后图片又回来 */
   messageId: number;
 }) {
-  const addAttachment = useChatStore((s) => s.addAttachment);
+  const addDataUrlAttachment = useChatStore((s) => s.addDataUrlAttachment);
   const openEditor = useAppStore((s) => s.openEditor);
   const openOutpaint = useAppStore((s) => s.openOutpaint);
   // 模板适配器没有编辑端点：隐藏入口，避免用户点进去才收到「暂不支持」
@@ -74,11 +72,11 @@ export default function ImageCard({
   };
 
   const reference = () => {
-    addAttachment({
-      id: `ref-${image.historyId}-${++viewerSeq}`,
-      dataUrl: image.dataUrl,
-      name: `引用图 #${image.historyId}`,
-    });
+    // 生成图可能很大：走 dataUrl 入口统一按需压缩
+    void addDataUrlAttachment(
+      image.dataUrl,
+      `引用图 #${image.historyId}`,
+    ).catch(() => toast("添加参考图失败", "error"));
   };
 
   const removeLocal = () =>

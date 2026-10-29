@@ -192,12 +192,15 @@ impl ImageAdapter for OpenAiAdapter {
                         .map_err(|e| AdapterError::Other {
                             message: format!("参考图 base64 解码失败: {}", e),
                         })?;
+                    // 文件名与 MIME 按真实格式上报：压缩后的参考图多为 JPEG，
+                    // 谎报 image/png 会被严格网关拒绝
+                    let (ext, mime) = crate::image_store::sniff_image_mime(&bytes);
                     form = form.part(
                         "image[]",
                         reqwest::multipart::Part::bytes(bytes)
                             // 文件名必须带扩展名，否则服务商可能按二进制拒绝
-                            .file_name(format!("image-{}.png", i))
-                            .mime_str("image/png")
+                            .file_name(format!("ref.{}.{}", i, ext))
+                            .mime_str(mime)
                             .map_err(|e| AdapterError::Other {
                                 message: e.to_string(),
                             })?,

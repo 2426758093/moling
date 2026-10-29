@@ -84,6 +84,22 @@ pub fn path_to_data_url(path: &str) -> Option<String> {
     })
 }
 
+/// 按魔数探测图片真实格式，返回 (扩展名, MIME)；未知格式回退 PNG。
+/// 参考图压缩后可能是 JPEG/WebP，multipart 上送不得再一律谎报 image/png。
+pub fn sniff_image_mime(bytes: &[u8]) -> (&'static str, &'static str) {
+    if bytes.starts_with(b"\x89PNG") {
+        ("png", "image/png")
+    } else if bytes.starts_with(b"\xff\xd8") {
+        ("jpg", "image/jpeg")
+    } else if bytes.starts_with(b"GIF") {
+        ("gif", "image/gif")
+    } else if bytes.starts_with(b"RIFF") {
+        ("webp", "image/webp")
+    } else {
+        ("png", "image/png")
+    }
+}
+
 /// 去掉 data URL 前缀，只保留 base64 部分
 pub fn strip_data_url(s: &str) -> String {
     if let Some(idx) = s.find(',') {
@@ -235,17 +251,7 @@ pub fn save_b64_image(
         .decode(&payload)
         .map_err(|e| AppError::Other(format!("图片 base64 解码失败: {}", e)))?;
     // 探测真实格式
-    let ext = if bytes.starts_with(b"\x89PNG") {
-        "png"
-    } else if bytes.starts_with(b"\xff\xd8") {
-        "jpg"
-    } else if bytes.starts_with(b"GIF") {
-        "gif"
-    } else if bytes.starts_with(b"RIFF") {
-        "webp"
-    } else {
-        "png"
-    };
+    let ext = sniff_image_mime(&bytes).0;
     let path = write_new(&images, name, ext, &bytes)?;
     let url = format!(
         "data:{};base64,{}",
@@ -366,6 +372,26 @@ pub fn enrich_image_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 参考图 multipart 的 MIME 必须按真实格式上报（压缩后多为 JPEG）
+    #[test]
+    fn sniff_image_mime_detects_real_format() {
+        assert_eq!(
+            sniff_image_mime(b"\x89PNG\r\n\x1a\n...."),
+            ("png", "image/png")
+        );
+        assert_eq!(
+            sniff_image_mime(b"\xff\xd8\xff\xe0...."),
+            ("jpg", "image/jpeg")
+        );
+        assert_eq!(sniff_image_mime(b"GIF89a...."), ("gif", "image/gif"));
+        assert_eq!(
+            sniff_image_mime(b"RIFF\x00\x00\x00\x00WEBP"),
+            ("webp", "image/webp")
+        );
+        // 未知格式回退 PNG（与旧行为一致）
+        assert_eq!(sniff_image_mime(b"not-an-image"), ("png", "image/png"));
+    }
 
     /// RC-19：SVG data URL（含 base64 变体）必须能被识别，才会落盘为 .svg
     #[test]
