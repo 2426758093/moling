@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { api, ProviderItem } from "../lib/api";
+import { downloadBlob } from "../lib/file";
 import { useProviderStore } from "../stores/providerStore";
 import { useAppStore } from "../stores/appStore";
 import { toast } from "../lib/notify";
@@ -98,11 +99,7 @@ export default function SettingsView() {
       const blob = new Blob([JSON.stringify(data, null, 2)], {
         type: "application/json",
       });
-      const a = document.createElement("a");
-      a.href = URL.createObjectURL(blob);
-      a.download = `moling_backup_${Date.now()}.json`;
-      a.click();
-      URL.revokeObjectURL(a.href);
+      downloadBlob(blob, `moling_backup_${Date.now()}.json`);
       setBackupMsg(
         includeKeys
           ? "已导出（包含明文 API Key，请勿分享或上传）"

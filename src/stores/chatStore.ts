@@ -87,9 +87,11 @@ interface ChatState {
   removeAttachment: (id: string) => void;
   updateAttachment: (id: string, patch: Partial<Attachment>) => void;
   clearAttachments: () => void;
-  send: (text: string) => Promise<void>;
+  /** 发送一条消息；true=已受理并落位到本地列表，false=未受理/已中止（调用方回填草稿） */
+  send: (text: string) => Promise<boolean>;
   stop: () => void;
-  retryLast: () => Promise<void>;
+  /** 重试某条 assistant 回复；未传 id 时取最后一条（旧行为） */
+  retryLast: (assistantId?: number) => Promise<void>;
   appendImageMessage: (
     img: {
       historyId: number;
@@ -162,6 +164,11 @@ function detachThinkingStream(): void {
 }
 
 export const useChatStore = create<ChatState>((set, get) => {
+  // 复合序号守卫：sendSeq 防「被新一轮发送/重试取代」，convSeq 防「已切走会话仍回写消息列表」。
+  // 两者职责分离：sending 锁只看 sendSeq（切会话后旧流程结束必须解锁），消息写入必须两个都匹配。
+  const stillCurrent = (sendSnapshot: number, convSnapshot: number) =>
+    sendSeq === sendSnapshot && convSeq === convSnapshot;
+
   // 抽出的「生成 + 持久化 assistant」流程，send()（新消息）与 retryLast()（重试）共用：
   // 只维护 1 条 assistant 气泡，不新增 user 消息（落实重试不重复用户消息）。
   // seq 为调用方持有的发送序号，用于丢弃已被新一轮发送取代的过期流程更新。
@@ -273,7 +280,9 @@ export const useChatStore = create<ChatState>((set, get) => {
         convId,
       );
       if (!isCurrent()) return;
-      if (result.used && !get().stopRequested) {
+      // 空优化结果不能覆盖用户原文（F-005）：后端正常时 used 已带 trim 守卫，
+      // 这里再挡一次旧版本/异常响应，避免气泡内容变空。
+      if (result.used && result.refined.trim() !== "" && !get().stopRequested) {
         updateAssistant({
           refined: result.refined,
           thinkingUsed: true,
@@ -569,7 +578,7 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     send: async (text) => {
       const trimmed = text.trim();
-      if (!trimmed || get().sending) return;
+      if (!trimmed || get().sending) return false;
       const { providers, defaultProviderId } = useProviderStore.getState();
       const provider = providers.find(
         (p) => p.provider.id === defaultProviderId,
@@ -577,14 +586,16 @@ export const useChatStore = create<ChatState>((set, get) => {
       const model = provider?.provider.defaultModel;
       if (!provider || defaultProviderId == null || !model) {
         toast("请先在「设置」中配置绘图服务商与模型", "error");
-        return;
+        return false;
       }
 
       // 校验通过后立即同步上锁再进入 await：后面有 createConversation 与附件落盘两次异步，
       // 若像原来那样等到生成前才置 sending，连点/连按 Enter 会穿透校验造成双发。
       set({ sending: true, stopRequested: false });
       const mySeq = ++sendSeq;
+      const myConv = convSeq;
       const isMine = () => sendSeq === mySeq;
+      let committed = false;
 
       try {
         let convId = get().activeId;
@@ -599,11 +610,11 @@ export const useChatStore = create<ChatState>((set, get) => {
               `创建会话失败：${parseAdapterError(String(e)).message}`,
               "error",
             );
-            return;
+            return false;
           }
-          if (!isMine()) return;
+          if (!isMine()) return false;
         }
-        if (get().stopRequested) return;
+        if (get().stopRequested) return false;
 
         // 附件先落盘，拿到 path 再入库（DB 不再存 dataUrl）。
         // F4：任一张失败即提示并中止发送，不静默降级为「无参考图继续生成」。
@@ -621,10 +632,10 @@ export const useChatStore = create<ChatState>((set, get) => {
             `参考图保存失败，已中止发送：${parseAdapterError(String(e)).message}`,
             "error",
           );
-          return;
+          return false;
         }
-        if (!isMine()) return;
-        if (get().stopRequested) return;
+        if (!isMine()) return false;
+        if (get().stopRequested) return false;
 
         let userResp: { id: number; imagesJson: string };
         try {
@@ -647,9 +658,9 @@ export const useChatStore = create<ChatState>((set, get) => {
           });
         } catch (e) {
           toast(`发送失败：${parseAdapterError(String(e)).message}`, "error");
-          return;
+          return false;
         }
-        if (!isMine()) return;
+        if (!isMine()) return false;
         const userMsgId = userResp.id;
 
         const userMsg: DisplayMessage = {
@@ -679,6 +690,10 @@ export const useChatStore = create<ChatState>((set, get) => {
           error: null,
         };
 
+        // 会话已切走：user/assistant 消息已入库（下次打开展示），但不能再写当前列表。
+        // 这里仍算「已受理」——消息确实发出去了；返回 false 会让 Composer 把草稿
+        // 回填到输入框，用户再点一次就是重复发送、重复计费。
+        if (!stillCurrent(mySeq, myConv)) return true;
         set({
           activeId: convId,
           messages: [...get().messages, userMsg, assistantMsg],
@@ -688,17 +703,20 @@ export const useChatStore = create<ChatState>((set, get) => {
             ? { hasMore: false, loadingOlder: false }
             : undefined),
         });
+        committed = true;
         if (get().conversations.find((c) => c.id === convId) === undefined) {
           await get().loadConversations();
         }
-        if (!isMine()) return;
+        if (!isMine()) return true;
 
         await runGeneration(convId, userMsg, atts, assistantLocalId, mySeq);
+        return true;
       } catch (e) {
         // 兜底：任何未预期异常都要提示并复位 sending，不能让异常把锁死在 true
         if (isMine()) {
           toast(`发送失败：${parseAdapterError(String(e)).message}`, "error");
         }
+        return committed;
       } finally {
         // 成功/异常/停止都复位；仅当本次仍是当前发送时复位，
         // 避免上一轮收尾把新一轮发送的锁清掉
@@ -734,29 +752,36 @@ export const useChatStore = create<ChatState>((set, get) => {
       }));
     },
 
-    retryLast: async () => {
+    retryLast: async (assistantId) => {
       if (get().sending) return;
       const msgs = get().messages;
-      let userIdx = -1;
-      for (let i = msgs.length - 1; i >= 0; i--) {
-        if (msgs[i].role === "user") {
-          userIdx = i;
-          break;
-        }
+      // 未传 id 时沿用旧行为：目标取列表最后一条（历史上均从最后一条回复触发）。
+      const targetIdx =
+        assistantId === undefined
+          ? msgs.length - 1
+          : msgs.findIndex((m) => m.id === assistantId);
+      if (targetIdx < 0) return;
+      const target = msgs[targetIdx];
+      if (target.role !== "assistant") return;
+      if (msgs.slice(targetIdx + 1).some((m) => m.role === "user")) {
+        toast("仅能重试最新一轮对话", "error");
+        return;
       }
+      // 只允许重试最后一条回复：新占位会追加到列表末尾，否则时间线错乱
+      if (targetIdx !== msgs.length - 1) {
+        toast("仅能重试最新一条回复", "error");
+        return;
+      }
+      // 从目标向前定位它对应的 user 消息（assistant 消息与 user 消息之间没有持久外键）
+      let userIdx = targetIdx - 1;
+      while (userIdx >= 0 && msgs[userIdx].role !== "user") userIdx--;
       if (userIdx < 0) return;
       const lastUser = msgs[userIdx];
       const convId = get().activeId;
       if (convId === null) return;
 
-      // 重试不重复 user 气泡：移除「最后一条 user 之后」的 assistant 回复
-      // （本地负数 id 的占位，或列表末尾的那条），随后重建一条 assistant 占位。
-      const tail = msgs.slice(userIdx + 1);
-      const assistantAfter = tail.find((m) => m.role === "assistant");
-      const shouldRemove =
-        assistantAfter !== undefined &&
-        (assistantAfter.id < 0 ||
-          tail[tail.length - 1]?.id === assistantAfter.id);
+      // 重试不重复 user 气泡：移除目标 assistant 回复，随后重建一条占位。
+      const assistantAfter = target;
 
       // 恢复参考图：DB 只存 path，dataUrl 由后端 enrich_image_entries 读盘补回
       // （user 消息的 {id,name,path} 条目同样处理），因此重启后通常仍能恢复；
@@ -782,11 +807,14 @@ export const useChatStore = create<ChatState>((set, get) => {
 
       set({ sending: true, stopRequested: false });
       const mySeq = ++sendSeq;
+      const myConv = convSeq;
       const isMine = () => sendSeq === mySeq;
       try {
+        // 会话已切走时不再执行重试（含删库），避免误删其它会话的回复
+        if (!stillCurrent(mySeq, myConv)) return;
         // 已入库的旧回复先删库再重试：只在前端移除会让旧行永远留在 messages 表里，
         // 下次打开会话又会冒出来（A3）。图片文件不动，可能仍被画廊引用。
-        if (shouldRemove && assistantAfter && assistantAfter.id > 0) {
+        if (assistantAfter && assistantAfter.id > 0) {
           try {
             await api.deleteMessage(assistantAfter.id);
           } catch (e) {
@@ -798,11 +826,11 @@ export const useChatStore = create<ChatState>((set, get) => {
           }
           if (!isMine()) return;
         }
+        // 删库也是 await：期间可能已切走会话，此时不能再改当前消息列表
+        if (!stillCurrent(mySeq, myConv)) return;
         set({
           messages: [
-            ...(shouldRemove
-              ? get().messages.filter((m) => m.id !== assistantAfter.id)
-              : get().messages),
+            ...get().messages.filter((m) => m.id !== assistantAfter.id),
             assistantMsg,
           ],
         });
@@ -825,6 +853,8 @@ export const useChatStore = create<ChatState>((set, get) => {
     appendImageMessage: async (img, displayPrompt) => {
       const convId = get().activeId;
       if (convId === null) return;
+      // 入库 await 期间用户可能已切走会话：记录当时的会话序号，回写前校验
+      const convSnapshot = convSeq;
       try {
         const persisted = await api.addMessage({
           conversationId: convId,
@@ -841,6 +871,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           paramsJson: "{}",
           createdAt: nowTimestamp(),
         });
+        if (convSeq !== convSnapshot || get().activeId !== convId) return;
         set((s) => ({
           messages: [
             ...s.messages,

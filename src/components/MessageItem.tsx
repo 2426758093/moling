@@ -184,7 +184,7 @@ export default memo(function MessageItem({
                 <Button
                   size="sm"
                   variant="secondary"
-                  onClick={() => void retryLast()}
+                  onClick={() => void retryLast(message.id)}
                   disabled={sending}
                 >
                   重试
@@ -205,7 +205,7 @@ export default memo(function MessageItem({
                   <Button
                     size="sm"
                     variant="secondary"
-                    onClick={() => void retryLast()}
+                    onClick={() => void retryLast(message.id)}
                     disabled={sending}
                   >
                     重试

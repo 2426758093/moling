@@ -22,7 +22,9 @@ import { useAppStore } from "./stores/appStore";
 import { useChatStore } from "./stores/chatStore";
 import { useProviderStore } from "./stores/providerStore";
 import { useQueueStore } from "./stores/queueStore";
+import { useCanvasStore } from "./stores/canvasStore";
 import { api } from "./lib/api";
+import { installCloseFlush } from "./lib/closeFlush";
 import { validateImageFile } from "./lib/file";
 import { applyGlassAppearance, applyThemeClass } from "./lib/theme";
 import { maxReferenceImages } from "./lib/useModelCaps";
@@ -64,6 +66,26 @@ function AppShell() {
         animate: { opacity: 1, y: 0 },
         exit: { opacity: 0, y: -8 },
       };
+
+  // 关闭前落盘（F-010）：画布保存有 600ms debounce，直接退出会丢掉最后一次编辑；
+  // 离开画布视图时的 flush 只覆盖「切视图」，不覆盖「关窗口/关应用」。
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    // StrictMode 会执行两次 effect：迟到的安装结果直接卸载，避免重复关闭处理器
+    let cancelled = false;
+    void installCloseFlush({
+      flush: () => useCanvasStore.getState().flush(),
+    })
+      .then((off) => {
+        if (cancelled) off();
+        else unlisten = off;
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     useProviderStore

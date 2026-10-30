@@ -144,7 +144,9 @@ export default function ChatView() {
                   initial={{ opacity: 0, y: 10 }}
                   animate={{ opacity: 1, y: 0 }}
                   transition={{ ...VIEW_TRANSITION, delay: 0.08 + i * 0.05 }}
-                  onClick={() => !sending && send(s)}
+                  onClick={() => {
+                    if (!sending) void send(s);
+                  }}
                   className="pressable rounded-card border border-line bg-elevated px-4 py-3 text-left text-callout text-secondary transition-colors duration-150 hover:bg-hover hover:text-primary"
                 >
                   {s}

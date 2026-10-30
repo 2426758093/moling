@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import JSZip from "jszip";
 import { api, HistoryItem } from "../lib/api";
+import { downloadBlob, downloadUrl } from "../lib/file";
 import { extOf } from "../lib/image";
 import { STYLE_PRESETS } from "../lib/types";
 import { dayKey, dayLabel } from "../lib/date";
@@ -62,12 +63,7 @@ async function exportZip(items: HistoryItem[]): Promise<number> {
   }
   zip.file("params.json", JSON.stringify(manifest, null, 2));
   const blob = await zip.generateAsync({ type: "blob" });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = `moling_export_${Date.now()}.zip`;
-  a.click();
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  downloadBlob(blob, `moling_export_${Date.now()}.zip`);
   return skipped;
 }
 
@@ -75,23 +71,16 @@ async function downloadOne(item: HistoryItem, withParams: boolean) {
   const h = item.history;
   const ext = extOf(h.filePath);
   const { dataUrl } = await api.getHistoryImage(h.id);
-  const a = document.createElement("a");
-  a.href = dataUrl;
-  a.download = `moling_${h.id}.${ext}`;
-  a.click();
+  downloadUrl(dataUrl, `moling_${h.id}.${ext}`);
   if (withParams) {
     const p = paramsOf(item);
-    const blob = new Blob(
+    const b = new Blob(
       [
         `prompt: ${p.prompt}\nnegative: ${p.negativePrompt}\nmodel: ${h.model}\nseed: ${p.seed}\nsize: ${p.width}x${p.height}\nguidance: ${p.guidance}\nsteps: ${p.steps}\n`,
       ],
       { type: "text/plain" },
     );
-    const b = document.createElement("a");
-    b.href = URL.createObjectURL(blob);
-    b.download = `moling_${h.id}.txt`;
-    b.click();
-    setTimeout(() => URL.revokeObjectURL(b.href), 1000);
+    downloadBlob(b, `moling_${h.id}.txt`);
   }
 }
 

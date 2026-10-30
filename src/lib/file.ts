@@ -144,3 +144,26 @@ export async function compressDataUrl(
     return { dataUrl, compressed: false };
   }
 }
+
+/** 对象 URL 的默认释放延迟：立即 revoke 可能中断 WebView 里刚开始的下载。 */
+export const REVOKE_DELAY_MS = 1000;
+
+/**
+ * 触发下载（备份 JSON / 导出图片等共同入口）。
+ * anchor 先挂到文档再 click（部分 WebView 只对已挂载节点响应），
+ * 对象 URL 延迟释放，避免下载还没开始就被回收（F-018 统一口径）。
+ */
+export function downloadUrl(url: string, filename: string): void {
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), REVOKE_DELAY_MS);
+}
+
+/** Blob 版本的 downloadUrl；对象 URL 由本函数创建并负责延迟释放。 */
+export function downloadBlob(blob: Blob, filename: string): void {
+  downloadUrl(URL.createObjectURL(blob), filename);
+}

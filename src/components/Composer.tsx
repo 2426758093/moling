@@ -181,7 +181,13 @@ export default function Composer() {
     if (!value.trim() || sending || useChatStore.getState().sending) return;
     setText("");
     requestAnimationFrame(autoGrow);
-    await send(value);
+    const accepted = await send(value);
+    // 未受理（未配置服务商 / 参考图落盘失败 / 被中止）：回填原文，避免草稿丢失。
+    // 用函数式写入，避免覆盖用户在这段 await 期间新输入的内容。
+    if (!accepted) {
+      setText((current) => current || value);
+      requestAnimationFrame(autoGrow);
+    }
   };
 
   const onKeyDown = (e: React.KeyboardEvent) => {

@@ -491,7 +491,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
             return { thumbs };
           });
         } catch {
-          // 缩略图失败只影响节点显示，SafeImg 会给出占位；不打断画布操作
+          // 缩略图失败只影响节点显示，SafeImg 会给出占位；不打断画布操作。
+          // 但必须回滚本批标记：否则这些 id 会永远留在 requestedThumbs 里被跳过，
+          // 再次进入画布也不会重试（F-017）。
+          for (const id of chunk) requestedThumbs.delete(id);
         }
       }
     },
