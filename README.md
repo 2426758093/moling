@@ -18,7 +18,7 @@
 - **多 Key 与代理**：单个服务商可挂多个 Key，401 自动切换并标记失效（403 只切换）；代理支持跟随系统 / 直连 / 手动，切换无需重启
 - **画廊**：生成记录、按天时间线、缩略图列表、按模型 / 风格 / 收藏筛选、两两对比（滑动叠图 / 并排）、复用参数、批量打包导出（含参数 JSON）
 - **批量队列**：一键把当前参数加入队列，支持 1–4 并发、逐条取消 / 重试；重启后未完成任务标为中断且不自动重跑
-- **可取消生成**：停止按钮真正中止在途请求，已生成的图片保留
+- **可取消生成**：点「停止」立即丢弃未落盘结果、界面不再等待；上游请求为协作式取消（在请求前 / 返回后 / 落盘前检查标志，不保证服务商侧停止计费），已生成的图片保留
 - **双主题与玻璃质感**：浅色 / 暗色，跟随系统；侧栏、栏头与浮层统一走 Liquid Glass 功能层，可在设置里选「清晰 / 标准 / 着色」三档通透度；全站过渡动画遵循「减少动态」偏好
 - **存储治理**：媒体根可整体迁移（图片 / 参考图 / 缩略图 / 回收站），存储占用统计 + 孤儿缓存自动回收（保留天数可调）
 - **数据备份**：配置与偏好一键导出/导入（默认不含明文 Key，可选包含；支持多 Key 往返；v4 含收藏与工作流预设，换机迁移）
@@ -50,6 +50,8 @@ pnpm tauri build --bundles nsis
 # 产物：src-tauri/target/release/bundle/nsis/墨灵_*_x64-setup.exe
 ```
 
+打包前先退出正在运行的墨灵（包括 `start.bat -Release` 启动的实例）：Windows 会锁住 `src-tauri/target/release/moling.exe`，`cargo` 链接完成后删不掉旧文件，构建会以 `failed to remove file ... 拒绝访问` 失败。
+
 ### 更新链路测试构建
 
 常规构建**不产出更新制品**（`bundle.createUpdaterArtifacts` 默认 false），因此没有签名密钥也能正常打包。要验证应用内更新，用测试配置覆盖一次：
@@ -72,18 +74,22 @@ Tauri 2（Rust）· React 19 · TypeScript · Vite 8 · Tailwind CSS 4 · Zustan
 ## 测试与质量门禁
 
 ```bash
-# 前端：类型检查 + ESLint + 格式检查 + 生产构建
+# 前端：类型检查 + ESLint + 格式检查 + 单测 + 生产构建
 pnpm exec tsc --noEmit
 pnpm lint
 pnpm format:check
+pnpm test
 pnpm build
 
-# 后端：格式 + Clippy（零告警）+ 单元测试
+# 后端：格式 + Clippy（零告警）+ 依赖漏洞扫描 + 单元测试
 cd src-tauri
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
+cargo audit
 cargo test
 ```
+
+工具链版本由根目录 `rust-toolchain.toml`（Rust 1.98.1）与 `.nvmrc`（Node 24.11.1）固定，`package.json` 的 `engines` 约束 Node ≥ 22.12 与 pnpm ≥ 11。
 
 CI（`.github/workflows/ci.yml`）在 Windows 上执行同一组门禁，并对生产依赖做 `pnpm audit --prod --audit-level high`。
 
