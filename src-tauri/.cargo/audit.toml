@@ -1,0 +1,21 @@
+# cargo-audit 白名单与配置（F-014：Rust 依赖漏洞扫描门禁）。
+#
+# 位置约定：cargo-audit 读取 `~/.cargo/audit.toml` 或相对当前工作目录的
+# `.cargo/audit.toml`。CI 的 rust job 与本地门禁都在 `src-tauri/` 下执行
+# cargo 命令，所以本文件放在 `src-tauri/.cargo/audit.toml`。
+#
+# 白名单策略（重要，勿滥用）：
+# 1. 默认不忽略任何 advisory —— CI 的 `cargo audit` 遇到漏洞必须失败。
+# 2. 只有「已确认无法在当前依赖版本修复」的 advisory 才可加入 ignore，且每条必须写：
+#    - RUSTSEC 编号；
+#    - 为何不能升级（附上游 issue 链接）；
+#    - 复评日期。到期不复评即视为违规。
+# 3. 初始阶段不启用 `--deny warnings`：unmaintained / unsound / yanked 属提示性告警，
+#    等基线扫描干净后再在 CI 里收紧，避免门禁首次上线即长期变红。
+#
+# 示例（当前为空）：
+# ignore = [
+#   "RUSTSEC-0000-0000", # 无可用修复版本，上游 issue: https://github.com/org/repo/issues/123，复评 2027-01-31
+# ]
+[advisories]
+ignore = []

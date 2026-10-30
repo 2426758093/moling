@@ -8,34 +8,45 @@ on:
 jobs:
   frontend:
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      # 不指定 version：pnpm/action-setup@v4 读取 package.json 的 packageManager（pnpm@11.23.0），保持单一真源
       - uses: pnpm/action-setup@v4
-        with:
-          version: 11
       - uses: actions/setup-node@v4
         with:
-          # Vite 8 要求 Node ^20.19.0 || >=22.12.0；pnpm 11 与本地开发一致用 22
-          node-version: 22
+          # Node 版本单一真源：仓库根 .nvmrc（Vite 8 要求 Node ^20.19.0 || >=22.12.0）
+          node-version-file: .nvmrc
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - run: pnpm lint
       - run: pnpm format:check
+      # 前端单元测试（vitest，F-003）：失败不进入打包
+      - run: pnpm test
       - run: pnpm build
       # 依赖审计：生产依赖不得出现 high/critical
       - run: pnpm audit --prod --audit-level high
 
   rust:
     runs-on: windows-latest
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: src-tauri
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Rust 工具链单一真源：仓库根 rust-toolchain.toml（channel 1.98.1 + rustfmt/clippy）；
+      # 该 action 未传 toolchain 输入时会安装工具链文件声明的全部项，并内置 Rust 构建缓存
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
-          components: rustfmt, clippy
-      - uses: swatinem/rust-cache@v2
+          # 默认 build-warnings 为 deny；保持与本地「仅 clippy -D warnings」一致的语义，避免 cargo test 构建期警告意外变红
+          build-warnings: ""
+      # cargo audit 二进制（F-014）：从 rustsec/rustsec 的 GitHub Releases 安装并校验 SHA256
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.22.2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+      - run: cargo test --locked
+      # 漏洞扫描：只对漏洞失败（初始不启用 --deny warnings），已知不可修 advisory 记入 src-tauri/.cargo/audit.toml
+      - run: cargo audit
