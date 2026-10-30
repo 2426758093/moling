@@ -219,11 +219,15 @@ fn parse_svg_data_url(input: &str) -> Option<(&str, bool)> {
 }
 
 /// base64（可带 data-url 前缀）落盘到 images/ 目录，返回 (文件路径, data_url)
+///
+/// 写盘期间登记媒体门闩：迁移媒体根时要么等本次写完，要么直接拒绝，
+/// 避免图片落进即将被清理的旧目录（F-004）。
 pub fn save_b64_image(
     app: &tauri::AppHandle,
     b64: &str,
     name: &str,
 ) -> AppResult<(String, String)> {
+    let _gate = crate::media_gate::enter_writer()?;
     save_b64_into(app, "images", b64, name)
 }
 
@@ -278,6 +282,7 @@ fn save_b64_into(
 
 /// 队列参考图落盘（写 refs/），返回文件路径
 pub fn save_ref_image(app: &tauri::AppHandle, b64: &str, name: &str) -> AppResult<String> {
+    let _gate = crate::media_gate::enter_writer()?;
     let (path, _) = save_b64_into(app, "refs", b64, name)?;
     Ok(path)
 }

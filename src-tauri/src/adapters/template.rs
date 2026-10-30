@@ -1,6 +1,6 @@
 use super::{
-    classify_http, classify_reqwest, http_client, AdapterError, EditRequest, GenerateRequest,
-    ImageAdapter, ProviderConfig, TransformRequest,
+    classify_http, classify_reqwest, download_image_bytes, http_client, AdapterError, EditRequest,
+    GenerateRequest, ImageAdapter, ProviderConfig, TransformRequest,
 };
 use base64::Engine;
 
@@ -42,16 +42,132 @@ impl TemplateSpec {
     }
 }
 
-pub(crate) fn render_template(tpl: &str, vars: &[(&str, &str)]) -> String {
-    let mut out = tpl.to_string();
-    for (k, v) in vars {
-        out = out.replace(&format!("{{{{{}}}}}", k), v);
+/// 模板变量类型：`Text` 按目标上下文转义，`Json` 是已编码的 JSON 片段（数组等），原样注入。
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Var<'a> {
+    Text(&'a str),
+    Json(&'a str),
+}
+
+impl<'a> Var<'a> {
+    fn as_str(self) -> &'a str {
+        match self {
+            Var::Text(value) | Var::Json(value) => value,
+        }
+    }
+}
+
+/// 渲染模式：决定变量值如何转义
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenderMode {
+    /// 原样替换（仅测试 / 兼容旧 API 使用）
+    #[cfg(test)]
+    Raw,
+    /// JSON 字符串字面量内容：Text 做 JSON 转义，Json 片段原样
+    Body,
+    /// URL 组件：所有变量值做百分号编码
+    Url,
+}
+
+/// 单遍替换 `{{name}}`：只扫描模板本身，插入的值绝不再参与替换。
+/// 这修掉了旧实现「逐变量 replace」的两个问题：
+/// 1. prompt 里出现 `{{key}}` 会被后续轮次替换成 API Key（模板注入）；
+/// 2. 变量顺序决定结果，换个顺序输出就变。
+fn render_with(tpl: &str, vars: &[(&str, Var<'_>)], mode: RenderMode) -> String {
+    let mut out = String::with_capacity(tpl.len());
+    let mut rest = tpl;
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);
+        let after_open = &rest[open + 2..];
+        let Some(close) = after_open.find("}}") else {
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let name = &after_open[..close];
+        let end = open + 2 + close + 2;
+        match vars.iter().find(|(key, _)| *key == name) {
+            Some((_, value)) => out.push_str(&escape_value(*value, mode)),
+            // 未知占位符原样保留，便于模板作者发现拼写错误
+            None => out.push_str(&rest[open..end]),
+        }
+        rest = &rest[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn escape_value(value: Var<'_>, mode: RenderMode) -> String {
+    match mode {
+        #[cfg(test)]
+        RenderMode::Raw => value.as_str().to_string(),
+        RenderMode::Body => match value {
+            Var::Text(text) => json_escape_text(text),
+            Var::Json(json) => json.to_string(),
+        },
+        RenderMode::Url => percent_encode(value.as_str()),
+    }
+}
+
+/// JSON 字符串字面量内容转义（去掉 serde 生成的首尾引号）
+fn json_escape_text(value: &str) -> String {
+    match serde_json::to_string(value) {
+        Ok(quoted) if quoted.len() >= 2 => quoted[1..quoted.len() - 1].to_string(),
+        _ => value.to_string(),
+    }
+}
+
+/// RFC 3986 non-unreserved 百分号编码（不引入新依赖）
+fn percent_encode(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(value.len());
+    for &byte in value.as_bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
     }
     out
 }
 
+/// 模板请求体渲染：Text 变量按 JSON 字符串内容转义，`{{images}}`/`{{ref_roles}}` 原样作为 JSON 片段
+pub(crate) fn render_body(tpl: &str, vars: &[(&str, Var<'_>)]) -> String {
+    render_with(tpl, vars, RenderMode::Body)
+}
+
+/// 模板 URL 渲染：变量值做百分号编码，模板自身的 `?`/`&`/`=` 不受影响
+pub(crate) fn render_url(tpl: &str, vars: &[(&str, Var<'_>)]) -> String {
+    render_with(tpl, vars, RenderMode::Url)
+}
+
+/// 生成请求变量表 → 渲染变量；JSON 片段必须原样注入
+fn render_vars<'a>(pairs: &'a [(&'static str, String)]) -> Vec<(&'static str, Var<'a>)> {
+    pairs
+        .iter()
+        .map(|(name, value)| {
+            let var = if matches!(*name, "images" | "ref_roles") {
+                Var::Json(value.as_str())
+            } else {
+                Var::Text(value.as_str())
+            };
+            (*name, var)
+        })
+        .collect()
+}
+
+/// 旧的变量表形态（仅测试使用，保留既有用例与 adapters/tests.rs 的调用）
+#[cfg(test)]
 fn vars_as_strs<'a>(pairs: &'a [(&'static str, String)]) -> Vec<(&'a str, &'a str)> {
     pairs.iter().map(|(k, v)| (*k, v.as_str())).collect()
+}
+
+/// 旧的单遍原始替换（仅测试使用；生产渲染走 `render_body`/`render_url`）
+#[cfg(test)]
+pub(crate) fn render_template(tpl: &str, vars: &[(&str, &str)]) -> String {
+    let vars: Vec<(&str, Var<'_>)> = vars.iter().map(|(k, v)| (*k, Var::Text(v))).collect();
+    render_with(tpl, &vars, RenderMode::Raw)
 }
 
 impl TemplateAdapter {
@@ -177,15 +293,10 @@ impl TemplateAdapter {
         let mut out = Vec::with_capacity(values.len());
         for s in values {
             let b64 = if s.starts_with("http://") || s.starts_with("https://") {
-                let bytes = http_client()
-                    .get(&s)
-                    .timeout(std::time::Duration::from_secs(config.timeout_secs))
-                    .send()
-                    .await
-                    .map_err(|e| classify_reqwest(&e))?
-                    .bytes()
-                    .await
-                    .map_err(|e| classify_reqwest(&e))?;
+                // F-011：URL 结果统一走带状态码 / 体积上限 / 魔数校验的下载函数
+                let bytes =
+                    download_image_bytes(&s, std::time::Duration::from_secs(config.timeout_secs))
+                        .await?;
                 base64::engine::general_purpose::STANDARD.encode(&bytes)
             } else {
                 s
@@ -218,9 +329,9 @@ impl ImageAdapter for TemplateAdapter {
     ) -> super::BoxFuture<'a, Result<Vec<String>, AdapterError>> {
         Box::pin(async move {
             let pairs = Self::vars(config, req);
-            let pairs = vars_as_strs(&pairs);
-            let url = render_template(&config.template_url, &pairs);
-            let body = render_template(&config.template_body, &pairs);
+            let vars = render_vars(&pairs);
+            let url = render_url(&config.template_url, &vars);
+            let body = render_body(&config.template_body, &vars);
             Self::request_and_extract(config, &url, &body, &config.template_response_path).await
         })
     }
@@ -233,9 +344,9 @@ impl ImageAdapter for TemplateAdapter {
         Box::pin(async move {
             let spec = Self::require_spec(&config.edit_template, "编辑")?.clone();
             let pairs = Self::edit_vars(config, req);
-            let pairs = vars_as_strs(&pairs);
-            let url = render_template(&spec.url, &pairs);
-            let body = render_template(&spec.body, &pairs);
+            let vars = render_vars(&pairs);
+            let url = render_url(&spec.url, &vars);
+            let body = render_body(&spec.body, &vars);
             Self::request_and_extract(config, &url, &body, &spec.response_path)
                 .await?
                 .into_iter()
@@ -254,9 +365,9 @@ impl ImageAdapter for TemplateAdapter {
         Box::pin(async move {
             let spec = Self::require_spec(&config.transform_template, "变换")?.clone();
             let pairs = Self::transform_vars(config, req);
-            let pairs = vars_as_strs(&pairs);
-            let url = render_template(&spec.url, &pairs);
-            let body = render_template(&spec.body, &pairs);
+            let vars = render_vars(&pairs);
+            let url = render_url(&spec.url, &vars);
+            let body = render_body(&spec.body, &vars);
             Self::request_and_extract(config, &url, &body, &spec.response_path)
                 .await?
                 .into_iter()
@@ -674,5 +785,75 @@ mod tests {
         assert_eq!(spec.url, "https://x/y");
         assert_eq!(spec.response_path, "data[0].url");
         assert!(TemplateSpec::from_json("not json").is_none());
+    }
+
+    /// F-002：prompt 里的 `{{key}}` 不会被二次替换成 API Key（模板注入）
+    #[test]
+    fn body_render_does_not_rescan_prompt_injection() {
+        let vars = [
+            ("prompt", Var::Text("{{key}}")),
+            ("key", Var::Text("sk-secret")),
+        ];
+        let body = render_body(r#"{"prompt":"{{prompt}}","key":"{{key}}"}"#, &vars);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("body 必须是合法 JSON");
+        assert_eq!(parsed["prompt"], "{{key}}");
+        assert_eq!(parsed["key"], "sk-secret");
+    }
+
+    /// F-002：变量表顺序不影响渲染结果（旧实现后替换的变量会覆盖先插入的值）
+    #[test]
+    fn body_render_is_order_independent() {
+        let forward = [("prompt", Var::Text("p")), ("key", Var::Text("k"))];
+        let mut reversed = forward;
+        reversed.reverse();
+        assert_eq!(
+            render_body("{{prompt}}/{{key}}", &forward),
+            render_body("{{prompt}}/{{key}}", &reversed)
+        );
+    }
+
+    /// F-002：引号 / 换行 / 反斜杠都转义成合法 JSON 字符串
+    #[test]
+    fn body_render_escapes_json_specials() {
+        let prompt = "a\"b\nc\\d";
+        let vars = [("prompt", Var::Text(prompt))];
+        let body = render_body(r#"{"prompt":"{{prompt}}"}"#, &vars);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("转义后必须是合法 JSON");
+        assert_eq!(parsed["prompt"], prompt);
+    }
+
+    /// F-002：{{images}} / {{ref_roles}} 是 JSON 片段，不能被当成字符串转义
+    #[test]
+    fn body_render_keeps_json_fragments_raw() {
+        let vars = [
+            ("images", Var::Json(r#"["A","B"]"#)),
+            ("prompt", Var::Text("p")),
+        ];
+        let body = render_body(r#"{"images":{{images}},"prompt":"{{prompt}}"}"#, &vars);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("body 必须是合法 JSON");
+        assert_eq!(parsed["images"], serde_json::json!(["A", "B"]));
+    }
+
+    /// F-002：URL 变量做百分号编码；模板自身的 ? / & / = 保持不变
+    #[test]
+    fn url_render_percent_encodes_values() {
+        let vars = [
+            ("prompt", Var::Text("猫 a b#c")),
+            ("key", Var::Text("sk-123")),
+        ];
+        let url = render_url("https://x.com/draw?p={{prompt}}&k={{key}}", &vars);
+        assert!(url.starts_with("https://x.com/draw?p="), "{url}");
+        assert!(url.contains("%E7%8C%AB"), "{url}");
+        assert!(url.contains("a%20b%23c"), "{url}");
+        assert!(url.ends_with("&k=sk-123"), "{url}");
+    }
+
+    /// 旧的 raw 渲染也必须是单遍：保留兼容测试覆盖，但不再有注入风险
+    #[test]
+    fn legacy_render_template_is_single_pass() {
+        assert_eq!(
+            render_template("{{prompt}}", &[("prompt", "{{key}}"), ("key", "sk")]),
+            "{{key}}"
+        );
     }
 }

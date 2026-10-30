@@ -7,6 +7,7 @@ mod image_gc;
 mod image_store;
 mod key_pool;
 mod logging;
+mod media_gate;
 mod paths;
 mod reference;
 mod storage;
@@ -85,6 +86,8 @@ pub fn run() {
             let media_root = paths::init_media_root(app.handle());
             init_storage_with_recovery(&data_dir)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            // 主密钥预热（F-013）：keyring IO 留在启动期，不落进持 DB 锁的保存路径
+            storage::warm_master_key();
             // 代理需在首个生成请求前生效；配置损坏只落日志，不阻断启动
             adapters::http::init_from_storage();
             // 队列：上次残留的 running 一律标 interrupted（不自动重跑），

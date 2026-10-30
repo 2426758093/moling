@@ -240,6 +240,32 @@ fn mock_refine_chunks(raw: &str) -> String {
     )
 }
 
+/// 思考结果统一降级：成功但文本为空白（模型只返回空格/换行）也按失败处理，
+/// 避免前端把空串写进 assistant 正文。
+fn refine_result_json(
+    raw: &str,
+    result: Result<String, adapters::AdapterError>,
+) -> serde_json::Value {
+    match result {
+        Ok(text) if !text.trim().is_empty() => serde_json::json!({
+            "refined": text,
+            "used": true,
+        }),
+        Ok(_) => serde_json::json!({
+            "refined": raw,
+            "used": false,
+            "error": adapters::AdapterError::Other {
+                message: "思考模型返回空内容".into(),
+            },
+        }),
+        Err(e) => serde_json::json!({
+            "refined": raw,
+            "used": false,
+            "error": e,
+        }),
+    }
+}
+
 #[tauri::command]
 pub async fn refine_prompt(
     app: tauri::AppHandle,
@@ -293,20 +319,7 @@ pub async fn refine_prompt(
         )
         .await
     };
-    match result {
-        Ok(text) => Ok(serde_json::json!({
-            "refined": text,
-            "used": true,
-        })),
-        Err(e) => {
-            // 思考失败降级为原文
-            Ok(serde_json::json!({
-                "refined": input.raw,
-                "used": false,
-                "error": e,
-            }))
-        }
-    }
+    Ok(refine_result_json(&input.raw, result))
 }
 
 /// 取消在途思考优化：置位注册表里的 token（幂等，未注册返回 false）
@@ -396,6 +409,32 @@ mod tests {
         assert!(!contains_cjk("MoLing 0.8.0"));
         // 假名与全角标点不算汉字，避免把日文误判为中文输入
         assert!(!contains_cjk("こんにちは、"));
+    }
+
+    /// F-005：思考返回空白文本时不得 used:true（否则前端会用空串覆盖正文）
+    #[test]
+    fn empty_refine_result_degrades_to_raw() {
+        let raw = "一只橘猫在窗台上打盹";
+        for blank in ["", "   ", "\n\t "] {
+            let value = refine_result_json(raw, Ok(blank.to_string()));
+            assert_eq!(value["refined"], raw);
+            assert_eq!(value["used"], false);
+            assert_eq!(value["error"]["type"], "other");
+        }
+
+        let ok = refine_result_json(raw, Ok("refined prompt".to_string()));
+        assert_eq!(ok["used"], true);
+        assert_eq!(ok["refined"], "refined prompt");
+
+        let failed = refine_result_json(
+            raw,
+            Err(adapters::AdapterError::Other {
+                message: "boom".into(),
+            }),
+        );
+        assert_eq!(failed["used"], false);
+        assert_eq!(failed["refined"], raw);
+        assert_eq!(failed["error"]["message"], "boom");
     }
 }
 

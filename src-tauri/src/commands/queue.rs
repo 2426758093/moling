@@ -8,8 +8,8 @@
 //! - 结果只写 history（画廊可见），不生成聊天消息，避免两套状态互相打架。
 
 use crate::commands::image::{
-    generate_core, CancelRegistration, GenerateCommandInput, GenerationRegistry,
-    MAX_REFERENCE_IMAGES,
+    generate_core, normalize_generation, CancelRegistration, GenerateCommandInput,
+    GenerationRegistry, MAX_REFERENCE_IMAGES,
 };
 use crate::image_store;
 use crate::reference::ReferenceSpec;
@@ -123,7 +123,24 @@ pub fn spawn_worker(app: tauri::AppHandle, state: SharedQueue) {
 }
 
 async fn worker_loop(app: tauri::AppHandle, state: SharedQueue) {
+    // 卡死任务回收不需要每次空转都扫库，一分钟一次足够
+    const REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+    // running 超过这个时长仍未收尾 → 视为 worker 卡住；
+    // 进程崩溃留下的 running 由启动时的 mark_running_interrupted 负责
+    const STALE_RUNNING_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+    let mut last_reap = std::time::Instant::now();
     loop {
+        if last_reap.elapsed() >= REAP_INTERVAL {
+            last_reap = std::time::Instant::now();
+            match storage::reap_stale_running(STALE_RUNNING_AGE) {
+                Ok(0) => {}
+                Ok(n) => {
+                    tracing::warn!("回收 {n} 个长时间未收尾的队列任务");
+                    let _ = app.emit("queue:counts", counts_json());
+                }
+                Err(e) => tracing::warn!("回收卡死任务失败: {e}"),
+            }
+        }
         if state.is_paused() {
             state.wait().await;
             continue;
@@ -144,10 +161,31 @@ async fn worker_loop(app: tauri::AppHandle, state: SharedQueue) {
         emit_job(&app, job.id);
         if let Err(e) = run_job(&app, &job).await {
             tracing::warn!("队列任务 #{} 收尾失败: {e}", job.id);
+            // 正常收尾已经失败：不能把这一行留在 running，否则会永久占用并发槽位
+            force_fail_job(job.id, &e).await;
         }
         emit_job(&app, job.id);
         // 空出一个名额：唤醒其它槽位重新尝试领取
         state.wake();
+    }
+}
+
+/// 兜底收尾（F-006）：正常 `finish_job` 写库失败后，用不要求当前是 running 的
+/// `finish_job_force` 重试几次；仍失败就交给周期回收（`reap_stale_running`）。
+async fn force_fail_job(job_id: i64, reason: &str) {
+    let mut delay = std::time::Duration::from_millis(200);
+    for attempt in 1..=3 {
+        match storage::finish_job_force(job_id, "failed", "[]", Some(reason)) {
+            Ok(_) => return,
+            Err(e) if attempt < 3 => {
+                tracing::warn!("队列任务 #{job_id} 兜底收尾第 {attempt} 次失败: {e}");
+                tokio::time::sleep(delay).await;
+                delay *= 2;
+            }
+            Err(e) => {
+                tracing::error!("队列任务 #{job_id} 兜底收尾失败，等待超时回收: {e}")
+            }
+        }
     }
 }
 
@@ -325,6 +363,8 @@ pub async fn enqueue_job(
         reference_paths,
     };
     let input_json = serde_json::to_string(&extras).map_err(|e| e.to_string())?;
+    // 尺寸/张数在入队时就归一化（F-016）：任务参数快照与真正执行时一致
+    let (width, height, count) = normalize_generation(input.width, input.height, input.count);
     let job = NewJob {
         provider_id: provider.id,
         provider_name: &provider.name,
@@ -332,12 +372,12 @@ pub async fn enqueue_job(
         prompt,
         negative_prompt: input.negative_prompt.as_deref().unwrap_or(""),
         style: &input.style,
-        width: input.width as i64,
-        height: input.height as i64,
+        width: width as i64,
+        height: height as i64,
         guidance: input.guidance.map(|g| g as f64),
         steps: input.steps.map(|s| s as i64),
         seed: input.seed.map(|s| s as i64),
-        count: input.count.clamp(1, 4) as i64,
+        count: count as i64,
         input_json: &input_json,
     };
     let id = storage::insert_job(&job)?;

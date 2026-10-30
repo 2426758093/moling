@@ -571,6 +571,14 @@ fn load_or_create_master_key() -> AppResult<[u8; 32]> {
     }
 }
 
+/// 启动预热主密钥（F-013）：把 keyring 读取提前到启动期，避免首个「保存服务商」
+/// 或首次解密 Key 时才在持锁路径上做 keyring IO；失败只记日志，不阻断启动。
+pub fn warm_master_key() {
+    if let Err(e) = master_key() {
+        tracing::warn!("主密钥预热失败（将在首次使用 Key 时重试）: {e}");
+    }
+}
+
 fn parse_hex_key(hex_str: &str) -> Result<[u8; 32], &'static str> {
     let bytes = hex::decode_inner(hex_str).map_err(|_| "hex 解码失败")?;
     if bytes.len() != 32 {
@@ -669,6 +677,44 @@ fn row_to_provider(row: &rusqlite::Row) -> rusqlite::Result<ProviderRow> {
 }
 
 pub fn save_provider(id: Option<i64>, draft: &ProviderDraft) -> AppResult<ProviderRow> {
+    // 加解密是慢操作（首次读 keyring 可达数百毫秒），必须在拿 DB 锁之前算好（F-013），
+    // 否则一次「保存服务商」会把整个 UI 的读写都堵在同一个 Mutex 后面。
+    let empty_enc = encrypt_secret("")?;
+    // 换 Key 时需要旧密文才能保留整组列表：短锁只读，解密同样放到锁外。
+    let existing_keys = match (id, draft.api_key.is_some()) {
+        (Some(existing), true) => {
+            let c = conn()?;
+            c.query_row(
+                "SELECT api_keys_enc, api_key_enc FROM providers WHERE id = ?1",
+                params![existing],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?
+        }
+        _ => None,
+    };
+    // 主密钥变化后旧密文解不开：按用户新填的 Key 重建列表，而不是让保存失败
+    let rebuilt_keys = match draft.api_key {
+        Some(new_key) => {
+            let mut keys = match existing_keys {
+                Some((keys_enc, legacy_enc)) => {
+                    decode_keys(&keys_enc, &legacy_enc).unwrap_or_else(|e| {
+                        tracing::warn!("保存服务商时旧 Key 解密失败，按新 Key 重建列表: {e}");
+                        Vec::new()
+                    })
+                }
+                None => Vec::new(),
+            };
+            if keys.is_empty() {
+                keys.push(ProviderKey::new(new_key));
+            } else {
+                keys[0] = ProviderKey::new(new_key);
+            }
+            Some(encode_keys(&keys)?)
+        }
+        None => None,
+    };
+
     let id = {
         // 元数据与 Key 列表同事务写入：避免「编辑资料 + 换主 Key」中途失败留下两列不一致
         let mut c = conn()?;
@@ -702,7 +748,6 @@ pub fn save_provider(id: Option<i64>, draft: &ProviderDraft) -> AppResult<Provid
             }
             None => {
                 // Key 统一由下面的 replace_first 逻辑写两列，这里先落空密文
-                let enc = encrypt_secret("")?;
                 tx.execute(
                     "INSERT INTO providers (name, base_url, api_key_enc, kind, models_json,
                      default_model, timeout_secs, template_url, template_body, template_response_path,
@@ -711,7 +756,7 @@ pub fn save_provider(id: Option<i64>, draft: &ProviderDraft) -> AppResult<Provid
                     params![
                         draft.name,
                         draft.base_url,
-                        enc,
+                        empty_enc,
                         draft.kind,
                         draft.models_json,
                         draft.default_model,
@@ -727,23 +772,14 @@ pub fn save_provider(id: Option<i64>, draft: &ProviderDraft) -> AppResult<Provid
             }
         };
         // 未填新 Key 时保持整组 Key 与密文原样，避免解密失败的旧数据在纯改资料时被清空
-        if let Some(new_key) = draft.api_key {
-            let (keys_enc, legacy_enc): (String, String) = tx.query_row(
-                "SELECT api_keys_enc, api_key_enc FROM providers WHERE id = ?1",
-                params![id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+        if let Some((keys_enc, first_enc)) = &rebuilt_keys {
+            let n = tx.execute(
+                "UPDATE providers SET api_keys_enc = ?1, api_key_enc = ?2 WHERE id = ?3",
+                params![keys_enc, first_enc, id],
             )?;
-            // 主密钥变化后旧密文解不开：按用户新填的 Key 重建列表，而不是让保存失败
-            let mut keys = decode_keys(&keys_enc, &legacy_enc).unwrap_or_else(|e| {
-                tracing::warn!("保存服务商时旧 Key 解密失败，按新 Key 重建列表: {e}");
-                Vec::new()
-            });
-            if keys.is_empty() {
-                keys.push(ProviderKey::new(new_key));
-            } else {
-                keys[0] = ProviderKey::new(new_key);
+            if n == 0 {
+                return Err(AppError::NotFound(format!("服务商 #{id} 不存在")));
             }
-            write_keys_tx(&tx, id, &keys)?;
         }
         tx.commit()?;
         id
@@ -1337,8 +1373,10 @@ pub fn import_config_with_refs(
     data: &serde_json::Value,
     write_ref: RefWriter<'_>,
 ) -> AppResult<usize> {
+    // F-013：参考图落盘（慢 IO）在取 DB 锁之前完成，导入期间 UI 的读写不再被堵住。
+    let assets = prepare_import_assets(data, write_ref)?;
     let mut c = conn()?;
-    import_config_in_with_refs(&mut c, data, write_ref)
+    import_config_in_prepared(&mut c, data, assets)
 }
 
 #[derive(Debug)]
@@ -1562,13 +1600,41 @@ fn insert_import_prompt_assets(
 /// 入参校验放在事务与 DELETE 之前，非法导入绝不触碰表内旧数据。
 #[cfg(test)]
 fn import_config_in(c: &mut Connection, data: &serde_json::Value) -> AppResult<usize> {
-    import_config_in_with_refs(c, data, None)
+    let assets = prepare_import_assets(data, None)?;
+    import_config_in_prepared(c, data, assets)
 }
 
+/// 单测接缝：在给定连接上执行导入，参考图落盘仍走本连接（测试用内存库，无锁竞争）。
+#[cfg(test)]
 fn import_config_in_with_refs(
     c: &mut Connection,
     data: &serde_json::Value,
     write_ref: RefWriter<'_>,
+) -> AppResult<usize> {
+    let assets = prepare_import_assets(data, write_ref)?;
+    import_config_in_prepared(c, data, assets)
+}
+
+/// 导入前的「慢准备」：预设参考图落盘。
+///
+/// F-013：这一步必须发生在拿 DB 锁之前——原先在 `conn()` 的 Mutex 内写文件，
+/// 大导入期间所有 UI 读写都被堵在同一条连接后面。校验失败或事务回滚只会留下
+/// 孤儿文件，由 image_gc 回收（与事务失败同口径）。
+fn prepare_import_assets(
+    data: &serde_json::Value,
+    write_ref: RefWriter<'_>,
+) -> AppResult<Option<(Vec<ImportFavorite>, Vec<ImportPreset>)>> {
+    let version = data.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
+    if version < 4 {
+        return Ok(None);
+    }
+    Ok(Some(parse_import_prompt_assets(data, write_ref)?))
+}
+
+fn import_config_in_prepared(
+    c: &mut Connection,
+    data: &serde_json::Value,
+    prompt_assets: Option<(Vec<ImportFavorite>, Vec<ImportPreset>)>,
 ) -> AppResult<usize> {
     let version = data.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
     let providers = require_providers(data)?;
@@ -1597,12 +1663,10 @@ fn import_config_in_with_refs(
             validate_import_network(net)?;
         }
     }
-    // v4：收藏与预设先校验（预设参考图此时落盘；后续事务失败只会留下孤儿文件，由 GC 回收）
-    let prompt_assets = if version >= 4 {
-        Some(parse_import_prompt_assets(data, write_ref)?)
-    } else {
-        None
-    };
+    debug_assert!(
+        version < 4 || prompt_assets.is_some(),
+        "v4 导入必须先在锁外准备好预设参考图"
+    );
 
     let tx = c.transaction()?;
     // v2/v3 默认不导出明文 Key：删除前记录旧密文，导入项无 Key 且
@@ -1838,6 +1902,10 @@ pub(crate) fn list_history_in(
     style_filter: &str,
     favorite_only: bool,
 ) -> AppResult<Vec<HistoryRow>> {
+    // 分页参数钳制（F-015）：SQLite 里 LIMIT -1 等于不限，负 offset 会被当成 0，
+    // 直接绑定调用方传来的值等于把「一次拉全库」的能力暴露给 IPC。
+    let limit = limit.clamp(1, 200);
+    let offset = offset.max(0);
     let mut conditions = Vec::new();
     if !model_filter.is_empty() {
         conditions.push("model = ?");
@@ -2985,6 +3053,65 @@ fn finish_job_in(
         params![id, status, images_json, error, timestamp_millis()],
     )?;
     Ok(affected > 0)
+}
+
+/// 兜底收尾（F-006）：只要还没落终态，就强制写成终态。
+///
+/// 正常路径必须走 `finish_job`（只允许 running → 终态）；这里给 worker 在正常收尾
+/// 写库失败后的补偿用。否则一次写库抖动就会把任务永久留在 running，而
+/// `claim_next_job` 按 running 计数判断并发上限，槽位就此泄漏。
+pub fn finish_job_force(
+    id: i64,
+    status: &str,
+    images_json: &str,
+    error: Option<&str>,
+) -> AppResult<bool> {
+    let c = conn()?;
+    finish_job_force_in(&c, id, status, images_json, error)
+}
+
+fn finish_job_force_in(
+    c: &Connection,
+    id: i64,
+    status: &str,
+    images_json: &str,
+    error: Option<&str>,
+) -> AppResult<bool> {
+    debug_assert!(JOB_TERMINAL_STATUSES.contains(&status));
+    let affected = c.execute(
+        "UPDATE jobs SET status = ?2, images_json = ?3, error = ?4, finished_at = ?5
+         WHERE id = ?1 AND status NOT IN ('done', 'failed', 'canceled', 'interrupted')",
+        params![id, status, images_json, error, timestamp_millis()],
+    )?;
+    Ok(affected > 0)
+}
+
+/// 与 `timestamp_millis` 同格式、但取 `age` 之前的时刻，用于 TEXT 时间戳的字典序比较。
+fn timestamp_millis_ago(age: std::time::Duration) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let then = now.saturating_sub(age);
+    format!("{}.{:03}", then.as_secs(), then.subsec_millis())
+}
+
+/// 回收卡死任务（F-006）：running 且 `started_at` 早于 now-max_age 的标为 interrupted。
+///
+/// 启动时 `mark_running_interrupted` 覆盖「进程崩溃」；这里覆盖「进程还活着但
+/// worker 卡死/收尾写库一直失败」——不回收的话这些行会永久占住并发槽位。
+pub fn reap_stale_running(max_age: std::time::Duration) -> AppResult<usize> {
+    let c = conn()?;
+    reap_stale_running_in(&c, max_age)
+}
+
+fn reap_stale_running_in(c: &Connection, max_age: std::time::Duration) -> AppResult<usize> {
+    let affected = c.execute(
+        "UPDATE jobs SET status = 'interrupted', finished_at = ?1,
+         error = COALESCE(error, '任务长时间未收尾，已标记为中断')
+         WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?2",
+        params![timestamp_millis(), timestamp_millis_ago(max_age)],
+    )?;
+    Ok(affected)
 }
 
 /// queued → canceled（立即生效，worker 不会再来取）。
@@ -4495,6 +4622,53 @@ mod tests {
         assert_eq!(get_job_in(&c, id).unwrap().unwrap().status, "done");
     }
 
+    /// F-006：收尾写库失败的兜底，能把残留 running 写成终态；已落终态的不覆盖
+    #[test]
+    fn finish_job_force_recovers_stuck_running() {
+        let c = mem_conn();
+        let id = insert_job_in(&c, &new_job("job")).unwrap();
+        // 还没 running 也能强制落终态（worker 卡在收尾路径上时的补救）
+        assert!(finish_job_force_in(&c, id, "failed", "[]", Some("db busy")).unwrap());
+        assert_eq!(get_job_in(&c, id).unwrap().unwrap().status, "failed");
+        // 已终态的行不会被二次覆盖
+        assert!(!finish_job_force_in(&c, id, "done", "[]", None).unwrap());
+        assert_eq!(get_job_in(&c, id).unwrap().unwrap().status, "failed");
+    }
+
+    /// F-006：running 超过阈值未收尾 → interrupted；新鲜 running 不动
+    #[test]
+    fn reap_stale_running_only_marks_expired() {
+        let c = mem_conn();
+        let stale = insert_job_in(&c, &new_job("stale")).unwrap();
+        let fresh = insert_job_in(&c, &new_job("fresh")).unwrap();
+        receive_running(&c, stale);
+        receive_running(&c, fresh);
+        // 把 stale 的开始时间改成 1 小时前
+        c.execute(
+            "UPDATE jobs SET started_at = ?2 WHERE id = ?1",
+            params![
+                stale,
+                timestamp_millis_ago(std::time::Duration::from_secs(3600))
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            reap_stale_running_in(&c, std::time::Duration::from_secs(1800)).unwrap(),
+            1
+        );
+        assert_eq!(
+            get_job_in(&c, stale).unwrap().unwrap().status,
+            "interrupted"
+        );
+        assert_eq!(get_job_in(&c, fresh).unwrap().unwrap().status, "running");
+    }
+
+    /// 领取下一条并确认它确实进入 running
+    fn receive_running(c: &Connection, id: i64) {
+        assert_eq!(claim_next_job_in(c, 4).unwrap().map(|j| j.id), Some(id));
+    }
+
     /// C4：失败任务重试回 queued，终态与运行中任务不能重试
     #[test]
     fn retry_requeues_failed() {
@@ -4974,5 +5148,25 @@ mod tests {
             ids(list_history_in(&c, 10, 0, "", "", false).unwrap()),
             vec![5, 4, 3, 2, 1]
         );
+    }
+
+    /// F-015：分页参数在存储层钳制，负 limit 不再等于「一次拉全库」
+    #[test]
+    fn list_history_clamps_paging_params() {
+        let c = mem_conn();
+        for i in 0..3 {
+            c.execute(
+                "INSERT INTO history (prompt, model, provider_name, style, file_path, favorite, created_at, op)
+                 VALUES (?1, 'm', 'P', 's', ?2, 0, ?3, 'generate')",
+                params![format!("p{i}"), format!("/tmp/{i}.png"), i.to_string()],
+            )
+            .unwrap();
+        }
+        // SQLite 原生 LIMIT -1 表示不限；钳制后按 1 条返回
+        assert_eq!(list_history_in(&c, -1, 0, "", "", false).unwrap().len(), 1);
+        // LIMIT 0 原本返回空页，钳制后至少 1 条，避免前端把空页当成「已到底」
+        assert_eq!(list_history_in(&c, 0, 0, "", "", false).unwrap().len(), 1);
+        // 负数 offset 与 0 等价
+        assert_eq!(list_history_in(&c, 10, -5, "", "", false).unwrap().len(), 3);
     }
 }

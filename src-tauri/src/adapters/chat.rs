@@ -63,11 +63,13 @@ pub async fn chat_complete_at(
     extract_reply_text(&parsed)
 }
 
-/// SSE 单帧解析结果：正文增量 / 流结束 / 无价值帧（心跳、role 帧、坏帧）
+/// SSE 单帧解析结果：正文增量 / 流结束 / 服务商错误帧 / 无价值帧（心跳、role 帧、坏帧）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SseItem {
     Delta(String),
     Done,
+    /// 服务商在流内返回的错误（`data: {"error": ...}`），旧实现会静默丢弃
+    Error(String),
     Ignored,
 }
 
@@ -130,10 +132,16 @@ impl SseDecoder {
             return SseItem::Done;
         }
         match serde_json::from_str::<serde_json::Value>(&data) {
-            Ok(parsed) => match parsed["choices"][0]["delta"]["content"].as_str() {
-                Some(text) if !text.is_empty() => SseItem::Delta(text.to_string()),
-                _ => SseItem::Ignored,
-            },
+            Ok(parsed) => {
+                // F-005：错误帧必须上浮，不能当作「无价值帧」静默丢弃
+                if let Some(message) = sse_error_message(&parsed) {
+                    return SseItem::Error(message);
+                }
+                match parsed["choices"][0]["delta"]["content"].as_str() {
+                    Some(text) if !text.is_empty() => SseItem::Delta(text.to_string()),
+                    _ => SseItem::Ignored,
+                }
+            }
             Err(e) => {
                 // 坏帧只记一次，避免心跳/工具事件刷日志
                 if !self.warned {
@@ -144,6 +152,32 @@ impl SseDecoder {
             }
         }
     }
+}
+
+/// 从 SSE 帧 JSON 中提取错误信息：`{"error":"..."}` 或 `{"error":{"message":...}}`
+fn sse_error_message(parsed: &serde_json::Value) -> Option<String> {
+    let error = parsed.get("error")?;
+    let raw = match error {
+        serde_json::Value::String(text) if !text.trim().is_empty() => text.clone(),
+        serde_json::Value::Object(obj) => obj
+            .get("message")
+            .and_then(|v| v.as_str())
+            .or_else(|| obj.get("type").and_then(|v| v.as_str()))
+            .or_else(|| obj.get("code").and_then(|v| v.as_str()))
+            .map(str::to_string)
+            .unwrap_or_else(|| error.to_string()),
+        _ => return None,
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(
+        trimmed
+            .chars()
+            .take(super::ERROR_BODY_TRUNCATE_LEN)
+            .collect(),
+    )
 }
 
 /// 返回 (帧体长度, 分隔符长度)；分隔符为 `\n\n`、`\r\n\r\n` 或混合的 `\n\r\n`
@@ -258,6 +292,12 @@ where
                     on_delta(&delta);
                 }
                 SseItem::Done => done = true,
+                // F-005：流内错误直接上抛，由上层降级为原文并展示原因
+                SseItem::Error(message) => {
+                    return Err(AdapterError::Other {
+                        message: format!("chat/completions 返回错误: {message}"),
+                    })
+                }
                 SseItem::Ignored => {}
             }
         }
@@ -481,6 +521,43 @@ mod tests {
                 SseItem::Delta("a".into()),
                 SseItem::Delta("b".into()),
                 SseItem::Done,
+            ]
+        );
+    }
+
+    /// F-005：服务商错误帧必须变成 Error 而不是静默 Ignored
+    #[test]
+    fn surfaces_error_object_frame() {
+        let mut decoder = SseDecoder::new();
+        assert_eq!(
+            decoder.feed(
+                b"data: {\"error\":{\"message\":\"quota exceeded\",\"type\":\"insufficient_quota\"}}\n\n"
+            ),
+            vec![SseItem::Error("quota exceeded".into())]
+        );
+    }
+
+    /// F-005：`{"error":"..."}` 字符串形态同样上浮
+    #[test]
+    fn surfaces_error_string_frame() {
+        let mut decoder = SseDecoder::new();
+        assert_eq!(
+            decoder.feed(b"data: {\"error\":\"stream boom\"}\n\n"),
+            vec![SseItem::Error("stream boom".into())]
+        );
+    }
+
+    /// F-005：先产出增量再报错时，两类帧按顺序返回
+    #[test]
+    fn delta_then_error_frame_order_preserved() {
+        let mut decoder = SseDecoder::new();
+        let mut payload = delta_frame("partial");
+        payload.push_str("data: {\"error\":{\"message\":\"interrupted\"}}\n\n");
+        assert_eq!(
+            decoder.feed(payload.as_bytes()),
+            vec![
+                SseItem::Delta("partial".into()),
+                SseItem::Error("interrupted".into()),
             ]
         );
     }

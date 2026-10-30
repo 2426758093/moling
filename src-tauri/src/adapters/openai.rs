@@ -1,6 +1,6 @@
 use super::{
-    classify_http, classify_reqwest, http_client, prompt_with_negative, AdapterError, EditRequest,
-    GenerateRequest, ImageAdapter, ProviderConfig, TransformRequest,
+    classify_http, classify_reqwest, download_image_bytes, http_client, prompt_with_negative,
+    AdapterError, EditRequest, GenerateRequest, ImageAdapter, ProviderConfig, TransformRequest,
 };
 use base64::Engine;
 
@@ -153,6 +153,16 @@ impl OpenAiAdapter {
         Self::fetch_image_b64(entry, timeout).await
     }
 
+    /// F-012：服务商返回 200 但 data 为空时，上抛可读错误而不是成功返回 0 张图
+    fn ensure_generated(out: Vec<String>) -> Result<Vec<String>, AdapterError> {
+        if out.is_empty() {
+            return Err(AdapterError::Other {
+                message: "API 未返回图片".into(),
+            });
+        }
+        Ok(out)
+    }
+
     /// 下载图片 URL（RA-05：必须带服务商超时，避免下载阶段无限挂起）
     async fn fetch_image_b64(
         entry: &ImageEntry,
@@ -162,13 +172,8 @@ impl OpenAiAdapter {
             return Ok(b64.clone());
         }
         if let Some(url) = &entry.url {
-            let resp = http_client()
-                .get(url)
-                .timeout(timeout)
-                .send()
-                .await
-                .map_err(|e| classify_reqwest(&e))?;
-            let bytes = resp.bytes().await.map_err(|e| classify_reqwest(&e))?;
+            // F-011：统一走带状态码 / 体积上限 / 魔数校验的下载函数
+            let bytes = download_image_bytes(url, timeout).await?;
             return Ok(base64::engine::general_purpose::STANDARD.encode(&bytes));
         }
         Err(AdapterError::Other {
@@ -332,7 +337,7 @@ impl ImageAdapter for OpenAiAdapter {
             for entry in &parsed.data {
                 out.push(Self::fetch_image_b64(entry, Self::timeout(config)).await?);
             }
-            Ok(out)
+            Self::ensure_generated(out)
         })
     }
 
@@ -449,6 +454,17 @@ mod tests {
         assert!(
             scaled_size(cursor.get_ref(), 1).is_none(),
             "风格转换保持原尺寸，不带 size 字段"
+        );
+    }
+
+    /// F-012：空结果必须报错，非空结果原样透传
+    #[test]
+    fn empty_generation_result_reports_error() {
+        let err = OpenAiAdapter::ensure_generated(vec![]).unwrap_err();
+        assert!(err.message().contains("未返回图片"), "{}", err.message());
+        assert_eq!(
+            OpenAiAdapter::ensure_generated(vec!["QUJD".into()]).unwrap(),
+            vec!["QUJD".to_string()]
         );
     }
 }

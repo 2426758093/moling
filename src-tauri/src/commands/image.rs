@@ -119,6 +119,37 @@ const GENERATE_MAX_ATTEMPTS: u32 = 2;
 /// 重试退避时长（仅瞬时错误使用，避免抖动期间立刻重击服务商）
 const GENERATE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// 尺寸区间与吸附步长（F-016）：上限对齐前端 appStore 的 SIZE_MAX（4096，也是画布
+/// 输出上限），下限放宽到 64 以兼容 outpaint 的窄边与被编辑的小图；8 的倍数与服务商
+/// 常见的对齐要求一致。原值来自 IPC，必须在这里钳制而不是只信前端。
+const SIZE_MIN: u32 = 64;
+const SIZE_MAX: u32 = 4096;
+const SIZE_STEP: u32 = 8;
+/// 单次生成张数上限：与前端张数滑杆、队列 enqueue 的旧 clamp(1,4) 同口径
+const COUNT_MAX: u32 = 4;
+
+/// 先夹到区间再吸附到 8 的倍数：顺序不能反，否则 4090 吸附成 4096 后仍合法，
+/// 但 4097 若先吸附会变成 4104 再被夹回 4096，结果不一致。
+pub(crate) fn normalize_size(n: u32) -> u32 {
+    let clamped = n.clamp(SIZE_MIN, SIZE_MAX);
+    let snapped = (clamped + SIZE_STEP / 2) / SIZE_STEP * SIZE_STEP;
+    snapped.clamp(SIZE_MIN, SIZE_MAX)
+}
+
+pub(crate) fn normalize_count(n: u32) -> u32 {
+    n.clamp(1, COUNT_MAX)
+}
+
+/// 生成参数统一归一化：命令层、队列入队与核心流程都走这里，保证「入库的值」
+/// 与「真正发给服务商的值」永远一致（F-016）。
+pub(crate) fn normalize_generation(width: u32, height: u32, count: u32) -> (u32, u32, u32) {
+    (
+        normalize_size(width),
+        normalize_size(height),
+        normalize_count(count),
+    )
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GenerateCommandInput {
@@ -193,7 +224,7 @@ pub async fn generate_images(
     let (_registration, cancel_token) = CancelRegistration::new(&state, input.job_id.as_ref());
     let progress_app = app.clone();
     let job_id = input.job_id.clone();
-    let requested = input.count;
+    let requested = normalize_count(input.count);
     let outcome = generate_core(&app, &input, cancel_token, move |done, total| {
         // 事件发不出去（窗口已关）不影响生成
         if let Some(payload) = progress_payload(job_id.as_deref(), done, total, requested) {
@@ -228,6 +259,17 @@ where
         return Err("该服务商还没有配置 API Key".to_string());
     }
 
+    // 尺寸/张数归一化（F-016）：请求、历史记录、进度事件都只用归一化后的值。
+    let (width, height, count) = normalize_generation(input.width, input.height, input.count);
+    if (width, height, count) != (input.width, input.height, input.count) {
+        tracing::debug!(
+            "生成参数已归一化：{}x{}x{} -> {width}x{height}x{count}",
+            input.width,
+            input.height,
+            input.count
+        );
+    }
+
     let mut ref_images: Vec<String> = input
         .images
         .clone()
@@ -252,12 +294,12 @@ where
         prompt: full_prompt.clone(),
         negative_prompt: input.negative_prompt.clone(),
         model: input.model.clone(),
-        width: input.width,
-        height: input.height,
+        width,
+        height,
         guidance: input.guidance,
         steps: input.steps,
         seed: input.seed,
-        count: input.count,
+        count,
         images: ref_images,
         references: references.to_vec(),
     };
@@ -341,8 +383,8 @@ where
                 model: input.model.clone(),
                 provider_name: row.name.clone(),
                 seed: seed_val,
-                width: input.width as i64,
-                height: input.height as i64,
+                width: width as i64,
+                height: height as i64,
                 guidance: input.guidance.unwrap_or(0.0) as f64,
                 steps: input.steps.unwrap_or(0) as i64,
                 style: input.style.clone(),
@@ -449,6 +491,9 @@ pub async fn edit_image(
              the surrounding background naturally."
             .to_string();
     }
+    // 尺寸归一化（F-016）：编辑同样走 IPC，不能只信前端
+    input.width = normalize_size(input.width);
+    input.height = normalize_size(input.height);
     let row =
         storage::get_provider(input.provider_id)?.ok_or_else(|| "服务商不存在".to_string())?;
     let candidates = key_pool::candidates(input.provider_id)?;
@@ -1138,5 +1183,34 @@ mod tests {
         assert_eq!(value["done"], 3);
         assert_eq!(value["total"], 4);
         assert_eq!(value["requested"], 4);
+    }
+
+    /// F-016：尺寸先夹区间再吸附 8 的倍数，0/超大值都不再透传给服务商
+    #[test]
+    fn normalize_size_clamps_then_snaps() {
+        assert_eq!(normalize_size(0), SIZE_MIN);
+        assert_eq!(normalize_size(1), SIZE_MIN);
+        assert_eq!(normalize_size(512), 512);
+        assert_eq!(normalize_size(1024), 1024);
+        // 4090 就近吸附到 4088（与前端 appStore 的 round 口径一致），不会越过上限
+        assert_eq!(normalize_size(4090), 4088);
+        assert_eq!(normalize_size(4097), SIZE_MAX);
+        assert_eq!(normalize_size(u32::MAX), SIZE_MAX);
+        // 结果永远是 8 的倍数且在区间内
+        for n in [0, 7, 63, 64, 65, 100, 1001, 4095, 5000] {
+            let v = normalize_size(n);
+            assert!(v.is_multiple_of(SIZE_STEP), "{n} -> {v} 不是 8 的倍数");
+            assert!((SIZE_MIN..=SIZE_MAX).contains(&v), "{n} -> {v} 越界");
+        }
+    }
+
+    /// F-016：张数归一化，0 张与超大张数都会被夹到 1–4
+    #[test]
+    fn normalize_count_clamps_to_range() {
+        assert_eq!(normalize_count(0), 1);
+        assert_eq!(normalize_count(1), 1);
+        assert_eq!(normalize_count(4), 4);
+        assert_eq!(normalize_count(9), COUNT_MAX);
+        assert_eq!(normalize_generation(0, 100_000, 0), (64, 4096, 1));
     }
 }

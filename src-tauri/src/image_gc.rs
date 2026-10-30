@@ -36,6 +36,11 @@ const EMPTY_REFS_FILE_THRESHOLD: usize = 3;
 /// 每次启动最多回填多少张缩略图：存量数据可能很多，分批补齐避免拖慢启动
 const THUMB_BACKFILL_BUDGET: usize = 60;
 
+/// 媒体根迁移留下的归档目录（`images.migrating-*` / `refs.migrating-*`）保留期。
+///
+/// 迁移成功后旧目录只改名不删除，留出一天人工回滚窗口；超过即整目录清理。
+const MIGRATION_ARCHIVE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     /// 正常：移动到 .trash
@@ -148,12 +153,16 @@ fn scan(
 ) -> Result<Stats, String> {
     let images = media_root.join("images");
     let refs_dir = media_root.join("refs");
+    let mut stats = Stats::default();
+
+    // 归档目录要在「images/refs 都不存在」早退之前清理：迁移成功后旧根
+    // 往往只剩 images.migrating-* / refs.migrating-*，否则永远清不到（F-004）。
+    prune_migration_archives(media_root, now, &mut stats);
+
     if !images.is_dir() && !refs_dir.is_dir() {
-        return Ok(Stats::default());
+        return Ok(stats);
     }
     let refs = storage::referenced_image_paths_snapshot().map_err(|e| e.to_string())?;
-
-    let mut stats = Stats::default();
 
     if images.is_dir() {
         let mut stems = HashSet::new();
@@ -483,6 +492,48 @@ fn prune_trash(trash: &Path, now: SystemTime, retention: Duration, stats: &mut S
     }
 }
 
+/// 清理媒体根迁移留下的归档目录（`images.migrating-*` / `refs.migrating-*`）。
+///
+/// 迁移成功后旧目录只改名归档（见 `commands/storage.rs::archive_dir_for`），
+/// 留一天回滚窗口再整目录删除。这里不看 `retention`：缓存保留期是给用户图
+/// 的，归档目录属于内部中间态，固定 24h 足够。
+fn prune_migration_archives(media_root: &Path, now: SystemTime, stats: &mut Stats) {
+    let Ok(entries) = std::fs::read_dir(media_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !(name.starts_with("images.migrating-") || name.starts_with("refs.migrating-")) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        if now.duration_since(modified).unwrap_or_default() < MIGRATION_ARCHIVE_AGE {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => stats.pruned += 1,
+            Err(e) => {
+                stats.errors += 1;
+                tracing::warn!("清理迁移归档目录失败 {:?}: {e}", entry.path());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -502,6 +553,59 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("创建目录");
         dir
+    }
+
+    /// 迁移归档目录超过保留期后整目录（含嵌套文件）删除
+    #[test]
+    fn migration_archives_are_pruned_after_retention() {
+        let dir = temp_images("migrate");
+        let archive = dir.join("images.migrating-1720000000000");
+        std::fs::create_dir_all(archive.join("nested")).expect("创建嵌套目录");
+        std::fs::write(archive.join("nested/old.png"), b"x").unwrap();
+
+        let now = SystemTime::now() + MIGRATION_ARCHIVE_AGE + Duration::from_secs(60);
+        let mut stats = Stats::default();
+        prune_migration_archives(&dir, now, &mut stats);
+
+        assert_eq!(stats.pruned, 1);
+        assert_eq!(stats.errors, 0);
+        assert!(!archive.exists(), "超龄归档应整个删除");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 只认 `images.migrating-` / `refs.migrating-` 目录，其他名字与非目录不动
+    #[test]
+    fn migration_archive_cleanup_ignores_unrelated_entries() {
+        let dir = temp_images("migrate-keep");
+        let unrelated_dir = dir.join("downloads");
+        let archive_like_file = dir.join("refs.migrating-1720000000000");
+        std::fs::create_dir_all(&unrelated_dir).expect("创建目录");
+        std::fs::write(&archive_like_file, b"not a dir").unwrap();
+
+        let now = SystemTime::now() + MIGRATION_ARCHIVE_AGE + Duration::from_secs(60);
+        let mut stats = Stats::default();
+        prune_migration_archives(&dir, now, &mut stats);
+
+        assert_eq!(stats.pruned, 0);
+        assert!(unrelated_dir.exists());
+        assert!(archive_like_file.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 迁移后旧根只剩归档目录时，scan 也要能清到（早退之前处理）
+    #[test]
+    fn scan_prunes_archives_without_images_dirs() {
+        let dir = temp_images("migrate-scan");
+        let archive = dir.join("refs.migrating-1720000000000");
+        std::fs::create_dir_all(&archive).expect("创建归档目录");
+
+        let now = SystemTime::now() + MIGRATION_ARCHIVE_AGE + Duration::from_secs(60);
+        let stats =
+            scan(&dir, Mode::Move, now, Duration::from_secs(24 * 60 * 60)).expect("扫描成功");
+
+        assert_eq!(stats.pruned, 1);
+        assert!(!archive.exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 缩略图回填只处理仍被引用的超龄原图；源文件消失的缩略图会被清理

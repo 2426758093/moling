@@ -8,6 +8,7 @@ mod tests;
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
 
 /// provider kind 常量（serde/DB 中的字符串值冻结：mock/template/openai）
 pub const KIND_MOCK: &str = "mock";
@@ -196,6 +197,89 @@ pub(crate) fn http_client() -> Arc<reqwest::Client> {
     http::current_client()
 }
 
+/// 单张远程图片体积上限（20MB）：防止错误页 / 超大响应把内存与落盘打满。
+pub(crate) const MAX_REMOTE_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+/// 支持的图片魔数（与 `image` crate 启用的格式一致：PNG / JPEG / GIF / WebP）
+fn looks_like_image(bytes: &[u8]) -> bool {
+    if bytes.starts_with(b"\x89PNG") || bytes.starts_with(b"\xff\xd8") || bytes.starts_with(b"GIF8")
+    {
+        return true;
+    }
+    bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP"
+}
+
+/// 响应体开头像 HTML / JSON 文本时，几乎可以确定拿到的是错误页而不是图片
+fn looks_like_text_body(bytes: &[u8]) -> bool {
+    bytes
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .is_some_and(|b| matches!(*b, b'<' | b'{' | b'['))
+}
+
+/// 下载结果校验（F-011）：体积上限 + 魔数。错误消息面向用户，明确「下载到的不是图片」。
+fn validate_downloaded_image(bytes: &[u8], max_bytes: usize) -> Result<(), AdapterError> {
+    if bytes.len() > max_bytes {
+        return Err(AdapterError::Other {
+            message: format!("图片体积超过上限 {} MB", max_bytes / 1024 / 1024),
+        });
+    }
+    if looks_like_image(bytes) {
+        return Ok(());
+    }
+    if looks_like_text_body(bytes) {
+        return Err(AdapterError::Other {
+            message: "下载内容不是图片（可能是错误页或登录页），请检查服务商图片链接".into(),
+        });
+    }
+    Err(AdapterError::Other {
+        message: "下载内容不是支持的图片格式（仅支持 PNG/JPEG/GIF/WebP）".into(),
+    })
+}
+
+/// 下载远程图片并做安全校验（F-011）：状态码、体积上限、魔数。
+///
+/// 不复用 `classify_http`：这里的 401/403 只表示图片链接不可访问，
+/// 若映射成 `AuthInvalid` 会被上层误判为 API Key 失效而触发换 Key。
+pub(crate) async fn download_image_bytes(
+    url: &str,
+    timeout: Duration,
+) -> Result<Vec<u8>, AdapterError> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(AdapterError::Other {
+            message: format!("图片地址不是 http(s): {url}"),
+        });
+    }
+    let resp = http_client()
+        .get(url)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| classify_reqwest(&e))?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        let truncated: String = text.chars().take(ERROR_BODY_TRUNCATE_LEN).collect();
+        return Err(AdapterError::Other {
+            message: format!("下载图片失败 HTTP {status}: {truncated}"),
+        });
+    }
+    if resp
+        .content_length()
+        .is_some_and(|len| len > MAX_REMOTE_IMAGE_BYTES as u64)
+    {
+        return Err(AdapterError::Other {
+            message: format!(
+                "图片体积超过上限 {} MB",
+                MAX_REMOTE_IMAGE_BYTES / 1024 / 1024
+            ),
+        });
+    }
+    let bytes = resp.bytes().await.map_err(|e| classify_reqwest(&e))?;
+    validate_downloaded_image(&bytes, MAX_REMOTE_IMAGE_BYTES)?;
+    Ok(bytes.to_vec())
+}
+
 pub fn classify_http(status: reqwest::StatusCode, body: &str) -> AdapterError {
     let truncated: String = body.chars().take(ERROR_BODY_TRUNCATE_LEN).collect();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
@@ -242,5 +326,47 @@ pub fn classify_reqwest(err: &reqwest::Error) -> AdapterError {
         AdapterError::Other {
             message: err.to_string(),
         }
+    }
+}
+
+#[cfg(test)]
+mod download_tests {
+    use super::*;
+
+    fn png_bytes() -> Vec<u8> {
+        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+        bytes.extend_from_slice(&[0, 0, 0, 0]);
+        bytes
+    }
+
+    /// F-011：四种受支持格式的魔数都被接受
+    #[test]
+    fn accepts_supported_image_magic() {
+        assert!(validate_downloaded_image(&png_bytes(), 1024).is_ok());
+        assert!(validate_downloaded_image(b"\xff\xd8\xff\xe0rest", 1024).is_ok());
+        assert!(validate_downloaded_image(b"GIF89a....", 1024).is_ok());
+        assert!(validate_downloaded_image(b"RIFF\x00\x00\x00\x00WEBPdata", 1024).is_ok());
+    }
+
+    /// F-011：错误页 / JSON 错误体 / 超限体积都必须被拒绝
+    #[test]
+    fn rejects_error_page_and_oversize_body() {
+        let err = validate_downloaded_image(b"<html>403 Forbidden</html>", 1024).unwrap_err();
+        assert!(err.message().contains("不是图片"), "{}", err.message());
+        let err = validate_downloaded_image(br#"{"error":"link expired"}"#, 1024).unwrap_err();
+        assert!(err.message().contains("不是图片"), "{}", err.message());
+        let err = validate_downloaded_image(&vec![0u8; 2048], 1024).unwrap_err();
+        assert!(err.message().contains("体积超过上限"), "{}", err.message());
+    }
+
+    /// F-011：非图片的二进制格式也要明确报格式不支持
+    #[test]
+    fn rejects_unknown_binary_format() {
+        let err = validate_downloaded_image(b"BM\x00\x00", 1024).unwrap_err();
+        assert!(
+            err.message().contains("不是支持的图片格式"),
+            "{}",
+            err.message()
+        );
     }
 }

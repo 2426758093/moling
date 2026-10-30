@@ -41,8 +41,9 @@ pub async fn get_media_root(app: tauri::AppHandle) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-/// 迁移媒体根：复制 → 单事务改写数据库 → 写引导文件 → 删旧目录。
-/// 任一步失败保持原状；队列运行中拒绝执行（正在写入的图片会漏拷）。
+/// 迁移媒体根：复制 → 单事务改写数据库 → 写引导文件 → 归档旧目录。
+/// 任一步失败保持原状；迁移期间由 `media_gate` 拦住新的图片落盘，
+/// 队列运行中拒绝执行（正在写入的图片会漏拷）。
 #[tauri::command]
 pub async fn set_media_root(
     app: tauri::AppHandle,
@@ -54,6 +55,14 @@ pub async fn set_media_root(
         .map_err(|e| e.to_string())
 }
 
+/// 旧目录归档名：`images` → `images.migrating-<毫秒时间戳>`。
+///
+/// 迁移后不再 `remove_dir_all`：改名是原子操作，万一数据库/引导文件回滚，
+/// 旧图还在；延迟清理交给 `image_gc`（F-004）。
+fn archive_dir_for(old_root: &Path, sub: &str, stamp: &str) -> PathBuf {
+    old_root.join(format!("{sub}.migrating-{stamp}"))
+}
+
 fn migrate_media_root(app: &tauri::AppHandle, target: &Path) -> AppResult<MigrationReport> {
     let old_root = paths::media_root(app)?;
     validate_target(&old_root, target).map_err(AppError::Other)?;
@@ -62,6 +71,9 @@ fn migrate_media_root(app: &tauri::AppHandle, target: &Path) -> AppResult<Migrat
             "队列有任务正在运行，请等待完成后再更改媒体目录".into(),
         ));
     }
+    // 先置迁移标志并等待在途写盘结束：之后所有新落盘都会拿到可读错误，
+    // 复制期间不会再有新图写进旧目录（F-004）。
+    let _gate = crate::media_gate::MigrationGate::acquire(std::time::Duration::from_secs(60))?;
     std::fs::create_dir_all(target)?;
     let target_abs = friendly_path(&normalize_absolute(target)?);
     // 用真实路径再校验一次：符号链接 / `..` 不能绕过「目录互相包含」的限制
@@ -121,13 +133,20 @@ fn migrate_media_root(app: &tauri::AppHandle, target: &Path) -> AppResult<Migrat
         return Err(e);
     }
 
-    // 旧目录只删媒体子目录；旧根可能就是 appData，不能整体删除
+    // 旧目录只改名归档，不立即删除：数据库/引导文件若被回滚还能找回；
+    // 真正的清理由 image_gc 在保留期后做（F-004）。
+    let stamp = storage::timestamp_millis();
     for sub in ["images", "refs"] {
         let dir = old_root.join(sub);
-        if let Err(e) = std::fs::remove_dir_all(&dir) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!("删除旧媒体目录失败（不影响迁移）{}: {e}", dir.display());
-            }
+        if !dir.exists() {
+            continue;
+        }
+        let archived = archive_dir_for(&old_root, sub, &stamp);
+        if let Err(e) = std::fs::rename(&dir, &archived) {
+            tracing::warn!(
+                "归档旧媒体目录失败（不影响迁移，稍后由清理任务处理）{}: {e}",
+                dir.display()
+            );
         }
     }
 
@@ -324,6 +343,27 @@ mod tests {
         );
         // images2 不能被 images 前缀误判为子目录
         assert!(validate_target(old, Path::new(r"E:\data\media2")).is_ok());
+    }
+
+    /// 归档名固定为 `<子目录>.migrating-<时间戳>`，落在旧根下
+    #[test]
+    fn archive_dir_for_keeps_under_old_root() {
+        let old = Path::new(r"E:\data\media");
+        assert_eq!(
+            archive_dir_for(old, "images", "1720000000000"),
+            PathBuf::from(r"E:\data\media\images.migrating-1720000000000")
+        );
+        assert_eq!(
+            archive_dir_for(old, "refs", "1"),
+            PathBuf::from(r"E:\data\media\refs.migrating-1")
+        );
+        // 迁移后旧根可能只剩归档目录，GC 按前缀识别
+        let name = archive_dir_for(old, "images", "9")
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        assert!(name.starts_with("images.migrating-"));
     }
 
     /// 递归复制保留子目录（.thumb/.trash），并返回真实文件数与字节数
