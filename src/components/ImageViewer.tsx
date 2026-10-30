@@ -1,11 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
+import SafeImg from "./SafeImg";
 import { IconClose, IconExpand, IconChevron } from "./Icons";
 
 export interface ViewerImage {
   dataUrl: string;
   title?: string;
 }
+
+/// 浮在图片之上的工具栏：clear 玻璃 + 压暗层，保证任何画面上都读得清。
+const BAR_BTN =
+  "pressable flex items-center justify-center rounded-pill p-2 text-on-accent transition-colors hover:bg-on-accent/15";
 
 export default function ImageViewer({
   images,
@@ -66,19 +71,23 @@ export default function ImageViewer({
       exit={{ opacity: 0 }}
       transition={{ duration: 0.2 }}
       ref={containerRef}
+      role="dialog"
+      aria-modal="true"
+      aria-label="图片查看器"
       className="fixed inset-0 z-50 flex flex-col bg-black"
       onClick={onClose}
     >
       <div
-        className="flex h-[52px] shrink-0 items-center justify-between px-4 text-white/80"
+        className="glass-media flex min-h-12 shrink-0 items-center justify-between px-4"
         onClick={(e) => e.stopPropagation()}
       >
-        <span className="text-[13px] tabular-nums">
+        <span className="text-subhead tabular-nums text-on-accent/80">
           {index + 1} / {images.length}
           {scale !== 1 && ` · ${Math.round(scale * 100)}%`}
         </span>
         <div className="flex gap-1">
           <button
+            type="button"
             onClick={() => {
               if (document.fullscreenElement) {
                 document.exitFullscreen();
@@ -86,15 +95,16 @@ export default function ImageViewer({
                 containerRef.current?.requestFullscreen();
               }
             }}
-            title={fullscreen ? "退出全屏" : "全屏"}
-            className="pressable rounded-full bg-white/10 p-2 transition-colors hover:bg-white/20"
+            aria-label={fullscreen ? "退出全屏" : "全屏查看"}
+            className={BAR_BTN}
           >
             <IconExpand size={15} />
           </button>
           <button
+            type="button"
             onClick={onClose}
-            title="关闭"
-            className="pressable rounded-full bg-white/10 p-2 transition-colors hover:bg-white/20"
+            aria-label="关闭查看器"
+            className={BAR_BTN}
           >
             <IconClose size={15} />
           </button>
@@ -125,10 +135,9 @@ export default function ImageViewer({
         onDoubleClick={reset}
         onClick={(e) => e.stopPropagation()}
       >
-        <img
+        <SafeImg
           src={current.dataUrl}
           alt={current.title ?? ""}
-          draggable={false}
           className="max-h-full max-w-full cursor-grab select-none active:cursor-grabbing"
           style={{
             transform: `translate(${offset.x}px, ${offset.y}px) scale(${scale})`,
@@ -136,22 +145,26 @@ export default function ImageViewer({
         />
         {index > 0 && (
           <button
+            type="button"
             onClick={(e) => {
               e.stopPropagation();
               onIndexChange(index - 1);
             }}
-            className="pressable absolute left-3 rounded-full bg-white/10 p-2.5 text-white transition-colors hover:bg-white/20"
+            aria-label="上一张"
+            className={`glass-media absolute left-3 ${BAR_BTN}`}
           >
             <IconChevron direction="left" size={18} />
           </button>
         )}
         {index < images.length - 1 && (
           <button
+            type="button"
             onClick={(e) => {
               e.stopPropagation();
               onIndexChange(index + 1);
             }}
-            className="pressable absolute right-3 rounded-full bg-white/10 p-2.5 text-white transition-colors hover:bg-white/20"
+            aria-label="下一张"
+            className={`glass-media absolute right-3 ${BAR_BTN}`}
           >
             <IconChevron direction="right" size={18} />
           </button>

@@ -12,6 +12,8 @@ interface QueueStore {
   jobs: QueueJob[];
   counts: Record<string, number>;
   paused: boolean;
+  /** 并发上限（1–4），后端每次领取任务时读取设置 */
+  concurrency: number;
   loaded: boolean;
   progress: Record<number, QueueProgress>;
   unlisteners: UnlistenFn[];
@@ -21,6 +23,7 @@ interface QueueStore {
   unsubscribe: () => void;
   enqueue: (input: EnqueueJobInput) => Promise<void>;
   start: () => Promise<void>;
+  setConcurrency: (n: number) => Promise<void>;
   cancel: (id: number) => Promise<void>;
   retry: (id: number) => Promise<void>;
   clearFinished: () => Promise<void>;
@@ -41,13 +44,14 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
   jobs: [],
   counts: {},
   paused: true,
+  concurrency: 1,
   loaded: false,
   progress: {},
   unlisteners: [],
 
   load: async () => {
-    const { jobs, counts, paused } = await api.listJobs();
-    set({ jobs, counts, paused, loaded: true });
+    const { jobs, counts, paused, concurrency } = await api.listJobs();
+    set({ jobs, counts, paused, concurrency, loaded: true });
   },
 
   subscribe: async () => {
@@ -103,6 +107,13 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
     await api.resumeQueue();
     set({ paused: false });
     toast("队列已开始");
+  },
+
+  setConcurrency: async (n) => {
+    const next = Math.min(4, Math.max(1, Math.round(n)));
+    await api.setSetting("queueConcurrency", String(next));
+    set({ concurrency: next });
+    toast(`并发数已设为 ${next}`);
   },
 
   cancel: async (id) => {

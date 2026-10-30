@@ -1,11 +1,15 @@
 import { useEffect, useState } from "react";
 import { api, ProxyInputPayload, ProxyMode } from "../../lib/api";
 import { useProviderStore } from "../../stores/providerStore";
+import { Button } from "../ui/Button";
+import { Input } from "../ui/Field";
+import { Row, Section } from "../ui/List";
+import { Select } from "../ui/Select";
 
-const MODES: { id: ProxyMode; label: string }[] = [
-  { id: "system", label: "跟随系统" },
-  { id: "direct", label: "直连（不使用代理）" },
-  { id: "manual", label: "手动代理" },
+const MODES: { value: ProxyMode; label: string }[] = [
+  { value: "system", label: "跟随系统" },
+  { value: "direct", label: "直连（不使用代理）" },
+  { value: "manual", label: "手动代理" },
 ];
 
 export default function NetworkSection() {
@@ -80,88 +84,86 @@ export default function NetworkSection() {
   };
 
   return (
-    <section>
-      <h2 className="mb-4 text-lg font-semibold">网络与代理</h2>
-      <div className="space-y-3 rounded-[var(--radius-card)] border border-theme p-4">
-        <div className="flex items-center justify-between text-sm">
-          <span className="text-secondary">代理模式</span>
-          <select
-            value={mode}
-            onChange={(e) => setMode(e.target.value as ProxyMode)}
-            className="rounded-[8px] border border-theme bg-transparent px-2 py-1 text-xs"
-          >
-            {MODES.map((m) => (
-              <option key={m.id} value={m.id}>
-                {m.label}
-              </option>
-            ))}
-          </select>
-        </div>
+    <Section
+      title="网络与代理"
+      description="下载模型与生成图片都会走这里的设置"
+    >
+      <Row label="代理模式">
+        <Select
+          value={mode}
+          onValueChange={(v) => setMode(v as ProxyMode)}
+          options={MODES}
+          label="代理模式"
+          widthClass="w-48"
+        />
+      </Row>
 
-        {mode === "manual" && (
-          <>
-            <div className="flex items-center justify-between gap-3 text-sm">
-              <span className="shrink-0 text-secondary">代理地址</span>
-              <input
-                value={url}
-                onChange={(e) => setUrl(e.target.value)}
-                placeholder="http://127.0.0.1:7890"
-                className="min-w-0 flex-1 rounded-[8px] border border-theme bg-transparent px-2 py-1 text-xs"
-              />
-            </div>
-            <div className="flex items-center justify-between gap-3 text-sm">
-              <span className="shrink-0 text-secondary">用户名</span>
-              <input
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                placeholder="可选"
-                className="min-w-0 flex-1 rounded-[8px] border border-theme bg-transparent px-2 py-1 text-xs"
-              />
-            </div>
-            <div className="flex items-center justify-between gap-3 text-sm">
-              <span className="shrink-0 text-secondary">密码</span>
-              <input
-                type="password"
-                value={password ?? ""}
-                onChange={(e) => setPassword(e.target.value)}
-                placeholder={hasPassword ? "已保存，留空不修改" : "可选"}
-                className="min-w-0 flex-1 rounded-[8px] border border-theme bg-transparent px-2 py-1 text-xs"
-              />
-            </div>
-            <div className="flex items-center justify-between gap-3 text-sm">
-              <span className="shrink-0 text-secondary">跳过代理</span>
-              <input
-                value={noProxy}
-                onChange={(e) => setNoProxy(e.target.value)}
-                placeholder="localhost,127.0.0.1"
-                className="min-w-0 flex-1 rounded-[8px] border border-theme bg-transparent px-2 py-1 text-xs"
-              />
-            </div>
-            <p className="text-xs text-tertiary">
-              目前只支持 HTTP/HTTPS
-              代理；密码留空表示保持原值，清空后保存表示清除。
-            </p>
-          </>
-        )}
+      {mode === "manual" && (
+        <>
+          <Row label="代理地址">
+            <Input
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              placeholder="http://127.0.0.1:7890"
+              aria-label="代理地址"
+              widthClass="w-64"
+            />
+          </Row>
+          <Row label="用户名">
+            <Input
+              value={username}
+              onChange={(e) => setUsername(e.target.value)}
+              placeholder="可选"
+              aria-label="代理用户名"
+              widthClass="w-64"
+            />
+          </Row>
+          <Row label="密码">
+            <Input
+              type="password"
+              value={password ?? ""}
+              onChange={(e) => setPassword(e.target.value)}
+              placeholder={hasPassword ? "已保存，留空不修改" : "可选"}
+              aria-label="代理密码"
+              widthClass="w-64"
+            />
+          </Row>
+          <Row label="跳过代理" hint="逗号分隔的主机名不经过代理">
+            <Input
+              value={noProxy}
+              onChange={(e) => setNoProxy(e.target.value)}
+              placeholder="localhost,127.0.0.1"
+              aria-label="跳过代理的主机"
+              widthClass="w-64"
+            />
+          </Row>
+        </>
+      )}
 
-        <div className="flex flex-wrap items-center gap-2 pt-1">
-          <button
-            onClick={() => void save()}
-            disabled={busy}
-            className="rounded-[8px] bg-accent px-3 py-1.5 text-xs text-white disabled:opacity-50"
-          >
-            保存
-          </button>
-          <button
-            onClick={() => void test()}
-            disabled={busy}
-            className="rounded-[8px] border border-theme px-3 py-1.5 text-xs disabled:opacity-50"
-          >
-            测试代理
-          </button>
-          {msg && <span className="w-full text-xs text-tertiary">{msg}</span>}
-        </div>
-      </div>
-    </section>
+      <Row
+        label="应用设置"
+        hint={
+          msg ? (
+            <span className={msg.includes("失败") ? "text-danger" : undefined}>
+              {msg}
+            </span>
+          ) : (
+            "目前只支持 HTTP/HTTPS 代理"
+          )
+        }
+      >
+        <Button
+          size="sm"
+          variant="primary"
+          loading={busy}
+          onClick={() => void save()}
+        >
+          保存
+        </Button>
+        <Button size="sm" onClick={() => void test()} disabled={busy}>
+          测试代理
+        </Button>
+      </Row>
+    </Section>
   );
 }

@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { CSSProperties, useState } from "react";
 
 /**
  * 带加载失败兜底的图片。
@@ -11,6 +11,7 @@ export default function SafeImg({
   src,
   alt,
   className,
+  style,
   draggable = false,
   loading,
   decoding,
@@ -18,6 +19,7 @@ export default function SafeImg({
   src: string;
   alt: string;
   className?: string;
+  style?: CSSProperties;
   draggable?: boolean;
   loading?: "eager" | "lazy";
   decoding?: "sync" | "async" | "auto";
@@ -32,7 +34,8 @@ export default function SafeImg({
       <div
         role="img"
         aria-label={`${alt}（图片缺失）`}
-        className={`${className ?? ""} flex items-center justify-center bg-sunken text-[11px] text-tertiary`}
+        style={style}
+        className={`${className ?? ""} flex items-center justify-center bg-sunken text-footnote text-tertiary`}
       >
         图片缺失
       </div>
@@ -44,6 +47,7 @@ export default function SafeImg({
       src={src}
       alt={alt}
       className={className}
+      style={style}
       draggable={draggable}
       loading={loading}
       decoding={decoding}

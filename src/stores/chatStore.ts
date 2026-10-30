@@ -10,7 +10,8 @@ import {
   ThinkingDelta,
 } from "../lib/api";
 import { toast } from "../lib/notify";
-import { MAX_REFERENCE_IMAGES } from "../lib/image";
+import { maxReferenceImages } from "../lib/useModelCaps";
+import { DEFAULT_REFERENCE_STRENGTH, ReferenceRole } from "../lib/types";
 import {
   compressDataUrl,
   genAttachmentId,
@@ -26,6 +27,9 @@ export interface Attachment {
   path?: string;
   /** 已做降采样（仅内存显示角标，不入库） */
   compressed?: boolean;
+  /// 角色 / 强度：提示词级近似，专家模式可调；旧消息恢复时缺省为构图 + 60
+  role?: ReferenceRole;
+  strength?: number;
 }
 
 export interface ChatImage {
@@ -34,6 +38,8 @@ export interface ChatImage {
   path?: string;
   prompt: string;
   seed: number | null;
+  /** 派生图血统：父记录 id（放大 / 风格 / 编辑结果），只用于界面标注 */
+  derivedFrom?: number;
 }
 
 export interface DisplayMessage {
@@ -79,12 +85,18 @@ interface ChatState {
   /** dataUrl 入口（引用生成图）：同样按需压缩 */
   addDataUrlAttachment: (dataUrl: string, name: string) => Promise<boolean>;
   removeAttachment: (id: string) => void;
+  updateAttachment: (id: string, patch: Partial<Attachment>) => void;
   clearAttachments: () => void;
   send: (text: string) => Promise<void>;
   stop: () => void;
   retryLast: () => Promise<void>;
   appendImageMessage: (
-    img: { historyId: number; dataUrl: string; path: string },
+    img: {
+      historyId: number;
+      dataUrl: string;
+      path: string;
+      derivedFrom?: number;
+    },
     displayPrompt: string,
   ) => Promise<void>;
 }
@@ -316,12 +328,21 @@ export const useChatStore = create<ChatState>((set, get) => {
         prompt:
           get().messages.find((m) => m.id === assistantLocalId)?.content ??
           userMsg.content,
+        negativePrompt: prefs.negativePrompt.trim() || null,
         model,
         width: prefs.width,
         height: prefs.height,
         style: prefs.style,
         count,
         images: atts.map((a) => a.dataUrl),
+        // 角色 / 强度只属于专家模式；简单模式保持「纯参考图」的旧行为
+        references:
+          useAppStore.getState().mode === "expert" && atts.length > 0
+            ? atts.map((a) => ({
+                role: a.role ?? "composition",
+                strength: a.strength ?? DEFAULT_REFERENCE_STRENGTH,
+              }))
+            : undefined,
         jobId,
       });
       cancelled = Boolean(resp.cancelled);
@@ -506,8 +527,9 @@ export const useChatStore = create<ChatState>((set, get) => {
     },
 
     addAttachment: (att) => {
-      if (get().attachments.length >= MAX_REFERENCE_IMAGES) {
-        toast(`最多添加 ${MAX_REFERENCE_IMAGES} 张参考图`, "error");
+      const limit = maxReferenceImages();
+      if (get().attachments.length >= limit) {
+        toast(`最多添加 ${limit} 张参考图`, "error");
         return false;
       }
       set((s) => ({ attachments: [...s.attachments, att] }));
@@ -520,6 +542,8 @@ export const useChatStore = create<ChatState>((set, get) => {
         dataUrl: prepared.dataUrl,
         name: file.name,
         compressed: prepared.compressed || undefined,
+        role: "composition",
+        strength: DEFAULT_REFERENCE_STRENGTH,
       });
     },
     addDataUrlAttachment: async (dataUrl, name) => {
@@ -529,10 +553,18 @@ export const useChatStore = create<ChatState>((set, get) => {
         dataUrl: prepared.dataUrl,
         name,
         compressed: prepared.compressed || undefined,
+        role: "composition",
+        strength: DEFAULT_REFERENCE_STRENGTH,
       });
     },
     removeAttachment: (id) =>
       set((s) => ({ attachments: s.attachments.filter((a) => a.id !== id) })),
+    updateAttachment: (id, patch) =>
+      set((s) => ({
+        attachments: s.attachments.map((a) =>
+          a.id === id ? { ...a, ...patch } : a,
+        ),
+      })),
     clearAttachments: () => set({ attachments: [] }),
 
     send: async (text) => {
@@ -602,7 +634,13 @@ export const useChatStore = create<ChatState>((set, get) => {
             content: trimmed,
             refinedContent: "",
             imagesJson: JSON.stringify(
-              atts.map(({ id, name, path }) => ({ id, name, path })),
+              atts.map(({ id, name, path, role, strength }) => ({
+                id,
+                name,
+                path,
+                role,
+                strength,
+              })),
             ),
             paramsJson: JSON.stringify(useAppStore.getState().prefs),
             createdAt: nowTimestamp(),
@@ -794,7 +832,11 @@ export const useChatStore = create<ChatState>((set, get) => {
           content: displayPrompt,
           refinedContent: displayPrompt,
           imagesJson: JSON.stringify([
-            { historyId: img.historyId, path: img.path },
+            {
+              historyId: img.historyId,
+              path: img.path,
+              derivedFrom: img.derivedFrom,
+            },
           ]),
           paramsJson: "{}",
           createdAt: nowTimestamp(),
@@ -816,6 +858,7 @@ export const useChatStore = create<ChatState>((set, get) => {
                   path: img.path,
                   prompt: displayPrompt,
                   seed: null,
+                  derivedFrom: img.derivedFrom,
                 },
               ],
               pendingImages: 0,

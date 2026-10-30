@@ -1,10 +1,15 @@
 import { useEffect, useState } from "react";
-import { motion } from "framer-motion";
 import { useProviderStore } from "../stores/providerStore";
 import { useAppStore } from "../stores/appStore";
 import { api, ThinkingConfig } from "../lib/api";
 import { toast } from "../lib/notify";
-import { IconChevron, IconPalette, IconBrain } from "./Icons";
+import { useCompact } from "../hooks/useMediaQuery";
+import { Select } from "./ui/Select";
+import { Switch } from "./ui/Switch";
+import { Button } from "./ui/Button";
+import { IconButton } from "./ui/IconButton";
+import { cn } from "./ui/cn";
+import { IconChevron, IconBrain } from "./Icons";
 
 export default function SettingsRail() {
   const [collapsed, setCollapsed] = useState(false);
@@ -14,6 +19,7 @@ export default function SettingsRail() {
   const saveProvider = useProviderStore((s) => s.save);
   const setView = useAppStore((s) => s.setView);
   const [thinking, setThinking] = useState<ThinkingConfig | null>(null);
+  const compact = useCompact();
 
   useEffect(() => {
     api
@@ -46,126 +52,118 @@ export default function SettingsRail() {
   };
 
   return (
-    <motion.aside
-      animate={{ width: collapsed ? 52 : 240 }}
-      transition={{ type: "spring", stiffness: 400, damping: 36 }}
-      className="bg-glass flex shrink-0 flex-col overflow-hidden border-l border-theme"
+    <aside
+      className={cn(
+        "glass flex shrink-0 flex-col overflow-hidden transition-[width] duration-300 ease-ios",
+        collapsed ? "w-14" : compact ? "w-50" : "w-60",
+      )}
     >
-      <div className="flex h-[52px] shrink-0 items-center justify-between px-3">
-        {!collapsed && (
-          <span className="text-[11px] font-medium tracking-wide text-tertiary">
-            生成设置
-          </span>
+      <div
+        className={cn(
+          "flex h-14 shrink-0 items-center",
+          collapsed ? "justify-center" : "justify-between px-4",
         )}
-        <button
-          onClick={() => setCollapsed(!collapsed)}
-          title={collapsed ? "展开" : "折叠"}
-          className="pressable rounded-md p-1 text-tertiary transition-colors hover:bg-hover hover:text-secondary"
-        >
-          <IconChevron direction={collapsed ? "left" : "right"} size={14} />
-        </button>
+      >
+        {!collapsed && (
+          <span className="text-caption text-tertiary">生成设置</span>
+        )}
+        <IconButton
+          label={collapsed ? "展开设置栏" : "折叠设置栏"}
+          size="sm"
+          tooltip={false}
+          icon={
+            <IconChevron direction={collapsed ? "left" : "right"} size={14} />
+          }
+          onClick={() => setCollapsed((v) => !v)}
+        />
       </div>
 
       <div
-        className={`min-h-0 flex-1 space-y-5 overflow-y-auto px-4 pb-4 ${
-          collapsed ? "px-2" : ""
-        }`}
+        className={cn(
+          "scroll-edge min-h-0 flex-1 space-y-4 overflow-y-auto pb-4",
+          collapsed ? "px-2" : "px-4",
+        )}
       >
-        {!collapsed ? (
+        {!collapsed && (
           <>
-            <div>
-              <div className="mb-1.5 text-[11px] font-medium tracking-wide text-tertiary">
-                绘图服务商
-              </div>
-              <select
-                value={defaultProviderId ?? ""}
-                onChange={(e) =>
-                  setDefaultProvider(
-                    e.target.value === "" ? null : Number(e.target.value),
-                  )
+            <div className="flex flex-col gap-1.5">
+              <span className="text-caption text-tertiary">绘图服务商</span>
+              <Select
+                label="绘图服务商"
+                value={defaultProviderId ? String(defaultProviderId) : ""}
+                placeholder="（未选择）"
+                onValueChange={(v) =>
+                  setDefaultProvider(v === "" ? null : Number(v))
                 }
-                className="w-full rounded-[10px] border border-theme bg-transparent px-2.5 py-[7px] text-[13px] outline-none transition-colors focus:border-accent"
-              >
-                <option value="">（未选择）</option>
-                {providers.map((p) => (
-                  <option key={p.provider.id} value={p.provider.id!}>
-                    {p.provider.name}
-                  </option>
-                ))}
-              </select>
+                options={[
+                  { value: "", label: "（未选择）" },
+                  ...providers.map((p) => ({
+                    value: String(p.provider.id),
+                    label: p.provider.name,
+                  })),
+                ]}
+              />
             </div>
-            <div>
-              <div className="mb-1.5 text-[11px] font-medium tracking-wide text-tertiary">
-                绘图模型
-              </div>
-              <select
+
+            <div className="flex flex-col gap-1.5">
+              <span className="text-caption text-tertiary">绘图模型</span>
+              <Select
+                label="绘图模型"
                 value={defaultItem?.provider.defaultModel ?? ""}
-                onChange={(e) => {
+                placeholder="（未选择）"
+                disabled={!defaultItem || models.length === 0}
+                onValueChange={(v) => {
                   if (!defaultItem) return;
                   saveProvider({
                     ...defaultItem.provider,
-                    defaultModel: e.target.value,
+                    defaultModel: v,
                   }).catch((err) =>
                     toast(`保存默认模型失败：${String(err)}`, "error"),
                   );
                 }}
-                className="w-full rounded-[10px] border border-theme bg-transparent px-2.5 py-[7px] text-[13px] outline-none transition-colors focus:border-accent"
-              >
-                <option value="">（未选择）</option>
-                {models.map((m) => (
-                  <option key={m} value={m}>
-                    {m}
-                  </option>
-                ))}
-              </select>
+                options={[
+                  { value: "", label: "（未选择）" },
+                  ...models.map((m) => ({ value: m, label: m })),
+                ]}
+              />
             </div>
 
-            {/* iOS 开关组样式 */}
-            <div className="rounded-[var(--radius-card)] border border-theme bg-elevated p-3.5">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2.5">
-                  <span className="text-accent">
-                    <IconBrain size={17} />
+            {/* 思考模型：内容层材质（不透明卡片），不是玻璃 */}
+            <div className="rounded-card border border-line bg-elevated p-3">
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex min-w-0 items-start gap-2">
+                  <span className="mt-0.5 shrink-0 text-accent">
+                    <IconBrain size={16} />
                   </span>
-                  <div>
-                    <div className="text-[13px] font-medium text-primary">
+                  <div className="min-w-0">
+                    <div className="text-callout font-medium text-primary">
                       思考模型
                     </div>
-                    <div className="mt-0.5 text-[11px] leading-snug text-tertiary">
+                    <div className="mt-0.5 text-footnote text-tertiary">
                       {thinking?.enabled
                         ? `已启用 · ${thinking.model || "未选模型"}`
                         : "生成前理解意图"}
                     </div>
                   </div>
                 </div>
-                <button
-                  onClick={toggleThinking}
-                  className={`relative h-[26px] w-[44px] rounded-full transition-colors duration-200 ${
-                    thinking?.enabled ? "bg-success" : "bg-sunken"
-                  }`}
-                >
-                  <span
-                    className={`absolute top-[2px] h-[22px] w-[22px] rounded-full bg-white shadow transition-all duration-200 ease-out ${
-                      thinking?.enabled ? "left-[20px]" : "left-[2px]"
-                    }`}
-                  />
-                </button>
+                <Switch
+                  checked={Boolean(thinking?.enabled)}
+                  onCheckedChange={() => void toggleThinking()}
+                  label="启用思考模型"
+                />
               </div>
-              <button
+              <Button
+                size="sm"
+                block
+                className="mt-3"
                 onClick={() => setView("settings")}
-                className="pressable mt-3 w-full rounded-[10px] border border-theme py-[7px] text-[12px] text-secondary transition-colors hover:bg-hover"
               >
                 配置思考模型…
-              </button>
+              </Button>
             </div>
           </>
-        ) : (
-          <div className="flex flex-col items-center gap-5 pt-2 text-tertiary">
-            <IconPalette size={17} />
-            <IconBrain size={17} />
-          </div>
         )}
       </div>
-    </motion.aside>
+    </aside>
   );
 }

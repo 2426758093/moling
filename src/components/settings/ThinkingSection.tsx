@@ -1,7 +1,12 @@
 import { useEffect, useState } from "react";
 import { api, parseAdapterError, ThinkingConfig } from "../../lib/api";
 import { useProviderStore } from "../../stores/providerStore";
-import { inputCls } from "./ui";
+import { Button } from "../ui/Button";
+import { Input } from "../ui/Field";
+import { Row, Section } from "../ui/List";
+import { Select } from "../ui/Select";
+import { SegmentedControl } from "../ui/SegmentedControl";
+import { Switch } from "../ui/Switch";
 
 export default function ThinkingSection() {
   const [config, setConfig] = useState<ThinkingConfig | null>(null);
@@ -16,6 +21,7 @@ export default function ThinkingSection() {
       .catch(() => undefined);
   }, []);
 
+  // 弹层类设置项没有可见 label 时用 aria-label 兜底
   if (!config) return null;
 
   const save = async (patch: Partial<ThinkingConfig>) => {
@@ -39,151 +45,126 @@ export default function ThinkingSection() {
   };
 
   return (
-    <section>
-      <h2 className="mb-4 text-lg font-semibold">思考模型</h2>
-      <div className="space-y-3 rounded-[var(--radius-card)] border border-theme p-4">
-        <div className="flex items-center justify-between text-sm">
-          <div>
-            <div className="text-primary">启用思考模型</div>
-            <div className="mt-0.5 text-xs text-tertiary">
-              生成前先用大模型理解意图、扩写提示词
-            </div>
-          </div>
-          <button
-            onClick={() => save({ enabled: !config.enabled })}
-            className={`relative h-5 w-9 rounded-full transition-colors duration-200 ${
-              config.enabled ? "bg-success" : "bg-sunken"
-            }`}
-          >
-            <span
-              className={`absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-all duration-200 ${
-                config.enabled ? "left-[18px]" : "left-0.5"
-              }`}
+    <Section
+      title="思考模型"
+      description="生成前先用大模型理解意图、扩写提示词"
+    >
+      <Row label="启用思考模型">
+        <Switch
+          checked={config.enabled}
+          onCheckedChange={(v) => void save({ enabled: v })}
+          label="启用思考模型"
+        />
+      </Row>
+
+      {config.enabled && (
+        <>
+          <Row label="接入方式">
+            <SegmentedControl
+              value={config.mode}
+              onValueChange={(v) => void save({ mode: v })}
+              label="接入方式"
+              size="sm"
+              options={[
+                { value: "reuse", label: "复用绘图服务商" },
+                { value: "standalone", label: "独立配置" },
+              ]}
             />
-          </button>
-        </div>
+          </Row>
 
-        {config.enabled && (
-          <>
-            <div className="flex gap-2 text-xs">
-              {(
-                [
-                  { id: "reuse", label: "复用绘图服务商" },
-                  { id: "standalone", label: "独立配置" },
-                ] as const
-              ).map((m) => (
-                <button
-                  key={m.id}
-                  onClick={() => save({ mode: m.id })}
-                  className={`rounded-full border px-3 py-1 transition-colors ${
-                    config.mode === m.id
-                      ? "border-accent bg-accent-soft"
-                      : "border-theme text-secondary"
-                  }`}
-                >
-                  {m.label}
-                </button>
-              ))}
-            </div>
-
-            {config.mode === "reuse" ? (
-              <div className="grid grid-cols-2 gap-3">
-                <div>
-                  <div className="mb-1 text-xs text-secondary">服务商</div>
-                  <select
-                    value={config.providerId ?? ""}
-                    onChange={(e) =>
-                      save({
-                        providerId:
-                          e.target.value === "" ? null : Number(e.target.value),
-                      })
-                    }
-                    className={inputCls}
-                  >
-                    <option value="">（未选择）</option>
-                    {providers.map((p) => (
-                      <option key={p.provider.id} value={p.provider.id!}>
-                        {p.provider.name}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-                <div>
-                  <div className="mb-1 text-xs text-secondary">模型</div>
-                  <input
-                    className={inputCls}
-                    value={config.model}
-                    onChange={(e) =>
-                      setConfig({ ...config, model: e.target.value })
-                    }
-                    onBlur={() => save({ model: config.model })}
-                    placeholder="如 gpt-4o-mini / deepseek-chat"
-                  />
-                </div>
-              </div>
-            ) : (
-              <div className="space-y-3">
-                <div className="grid grid-cols-2 gap-3">
-                  <div>
-                    <div className="mb-1 text-xs text-secondary">API 地址</div>
-                    <input
-                      className={inputCls}
-                      value={config.baseUrl}
-                      onChange={(e) =>
-                        setConfig({ ...config, baseUrl: e.target.value })
-                      }
-                      onBlur={() => save({ baseUrl: config.baseUrl })}
-                      placeholder="https://api.example.com/v1"
-                    />
-                  </div>
-                  <div>
-                    <div className="mb-1 text-xs text-secondary">模型</div>
-                    <input
-                      className={inputCls}
-                      value={config.model}
-                      onChange={(e) =>
-                        setConfig({ ...config, model: e.target.value })
-                      }
-                      onBlur={() => save({ model: config.model })}
-                      placeholder="如 gpt-4o-mini"
-                    />
-                  </div>
-                </div>
-                <div>
-                  <div className="mb-1 text-xs text-secondary">
-                    API Key
-                    {config.apiKeyMasked && (
-                      <span className="ml-2 text-tertiary">
-                        已保存 {config.apiKeyMasked}（留空则不变）
-                      </span>
-                    )}
-                  </div>
-                  <input
-                    className={inputCls}
-                    type="password"
-                    value={apiKey}
-                    onChange={(e) => setApiKey(e.target.value)}
-                    onBlur={() => apiKey && save({})}
-                    placeholder="sk-..."
-                  />
-                </div>
-              </div>
-            )}
-
-            <div className="flex items-center gap-3">
-              <button
-                onClick={doTest}
-                className="rounded-[8px] border border-theme px-3 py-1 text-xs"
+          {config.mode === "reuse" ? (
+            <>
+              <Row label="服务商" hint="沿用绘图服务商的地址与 Key">
+                <Select
+                  value={config.providerId ? String(config.providerId) : "none"}
+                  onValueChange={(v) =>
+                    void save({ providerId: v === "none" ? null : Number(v) })
+                  }
+                  options={[
+                    { value: "none", label: "（未选择）" },
+                    ...providers.map((p) => ({
+                      value: String(p.provider.id),
+                      label: p.provider.name,
+                    })),
+                  ]}
+                  label="思考模型服务商"
+                  widthClass="w-48"
+                />
+              </Row>
+              <Row label="模型">
+                <Input
+                  value={config.model}
+                  onChange={(e) =>
+                    setConfig({ ...config, model: e.target.value })
+                  }
+                  onBlur={() => void save({ model: config.model })}
+                  placeholder="如 gpt-4o-mini / deepseek-chat"
+                  aria-label="思考模型名称"
+                  widthClass="w-56"
+                />
+              </Row>
+            </>
+          ) : (
+            <>
+              <Row label="API 地址">
+                <Input
+                  value={config.baseUrl}
+                  onChange={(e) =>
+                    setConfig({ ...config, baseUrl: e.target.value })
+                  }
+                  onBlur={() => void save({ baseUrl: config.baseUrl })}
+                  placeholder="https://api.example.com/v1"
+                  aria-label="思考模型 API 地址"
+                  widthClass="w-64"
+                />
+              </Row>
+              <Row label="模型">
+                <Input
+                  value={config.model}
+                  onChange={(e) =>
+                    setConfig({ ...config, model: e.target.value })
+                  }
+                  onBlur={() => void save({ model: config.model })}
+                  placeholder="如 gpt-4o-mini"
+                  aria-label="思考模型名称"
+                  widthClass="w-56"
+                />
+              </Row>
+              <Row
+                label="API Key"
+                hint={
+                  config.apiKeyMasked
+                    ? `已保存 ${config.apiKeyMasked}（留空则不变）`
+                    : "仅保存在本机，不明文回填"
+                }
               >
-                测试连接
-              </button>
-              {status && (
-                <span className="text-xs text-tertiary">{status}</span>
-              )}
-            </div>
-          </>
-        )}
-      </div>
-    </section>
+                <Input
+                  type="password"
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  onBlur={() => {
+                    if (apiKey) void save({});
+                  }}
+                  placeholder="sk-..."
+                  aria-label="思考模型 API Key"
+                  widthClass="w-56"
+                />
+              </Row>
+            </>
+          )}
+
+          <Row label="连接测试">
+            <Button size="sm" loading={status === "测试中…"} onClick={doTest}>
+              测试连接
+            </Button>
+            {status && status !== "测试中…" && (
+              <span className="max-w-xs text-footnote text-tertiary">
+                {status}
+              </span>
+            )}
+          </Row>
+        </>
+      )}
+    </Section>
   );
 }

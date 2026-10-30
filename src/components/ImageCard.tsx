@@ -6,9 +6,11 @@ import { useAppStore } from "../stores/appStore";
 import { useProviderStore } from "../stores/providerStore";
 import { api } from "../lib/api";
 import { extOf } from "../lib/image";
+import { useModelCaps } from "../lib/useModelCaps";
+import { DUR, EASE } from "../lib/motion";
 import { toast } from "../lib/notify";
 import ImageViewer, { ViewerImage } from "./ImageViewer";
-import ContextMenu, { MenuItem } from "./ContextMenu";
+import { ContextMenu, DropdownMenu, MenuItem } from "./ui/Menu";
 import SafeImg from "./SafeImg";
 import {
   IconDownload,
@@ -17,8 +19,11 @@ import {
   IconBrush,
   IconEraser,
   IconExpand,
+  IconSparkle,
   IconTrash,
   IconChevron,
+  IconCrop,
+  IconPalette,
 } from "./Icons";
 
 export default function ImageCard({
@@ -36,15 +41,32 @@ export default function ImageCard({
   const addDataUrlAttachment = useChatStore((s) => s.addDataUrlAttachment);
   const openEditor = useAppStore((s) => s.openEditor);
   const openOutpaint = useAppStore((s) => s.openOutpaint);
-  // 模板适配器没有编辑端点：隐藏入口，避免用户点进去才收到「暂不支持」
-  const isTemplateProvider = useProviderStore((s) => {
+  const openTransform = useAppStore((s) => s.openTransform);
+  const openBasicEdit = useAppStore((s) => s.openBasicEdit);
+  const openBackground = useAppStore((s) => s.openBackground);
+  const expert = useAppStore((s) => s.mode) === "expert";
+  // 模板服务商只有在配置了编辑模板后才有编辑端点；否则隐藏入口，
+  // 避免用户点进去才收到「未配置编辑模板」
+  const caps = useModelCaps();
+  const editUnsupported = useProviderStore((s) => {
     const current = s.providers.find(
       (p) => p.provider.id === s.defaultProviderId,
     );
-    return current?.provider.kind === "template";
+    return (
+      current?.provider.kind === "template" &&
+      current.provider.editTemplateUrl.trim() === ""
+    );
+  });
+  const transformUnsupported = useProviderStore((s) => {
+    const current = s.providers.find(
+      (p) => p.provider.id === s.defaultProviderId,
+    );
+    return (
+      current?.provider.kind === "template" &&
+      current.provider.transformTemplateUrl.trim() === ""
+    );
   });
   const [viewerIndex, setViewerIndex] = useState<number | null>(null);
-  const [menuPos, setMenuPos] = useState<{ x: number; y: number } | null>(null);
   const [copied, setCopied] = useState(false);
   const copiedTimer = useRef<number | null>(null);
 
@@ -108,44 +130,94 @@ export default function ImageCard({
     prompt,
   };
 
-  const editItems: MenuItem[] = isTemplateProvider
-    ? []
-    : [
-        {
-          label: "局部重绘",
-          icon: <IconBrush size={14} />,
-          onClick: () => openEditor({ ...baseTarget, mode: "inpaint" }),
-        },
-        {
-          label: "AI 消除",
-          icon: <IconEraser size={14} />,
-          onClick: () => openEditor({ ...baseTarget, mode: "erase" }),
-        },
-        {
-          label: "扩图",
-          icon: <IconExpand size={14} />,
-          onClick: () => openOutpaint(baseTarget),
-        },
-      ];
+  const editItems: MenuItem[] =
+    editUnsupported || !caps.edit
+      ? []
+      : [
+          {
+            id: "inpaint",
+            label: "局部重绘",
+            icon: <IconBrush size={14} />,
+            onSelect: () => openEditor({ ...baseTarget, mode: "inpaint" }),
+          },
+          {
+            id: "erase",
+            label: "AI 消除",
+            icon: <IconEraser size={14} />,
+            onSelect: () => openEditor({ ...baseTarget, mode: "erase" }),
+          },
+          {
+            id: "outpaint",
+            label: "扩图",
+            icon: <IconExpand size={14} />,
+            onSelect: () => openOutpaint(baseTarget),
+          },
+        ];
+
+  // 放大 / 风格转换：服务商有变换端点（模板未配置时隐藏），且模型能力允许
+  const transformItems: MenuItem[] =
+    transformUnsupported || !caps.transform
+      ? []
+      : [
+          {
+            id: "upscale",
+            label: "高清放大",
+            icon: <IconExpand size={14} />,
+            onSelect: () => openTransform({ ...baseTarget, kind: "upscale" }),
+          },
+          {
+            id: "style",
+            label: "风格转换",
+            icon: <IconSparkle size={14} />,
+            onSelect: () => openTransform({ ...baseTarget, kind: "style" }),
+          },
+        ];
 
   const menuItems: MenuItem[] = [
     {
+      id: "copy",
       label: copied ? "已复制提示词" : "复制提示词",
       icon: <IconCopy size={14} />,
-      onClick: copyPrompt,
+      onSelect: copyPrompt,
     },
     {
+      id: "reference",
       label: "引用为参考图",
       icon: <IconQuote size={14} />,
-      onClick: reference,
+      onSelect: reference,
     },
     ...editItems,
-    { label: "下载", icon: <IconDownload size={14} />, onClick: download },
+    // 换背景属于进阶功能：简单模式下不展示
+    ...(expert
+      ? [
+          {
+            id: "background",
+            label: "换背景",
+            icon: <IconPalette size={14} />,
+            onSelect: () => openBackground(baseTarget),
+          },
+        ]
+      : []),
     {
+      id: "basic-edit",
+      label: "基础编辑",
+      icon: <IconCrop size={14} />,
+      onSelect: () => openBasicEdit(baseTarget),
+    },
+    ...transformItems,
+    {
+      id: "download",
+      label: "下载",
+      icon: <IconDownload size={14} />,
+      separatorBefore: true,
+      onSelect: download,
+    },
+    {
+      id: "delete",
       label: "删除",
       icon: <IconTrash size={14} />,
       danger: true,
-      onClick: removeImage,
+      onSelect: removeImage,
     },
   ];
 
@@ -159,66 +231,55 @@ export default function ImageCard({
 
   return (
     <>
-      <motion.div
-        layout
-        initial={{ opacity: 0, scale: 0.95 }}
-        animate={{ opacity: 1, scale: 1 }}
-        transition={{ duration: 0.24, ease: [0.25, 0.1, 0.25, 1] }}
-        role="button"
-        tabIndex={0}
-        aria-label={`查看大图：${prompt}`}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            openViewer();
-          }
-        }}
-        className="group relative cursor-zoom-in overflow-hidden rounded-[var(--radius-card)] shadow-card"
-        onClick={openViewer}
-        onContextMenu={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          setMenuPos({ x: e.clientX, y: e.clientY });
-        }}
-      >
-        <SafeImg
-          src={image.dataUrl}
-          alt={prompt}
-          className="block w-full object-cover transition-transform duration-300 ease-out group-hover:scale-[1.02]"
-        />
-        <div className="absolute inset-0 flex items-end justify-between bg-gradient-to-t from-black/50 via-black/0 to-black/0 p-2 opacity-0 transition-opacity duration-200 group-hover:opacity-100">
+      <ContextMenu items={menuItems}>
+        <motion.div
+          layout
+          initial={{ opacity: 0, scale: 0.97 }}
+          animate={{ opacity: 1, scale: 1 }}
+          transition={{ duration: DUR.base, ease: EASE.ios }}
+          className="group relative overflow-hidden rounded-card shadow-card"
+        >
+          {/* 查看大图是可聚焦按钮，操作条是它的兄弟节点 —— 不再嵌套可交互元素 */}
           <button
-            onClick={(e) => {
-              e.stopPropagation();
-              download();
-            }}
-            className="pressable flex items-center gap-1 rounded-full bg-white/20 px-2.5 py-1 text-[11px] text-white backdrop-blur-md transition-colors duration-150 hover:bg-white/35"
+            type="button"
+            onClick={openViewer}
+            aria-label={`查看大图：${prompt}`}
+            className="block w-full cursor-zoom-in"
           >
-            <IconDownload size={12} />
-            下载
+            <SafeImg
+              src={image.dataUrl}
+              alt={prompt}
+              className="block w-full object-cover transition-transform duration-300 ease-ios group-hover:scale-[1.015]"
+            />
           </button>
-          <button
-            title="更多操作"
-            aria-label="更多操作"
-            onClick={(e) => {
-              e.stopPropagation();
-              const rect = e.currentTarget.getBoundingClientRect();
-              setMenuPos({ x: rect.right - 192, y: rect.bottom + 4 });
-            }}
-            className="pressable rounded-full bg-white/20 p-1.5 text-white backdrop-blur-md transition-colors duration-150 hover:bg-white/35"
-          >
-            <IconChevron direction="down" size={13} />
-          </button>
-        </div>
-      </motion.div>
-      {menuPos && (
-        <ContextMenu
-          x={menuPos.x}
-          y={menuPos.y}
-          items={menuItems}
-          onClose={() => setMenuPos(null)}
-        />
-      )}
+          {image.derivedFrom !== undefined && (
+            <span className="glass-media pointer-events-none absolute left-2 top-2 rounded-pill px-2 py-0.5 text-caption text-on-accent">
+              派生自 #{image.derivedFrom}
+            </span>
+          )}
+          <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center justify-between gap-2 p-2 opacity-0 transition-opacity duration-200 group-focus-within:opacity-100 group-hover:opacity-100">
+            <div className="glass-media pointer-events-auto flex items-center gap-0.5 rounded-pill p-0.5">
+              <button
+                type="button"
+                onClick={download}
+                className="pressable flex items-center gap-1 rounded-pill px-2.5 py-1 text-footnote text-on-accent transition-colors hover:bg-on-accent/15"
+              >
+                <IconDownload size={12} />
+                下载
+              </button>
+            </div>
+            <DropdownMenu items={menuItems} align="end">
+              <button
+                type="button"
+                aria-label="更多操作"
+                className="glass-media pressable pointer-events-auto flex h-7 w-7 items-center justify-center rounded-pill text-on-accent hover:bg-on-accent/15"
+              >
+                <IconChevron direction="down" size={13} />
+              </button>
+            </DropdownMenu>
+          </div>
+        </motion.div>
+      </ContextMenu>
       {viewerIndex !== null &&
         createPortal(
           <ImageViewer

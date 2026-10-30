@@ -2,8 +2,11 @@ import { useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useChatStore } from "../stores/chatStore";
+import { useScrollEdge } from "../hooks/useScrollEdge";
+import { DUR, EASE, VIEW_TRANSITION } from "../lib/motion";
 import MessageItem from "./MessageItem";
 import Composer from "./Composer";
+import PageHeader from "./PageHeader";
 import { IconSparkle } from "./Icons";
 
 const SUGGESTIONS = [
@@ -24,6 +27,7 @@ export default function ChatView() {
   const loadOlder = useChatStore((s) => s.loadOlder);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
+  useScrollEdge(scrollRef);
 
   const virtualizer = useVirtualizer({
     count: messages.length,
@@ -95,42 +99,41 @@ export default function ChatView() {
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-base">
-      {/* Large Title 导航栏（毛玻璃） */}
-      <header className="bg-glass z-10 flex h-[52px] shrink-0 items-end border-b border-theme px-6 pb-2">
-        <AnimatePresence mode="wait">
-          <motion.h1
-            key={title}
-            initial={{ opacity: 0, y: 6 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0, y: -6 }}
-            transition={{ duration: 0.18 }}
-            className="truncate text-[17px] font-semibold tracking-tight text-primary"
-          >
-            {title}
-          </motion.h1>
-        </AnimatePresence>
-      </header>
+      <PageHeader
+        title={
+          <AnimatePresence mode="wait">
+            <motion.span
+              key={title}
+              initial={{ opacity: 0, y: 4 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -4 }}
+              transition={{ duration: DUR.quick, ease: EASE.ios }}
+              className="block truncate"
+            >
+              {title}
+            </motion.span>
+          </AnimatePresence>
+        }
+      />
 
       <div
         ref={scrollRef}
         onScroll={handleScroll}
-        className="min-h-0 flex-1 overflow-y-auto"
+        className="scroll-edge min-h-0 flex-1 overflow-y-auto"
       >
         {empty ? (
           <div className="flex h-full flex-col items-center justify-center gap-10 px-6 pb-16">
             <motion.div
-              initial={{ opacity: 0, y: 20 }}
+              initial={{ opacity: 0, y: 16 }}
               animate={{ opacity: 1, y: 0 }}
-              transition={{ duration: 0.4, ease: [0.25, 0.1, 0.25, 1] }}
+              transition={VIEW_TRANSITION}
               className="text-center"
             >
-              <div className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-[20px] bg-accent-soft text-accent">
+              <div className="mx-auto mb-5 flex h-14 w-14 items-center justify-center rounded-panel bg-accent-soft text-accent">
                 <IconSparkle size={26} strokeWidth={1.4} />
               </div>
-              <h2 className="text-[26px] font-bold tracking-tight text-primary">
-                描述画面，即刻成图
-              </h2>
-              <p className="mt-2 text-[14px] text-tertiary">
+              <h2 className="text-display text-primary">描述画面，即刻成图</h2>
+              <p className="mt-2 text-callout text-tertiary">
                 像聊天一样描述想法，墨灵会思考、优化并绘制出来
               </p>
             </motion.div>
@@ -138,11 +141,11 @@ export default function ChatView() {
               {SUGGESTIONS.map((s, i) => (
                 <motion.button
                   key={s}
-                  initial={{ opacity: 0, y: 12 }}
+                  initial={{ opacity: 0, y: 10 }}
                   animate={{ opacity: 1, y: 0 }}
-                  transition={{ duration: 0.3, delay: 0.1 + i * 0.06 }}
+                  transition={{ ...VIEW_TRANSITION, delay: 0.08 + i * 0.05 }}
                   onClick={() => !sending && send(s)}
-                  className="pressable rounded-[var(--radius-card)] border border-theme bg-elevated px-4 py-3 text-left text-[13px] text-secondary shadow-card transition-colors duration-150 hover:text-primary"
+                  className="pressable rounded-card border border-line bg-elevated px-4 py-3 text-left text-callout text-secondary transition-colors duration-150 hover:bg-hover hover:text-primary"
                 >
                   {s}
                 </motion.button>
@@ -153,7 +156,7 @@ export default function ChatView() {
           <div className="mx-auto max-w-2xl px-5 py-6">
             {(hasMore || loadingOlder) && (
               <div
-                className="mb-3 text-center text-[12px] text-tertiary"
+                className="mb-3 text-center text-footnote text-tertiary"
                 role="status"
                 aria-live="polite"
               >

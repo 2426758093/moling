@@ -1,47 +1,69 @@
 import { useEffect } from "react";
-import { AnimatePresence, motion } from "framer-motion";
+import {
+  AnimatePresence,
+  MotionConfig,
+  motion,
+  useReducedMotion,
+} from "framer-motion";
 import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
 import GalleryView from "./components/GalleryView";
+import CanvasView from "./components/CanvasView";
 import QueueView from "./components/QueueView";
 import SettingsView from "./components/SettingsView";
 import SettingsRail from "./components/SettingsRail";
 import EditorView from "./components/EditorView";
 import OutpaintView from "./components/OutpaintView";
+import TransformDialog from "./components/TransformDialog";
+import BasicEditView from "./components/BasicEditView";
+import BackgroundView from "./components/BackgroundView";
+import { TooltipProvider } from "./components/ui/Tooltip";
 import { useAppStore } from "./stores/appStore";
 import { useChatStore } from "./stores/chatStore";
 import { useProviderStore } from "./stores/providerStore";
 import { useQueueStore } from "./stores/queueStore";
 import { api } from "./lib/api";
 import { validateImageFile } from "./lib/file";
-import { applyThemeClass } from "./lib/theme";
-import { MAX_REFERENCE_IMAGES } from "./lib/image";
+import { applyGlassAppearance, applyThemeClass } from "./lib/theme";
+import { maxReferenceImages } from "./lib/useModelCaps";
+import { DUR, EASE } from "./lib/motion";
 import { toast } from "./lib/notify";
 
-function useApplyTheme() {
+function useApplyAppearance() {
   const theme = useAppStore((s) => s.theme);
+  const glass = useAppStore((s) => s.glass);
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
-    const apply = () => applyThemeClass(theme);
+    const apply = () => {
+      applyThemeClass(theme);
+      applyGlassAppearance(glass);
+    };
     apply();
     media.addEventListener("change", apply);
     return () => media.removeEventListener("change", apply);
-  }, [theme]);
+  }, [theme, glass]);
 }
 
-const VIEW_VARIANTS = {
-  initial: { opacity: 0, y: 10 },
-  animate: { opacity: 1, y: 0 },
-  exit: { opacity: 0, y: -10 },
-};
-
-export default function App() {
-  useApplyTheme();
+function AppShell() {
+  useApplyAppearance();
   const view = useAppStore((s) => s.view);
   const editTarget = useAppStore((s) => s.editTarget);
   const outpaintTarget = useAppStore((s) => s.outpaintTarget);
+  const basicEditTarget = useAppStore((s) => s.basicEditTarget);
+  const backgroundTarget = useAppStore((s) => s.backgroundTarget);
   const addFileAttachment = useChatStore((s) => s.addFileAttachment);
   const setView = useAppStore((s) => s.setView);
+  const reduce = useReducedMotion();
+
+  // 减少动态：位移与淡入都必须停 —— framer-motion 的 reducedMotion="user" 只关
+  // 位移不关透明度，所以这里显式分支，实际效果才和"减少动态"的承诺一致。
+  const viewVariants = reduce
+    ? { initial: { opacity: 1 }, animate: { opacity: 1 }, exit: { opacity: 1 } }
+    : {
+        initial: { opacity: 0, y: 8 },
+        animate: { opacity: 1, y: 0 },
+        exit: { opacity: 0, y: -8 },
+      };
 
   useEffect(() => {
     useProviderStore
@@ -90,17 +112,14 @@ export default function App() {
         if (files.length === 0) return;
         e.preventDefault();
         void (async () => {
-          const remaining =
-            MAX_REFERENCE_IMAGES - useChatStore.getState().attachments.length;
+          const limit = maxReferenceImages();
+          const remaining = limit - useChatStore.getState().attachments.length;
           if (remaining <= 0) {
-            toast(`最多添加 ${MAX_REFERENCE_IMAGES} 张参考图`, "error");
+            toast(`最多添加 ${limit} 张参考图`, "error");
             return;
           }
           if (files.length > remaining) {
-            toast(
-              `最多添加 ${MAX_REFERENCE_IMAGES} 张参考图，已忽略多余文件`,
-              "error",
-            );
+            toast(`最多添加 ${limit} 张参考图，已忽略多余文件`, "error");
           }
           for (const file of files.slice(0, remaining)) {
             const invalid = await validateImageFile(file);
@@ -119,17 +138,19 @@ export default function App() {
         <AnimatePresence mode="wait">
           <motion.div
             key={view}
-            variants={VIEW_VARIANTS}
+            variants={viewVariants}
             initial="initial"
             animate="animate"
             exit="exit"
-            transition={{ duration: 0.18 }}
+            transition={{ duration: reduce ? 0 : DUR.slow, ease: EASE.ios }}
             className="flex min-h-0 flex-1 flex-col"
           >
             {view === "chat" ? (
               <ChatView />
             ) : view === "gallery" ? (
               <GalleryView />
+            ) : view === "canvas" ? (
+              <CanvasView />
             ) : view === "queue" ? (
               <QueueView />
             ) : (
@@ -141,6 +162,21 @@ export default function App() {
       <SettingsRail />
       <AnimatePresence>{editTarget && <EditorView />}</AnimatePresence>
       <AnimatePresence>{outpaintTarget && <OutpaintView />}</AnimatePresence>
+      <AnimatePresence>{basicEditTarget && <BasicEditView />}</AnimatePresence>
+      <AnimatePresence>
+        {backgroundTarget && <BackgroundView />}
+      </AnimatePresence>
+      <TransformDialog />
     </div>
+  );
+}
+
+export default function App() {
+  return (
+    <MotionConfig reducedMotion="user">
+      <TooltipProvider delayDuration={500} skipDelayDuration={300}>
+        <AppShell />
+      </TooltipProvider>
+    </MotionConfig>
   );
 }

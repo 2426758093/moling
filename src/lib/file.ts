@@ -8,6 +8,16 @@ export function readFileAsDataUrl(file: File): Promise<string> {
   });
 }
 
+/** 读取 JSON / 文本文件（收藏与预设的导入入口） */
+export function readFileAsText(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsText(file);
+  });
+}
+
 // 附件本地 ID：时间戳 + 随机后缀，保证同一毫秒内不冲突。
 export function genAttachmentId(): string {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -58,6 +68,25 @@ function blobToDataUrl(blob: Blob): Promise<string> {
     reader.onerror = () => reject(reader.error);
     reader.readAsDataURL(blob);
   });
+}
+
+/**
+ * 像素级命令（放大 / 风格 / 基础编辑）只接受栅格图：
+ * SVG 等矢量来源先用 canvas 栅格化为 PNG，否则 Rust 侧 load_from_memory 会失败。
+ * 走 <img> 而不是 createImageBitmap —— Chromium 不支持对 SVG blob 做 createImageBitmap。
+ */
+export async function ensureRasterDataUrl(dataUrl: string): Promise<string> {
+  if (dataUrlMime(dataUrl) !== "image/svg+xml") return dataUrl;
+  const img = new Image();
+  img.src = dataUrl;
+  await img.decode();
+  const canvas = document.createElement("canvas");
+  canvas.width = img.naturalWidth;
+  canvas.height = img.naturalHeight;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) throw new Error("canvas 2d 上下文不可用");
+  ctx.drawImage(img, 0, 0);
+  return canvas.toDataURL("image/png");
 }
 
 /** 文件入口：读成 dataUrl 后按同样规则压缩 */

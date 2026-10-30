@@ -178,3 +178,45 @@ export const IconQuote = (p: IconProps) => (
     <path d="M10 8c-3 0-5 2-5 5v3h5v-5H7.5C7.5 9.6 8.6 8.5 10 8.5ZM19 8c-3 0-5 2-5 5v3h5v-5h-2.5c0-1.4 1.1-2.5 2.5-2.5Z" />
   </svg>
 );
+
+export const IconCrop = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M6 2v14a2 2 0 0 0 2 2h14" />
+    <path d="M2 6h14a2 2 0 0 1 2 2v14" />
+  </svg>
+);
+
+export const IconRotate = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M21 12a9 9 0 1 1-3.2-6.9" />
+    <path d="M21 3v6h-6" />
+  </svg>
+);
+
+export const IconFlip = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M12 3v18" />
+    <path d="M8 7 4 12l4 5V7ZM16 7l4 5-4 5V7Z" />
+  </svg>
+);
+
+export const IconCanvas = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="3" y="4" width="7" height="7" rx="1.5" />
+    <rect x="14" y="13" width="7" height="7" rx="1.5" />
+    <path d="M10 7.5h3.5a3.5 3.5 0 0 1 3.5 3.5v2" />
+  </svg>
+);
+
+export const IconLink = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1.2 1.2" />
+    <path d="M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1.2-1.2" />
+  </svg>
+);
+
+export const IconMinus = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M5 12h14" />
+  </svg>
+);

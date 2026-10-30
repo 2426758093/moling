@@ -1,10 +1,15 @@
 import { useEffect, useRef, useState } from "react";
-import { motion } from "framer-motion";
+import { motion, useReducedMotion } from "framer-motion";
 import { useAppStore } from "../stores/appStore";
 import { useChatStore } from "../stores/chatStore";
 import { useProviderStore } from "../stores/providerStore";
 import { api, parseAdapterError, adapterErrorTitle } from "../lib/api";
 import { toast } from "../lib/notify";
+import { DUR, EASE } from "../lib/motion";
+import { Button } from "./ui/Button";
+import { IconButton } from "./ui/IconButton";
+import { Input } from "./ui/Field";
+import { SegmentedControl } from "./ui/SegmentedControl";
 import { IconClose } from "./Icons";
 import SafeImg from "./SafeImg";
 
@@ -18,11 +23,18 @@ interface Offsets {
 }
 
 const PRESETS = [
-  { id: "free", label: "自由" },
-  { id: "16:9", label: "16:9" },
-  { id: "9:16", label: "9:16" },
-  { id: "1:1", label: "1:1" },
+  { value: "free", label: "自由" },
+  { value: "16:9", label: "16:9" },
+  { value: "9:16", label: "9:16" },
+  { value: "1:1", label: "1:1" },
 ];
+
+const SIDE_LABEL: Record<Side, string> = {
+  top: "上",
+  right: "右",
+  bottom: "下",
+  left: "左",
+};
 
 export default function OutpaintView() {
   const target = useAppStore((s) => s.outpaintTarget);
@@ -45,6 +57,7 @@ export default function OutpaintView() {
   const [error, setError] = useState<string | null>(null);
   const dragSide = useRef<Side | null>(null);
   const dragStart = useRef({ x: 0, y: 0, offsets: offsets });
+  const reduce = useReducedMotion();
 
   useEffect(() => {
     if (!target) return;
@@ -68,6 +81,14 @@ export default function OutpaintView() {
     });
     setOffsets({ top: 0, right: 0, bottom: 0, left: 0 });
   }, [image]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") closeOutpaint();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [closeOutpaint]);
 
   if (!target) return null;
 
@@ -201,6 +222,8 @@ export default function OutpaintView() {
         maskB64: null,
         width: tw,
         height: th,
+        op: "outpaint",
+        parentId: target.historyId,
       });
       const displayPrompt = `（扩图 ${tw}×${th}）`;
       await useChatStore.getState().appendImageMessage(
@@ -208,6 +231,7 @@ export default function OutpaintView() {
           historyId: out.historyId,
           dataUrl: out.dataUrl,
           path: out.filePath,
+          derivedFrom: target.historyId,
         },
         displayPrompt,
       );
@@ -261,60 +285,65 @@ export default function OutpaintView() {
 
   return (
     <motion.div
-      initial={{ opacity: 0 }}
+      initial={reduce ? false : { opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
-      transition={{ duration: 0.2 }}
+      transition={{ duration: reduce ? 0 : DUR.base, ease: EASE.ios }}
       className="fixed inset-0 z-40 flex flex-col bg-base"
     >
-      <div className="bg-glass flex h-[52px] shrink-0 items-center gap-3 border-b border-theme px-4">
-        <span className="text-sm font-medium text-primary">扩图</span>
-        <span className="text-xs text-tertiary">
-          向外拖动手柄扩展画面，AI 补全内容
-        </span>
-        <div className="ml-auto flex items-center gap-2">
-          <button
-            onClick={submit}
-            disabled={busy || !changed}
-            className="pressable rounded-[10px] bg-accent px-4 py-1.5 text-sm font-medium text-white transition-opacity disabled:opacity-40"
-          >
-            {busy ? "扩图中…" : "生成扩图"}
-          </button>
-          <button
-            onClick={closeOutpaint}
-            title="关闭"
-            className="pressable rounded-[10px] border border-theme p-2 text-secondary transition-colors hover:bg-hover"
-          >
-            <IconClose size={14} />
-          </button>
+      <header className="relative z-10 shrink-0 glass">
+        <div className="flex min-h-12 items-center gap-3 px-6 py-2">
+          <div className="flex min-w-0 flex-col">
+            <h1 className="truncate text-title3 text-primary">扩图</h1>
+            <p className="truncate text-footnote text-tertiary">
+              向外拖动手柄扩展画面，AI 补全内容
+            </p>
+          </div>
+          <div className="ml-auto flex shrink-0 items-center gap-2">
+            <Button
+              variant="primary"
+              size="sm"
+              loading={busy}
+              disabled={!changed}
+              onClick={() => void submit()}
+            >
+              生成扩图
+            </Button>
+            <IconButton
+              label="关闭扩图"
+              icon={<IconClose size={16} />}
+              onClick={closeOutpaint}
+            />
+          </div>
         </div>
-      </div>
 
-      <div className="bg-glass flex shrink-0 flex-wrap items-center gap-2 border-b border-theme px-4 py-2">
-        <span className="text-xs text-tertiary">目标比例</span>
-        {PRESETS.map((p) => (
-          <button
-            key={p.id}
-            onClick={() => applyPreset(p.id)}
-            className={`pressable rounded-[8px] border px-2.5 py-1 text-xs transition-colors ${
-              preset === p.id
-                ? "border-accent bg-accent-soft text-accent"
-                : "border-theme text-tertiary hover:text-secondary"
-            }`}
-          >
-            {p.label}
-          </button>
-        ))}
-        <span className="text-xs tabular-nums text-tertiary">
-          {targetW} × {targetH}
-        </span>
-        <input
-          value={prompt}
-          onChange={(e) => setPrompt(e.target.value)}
-          placeholder="补充描述（可选）：如“延伸出海面与晚霞”"
-          className="min-w-0 flex-1 rounded-lg border border-theme bg-transparent px-3 py-1.5 text-sm outline-none transition-colors focus:border-accent"
-        />
-      </div>
+        <div
+          role="toolbar"
+          aria-label="扩图工具"
+          className="flex flex-wrap items-center gap-3 px-6 pb-2.5"
+        >
+          <span className="text-footnote text-tertiary">目标比例</span>
+          <SegmentedControl
+            value={preset}
+            onValueChange={applyPreset}
+            options={PRESETS}
+            label="目标比例"
+            size="sm"
+          />
+          <span className="text-footnote tabular-nums text-tertiary">
+            {targetW} × {targetH}
+          </span>
+          <div className="min-w-0 flex-1">
+            <Input
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              placeholder="补充描述（可选）：如“延伸出海面与晚霞”"
+              aria-label="补全描述"
+              compact
+            />
+          </div>
+        </div>
+      </header>
 
       <div
         ref={containerRef}
@@ -327,7 +356,7 @@ export default function OutpaintView() {
             {/* 目标区域虚线框 */}
             {changed && (
               <div
-                className="pointer-events-none absolute rounded-lg border-2 border-dashed border-accent/60"
+                className="pointer-events-none absolute rounded-card border-2 border-dashed border-accent/60"
                 style={{
                   top: -offsets.top,
                   left: -offsets.left,
@@ -337,7 +366,7 @@ export default function OutpaintView() {
               />
             )}
             <div
-              className="relative overflow-hidden rounded-lg shadow-pop"
+              className="relative overflow-hidden rounded-card shadow-pop"
               style={{ width: display.w, height: display.h }}
             >
               <SafeImg
@@ -351,8 +380,15 @@ export default function OutpaintView() {
                 key={h.side}
                 style={h.style}
                 role="slider"
-                aria-label={`向${h.side === "left" ? "左" : h.side === "right" ? "右" : h.side === "top" ? "上" : "下"}扩图`}
-                aria-valuenow={0}
+                aria-label={`向${SIDE_LABEL[h.side]}扩图`}
+                aria-valuemin={0}
+                aria-valuemax={4096}
+                aria-valuenow={offsets[h.side]}
+                aria-orientation={
+                  h.side === "top" || h.side === "bottom"
+                    ? "vertical"
+                    : "horizontal"
+                }
                 tabIndex={0}
                 onKeyDown={(e) => {
                   // 键盘兜底：方向键按 8px 步进取值（视觉手柄原本只能拖拽）
@@ -377,17 +413,20 @@ export default function OutpaintView() {
                   if (e.currentTarget.hasPointerCapture(e.pointerId))
                     e.currentTarget.releasePointerCapture(e.pointerId);
                 }}
-                className="absolute z-10 h-3.5 w-12 touch-none rounded-full border border-theme bg-elevated shadow-card"
+                className="absolute z-10 h-3.5 w-12 touch-none rounded-pill border border-line bg-elevated shadow-card transition-transform focus-visible:ring-2 focus-visible:ring-accent active:scale-110"
               />
             ))}
           </div>
         ) : (
-          <span className="text-sm text-tertiary">加载中…</span>
+          <span className="text-body text-tertiary">加载中…</span>
         )}
       </div>
 
       {error && (
-        <div className="shrink-0 border-t border-danger/30 bg-danger/10 px-4 py-2 text-xs text-danger">
+        <div
+          role="alert"
+          className="shrink-0 border-t border-danger/25 bg-danger/10 px-6 py-2 text-footnote text-danger"
+        >
           {error}
         </div>
       )}

@@ -1,11 +1,19 @@
 import { useEffect, useRef, useState } from "react";
-import { motion } from "framer-motion";
+import { motion, useReducedMotion } from "framer-motion";
 import { useAppStore } from "../stores/appStore";
 import { useChatStore } from "../stores/chatStore";
 import { useProviderStore } from "../stores/providerStore";
 import { api, parseAdapterError, adapterErrorTitle } from "../lib/api";
 import { toast } from "../lib/notify";
+import { DUR, EASE } from "../lib/motion";
+import { Button } from "./ui/Button";
+import { IconButton } from "./ui/IconButton";
+import { Input } from "./ui/Field";
+import { Slider } from "./ui/Slider";
+import { ToolbarGroup, ToolbarSeparator } from "./ui/Toolbar";
+import { IconBrush, IconClose, IconEraser } from "./Icons";
 import SafeImg from "./SafeImg";
+import MaskCanvas, { MaskCanvasHandle } from "./MaskCanvas";
 
 export default function EditorView() {
   const editTarget = useAppStore((s) => s.editTarget);
@@ -16,7 +24,7 @@ export default function EditorView() {
   const source = editTarget;
 
   const containerRef = useRef<HTMLDivElement>(null);
-  const maskCanvasRef = useRef<HTMLCanvasElement>(null);
+  const maskRef = useRef<MaskCanvasHandle>(null);
   const [image, setImage] = useState<HTMLImageElement | null>(null);
   const [display, setDisplay] = useState({ w: 0, h: 0 });
   const [brushSize, setBrushSize] = useState(48);
@@ -25,7 +33,7 @@ export default function EditorView() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [resultUrl, setResultUrl] = useState<string | null>(null);
-  const drawing = useRef(false);
+  const reduce = useReducedMotion();
 
   useEffect(() => {
     if (!source) return;
@@ -46,86 +54,18 @@ export default function EditorView() {
       w: Math.round(image.naturalWidth * scale),
       h: Math.round(image.naturalHeight * scale),
     });
-    const canvas = maskCanvasRef.current;
-    if (canvas) {
-      canvas.width = image.naturalWidth;
-      canvas.height = image.naturalHeight;
-      const ctx = canvas.getContext("2d")!;
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.lineCap = "round";
-      ctx.lineJoin = "round";
-    }
     setResultUrl(null);
   }, [image]);
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") closeEditor();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [closeEditor]);
+
   if (!source) return null;
-
-  const maskCtx = () => maskCanvasRef.current?.getContext("2d") ?? null;
-
-  const stroke = (e: React.PointerEvent) => {
-    const canvas = maskCanvasRef.current;
-    const ctx = maskCtx();
-    if (!canvas || !ctx) return;
-    const rect = canvas.getBoundingClientRect();
-    const x = ((e.clientX - rect.left) / rect.width) * canvas.width;
-    const y = ((e.clientY - rect.top) / rect.height) * canvas.height;
-    ctx.globalCompositeOperation = eraser ? "destination-out" : "source-over";
-    ctx.strokeStyle = "#ff2d2d";
-    ctx.fillStyle = "#ff2d2d";
-    ctx.lineWidth = brushSize;
-    if (!drawing.current) {
-      ctx.beginPath();
-      ctx.moveTo(x, y);
-      drawing.current = true;
-    } else {
-      ctx.lineTo(x, y);
-      ctx.stroke();
-    }
-  };
-
-  const paintAt = (e: React.PointerEvent) => {
-    const canvas = maskCanvasRef.current;
-    const ctx = maskCtx();
-    if (!canvas || !ctx) return;
-    const rect = canvas.getBoundingClientRect();
-    const x = ((e.clientX - rect.left) / rect.width) * canvas.width;
-    const y = ((e.clientY - rect.top) / rect.height) * canvas.height;
-    ctx.globalCompositeOperation = eraser ? "destination-out" : "source-over";
-    ctx.fillStyle = "#ff2d2d";
-    ctx.beginPath();
-    ctx.arc(x, y, brushSize / 2, 0, Math.PI * 2);
-    ctx.fill();
-  };
-
-  const selectAll = () => {
-    const canvas = maskCanvasRef.current;
-    const ctx = maskCtx();
-    if (!canvas || !ctx) return;
-    ctx.globalCompositeOperation = "source-over";
-    ctx.fillStyle = "#ff2d2d";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-  };
-
-  const clearMask = () => {
-    const canvas = maskCanvasRef.current;
-    const ctx = maskCtx();
-    if (!canvas || !ctx) return;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-  };
-
-  const maskToB64 = (): string | null => {
-    const canvas = maskCanvasRef.current;
-    if (!canvas || !image) return null;
-    const off = document.createElement("canvas");
-    off.width = canvas.width;
-    off.height = canvas.height;
-    const ctx = off.getContext("2d")!;
-    ctx.fillStyle = "#000";
-    ctx.fillRect(0, 0, off.width, off.height);
-    ctx.globalCompositeOperation = "destination-out";
-    ctx.drawImage(canvas, 0, 0);
-    return off.toDataURL("image/png");
-  };
 
   const submit = async () => {
     if (!image || !source) return;
@@ -148,20 +88,30 @@ export default function EditorView() {
     srcCanvas.width = image.naturalWidth;
     srcCanvas.height = image.naturalHeight;
     srcCanvas.getContext("2d")!.drawImage(image, 0, 0);
-    const maskB64 = maskToB64();
+    if (!maskRef.current?.hasStrokes()) {
+      toast("请先涂抹要修改的区域", "error");
+      return;
+    }
+    const maskB64 = maskRef.current.toAlphaPng();
     if (!maskB64) return;
     setBusy(true);
     setError(null);
     const sentPrompt = source.mode === "erase" ? "" : prompt;
+    // 消除不需要负向词（提示词由后端补全），重绘沿用全局负向设置
+    const prefs = useAppStore.getState().prefs;
     try {
       const out = await api.editImage({
         providerId: defaultProviderId,
         prompt: sentPrompt,
+        negativePrompt:
+          source.mode === "erase" ? null : prefs.negativePrompt.trim() || null,
         model,
         imageB64: srcCanvas.toDataURL("image/png"),
         maskB64,
         width: image.naturalWidth,
         height: image.naturalHeight,
+        op: isErase ? "erase" : "edit",
+        parentId: source.historyId,
       });
       setResultUrl(out.dataUrl);
       // 结果回流消息流：在当前对话追加一条助手消息
@@ -171,6 +121,7 @@ export default function EditorView() {
           historyId: out.historyId,
           dataUrl: out.dataUrl,
           path: out.filePath,
+          derivedFrom: source.historyId,
         },
         displayPrompt,
       );
@@ -182,114 +133,135 @@ export default function EditorView() {
     }
   };
 
+  const isErase = source.mode === "erase";
+
   return (
     <motion.div
-      initial={{ opacity: 0 }}
+      initial={reduce ? false : { opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
-      transition={{ duration: 0.2 }}
+      transition={{ duration: reduce ? 0 : DUR.base, ease: EASE.ios }}
       className="fixed inset-0 z-40 flex flex-col bg-base"
     >
-      <div className="bg-glass flex h-[52px] shrink-0 items-center gap-3 border-b border-theme px-4">
-        <span className="text-sm font-medium text-primary">
-          {source.mode === "erase" ? "AI 消除" : "局部重绘"}
-        </span>
-        <span className="text-xs text-tertiary">
-          {source.mode === "erase"
-            ? "涂抹要消除的对象，一键补全背景"
-            : "涂抹要修改的区域，其余像素保持不变"}
-        </span>
-        <div className="ml-auto flex items-center gap-2">
-          <button
-            onClick={submit}
-            disabled={busy}
-            className="pressable rounded-[10px] bg-accent px-4 py-1.5 text-sm font-medium text-white transition-opacity disabled:opacity-50"
-          >
-            {busy
-              ? "处理中…"
-              : source.mode === "erase"
-                ? "一键消除"
-                : "局部重绘"}
-          </button>
-          <button
-            onClick={closeEditor}
-            className="pressable rounded-[10px] border border-theme px-3 py-1.5 text-sm text-secondary transition-colors hover:bg-hover"
-          >
-            关闭
-          </button>
+      {/* 栏头与工具条合并为同一块玻璃：中间不夹第二条分割玻璃 */}
+      <header className="relative z-10 shrink-0 glass">
+        <div className="flex min-h-12 items-center gap-3 px-6 py-2">
+          <div className="flex min-w-0 flex-col">
+            <h1 className="truncate text-title3 text-primary">
+              {isErase ? "AI 消除" : "局部重绘"}
+            </h1>
+            <p className="truncate text-footnote text-tertiary">
+              {isErase
+                ? "涂抹要消除的对象，一键补全背景"
+                : "涂抹要修改的区域，其余像素保持不变"}
+            </p>
+          </div>
+          <div className="ml-auto flex shrink-0 items-center gap-2">
+            <Button
+              variant="primary"
+              size="sm"
+              loading={busy}
+              onClick={() => void submit()}
+            >
+              {isErase ? "一键消除" : "局部重绘"}
+            </Button>
+            <IconButton
+              label="关闭编辑器"
+              icon={<IconClose size={16} />}
+              onClick={closeEditor}
+            />
+          </div>
         </div>
-      </div>
 
-      <div className="bg-glass flex shrink-0 flex-wrap items-center gap-3 border-b border-theme px-4 py-2">
-        <span className="text-xs text-tertiary">画笔</span>
-        <input
-          type="range"
-          min={8}
-          max={200}
-          value={brushSize}
-          onChange={(e) => setBrushSize(Number(e.target.value))}
-        />
-        <button
-          onClick={() => setEraser(!eraser)}
-          className={`rounded-lg border px-2.5 py-1 text-xs transition-colors ${
-            eraser
-              ? "border-accent bg-accent-soft text-accent"
-              : "border-theme text-tertiary hover:text-secondary"
-          }`}
+        <div
+          role="toolbar"
+          aria-label="蒙版工具"
+          className="flex flex-wrap items-center gap-2 px-6 pb-2.5"
         >
-          {eraser ? "橡皮擦中" : "橡皮擦"}
-        </button>
-        <button
-          onClick={selectAll}
-          className="rounded-lg border border-theme px-2.5 py-1 text-xs text-tertiary transition-colors hover:text-secondary"
-        >
-          全选
-        </button>
-        <button
-          onClick={clearMask}
-          className="rounded-lg border border-theme px-2.5 py-1 text-xs text-tertiary transition-colors hover:text-secondary"
-        >
-          清除蒙版
-        </button>
-        {source.mode !== "erase" && (
-          <input
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            placeholder="描述要重绘的内容…"
-            className="min-w-0 flex-1 rounded-lg border border-theme bg-transparent px-3 py-1.5 text-sm outline-none transition-colors focus:border-accent"
-          />
-        )}
-      </div>
+          <ToolbarGroup>
+            <span className="pl-1 text-tertiary">
+              <IconBrush size={16} />
+            </span>
+            <div className="w-28 shrink-0">
+              <Slider
+                value={brushSize}
+                onValueChange={setBrushSize}
+                min={8}
+                max={200}
+                label="画笔大小"
+              />
+            </div>
+            <span className="w-8 text-right text-footnote tabular-nums text-tertiary">
+              {brushSize}
+            </span>
+          </ToolbarGroup>
+
+          <ToolbarSeparator />
+
+          <ToolbarGroup>
+            <IconButton
+              label={eraser ? "关闭橡皮擦" : "橡皮擦"}
+              icon={<IconEraser size={16} />}
+              variant={eraser ? "secondary" : "ghost"}
+              aria-pressed={eraser}
+              onClick={() => setEraser((v) => !v)}
+            />
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => maskRef.current?.fillAll()}
+            >
+              全选
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => maskRef.current?.clear()}
+            >
+              清除蒙版
+            </Button>
+          </ToolbarGroup>
+
+          {!isErase && (
+            <>
+              <ToolbarSeparator />
+              <div className="min-w-0 flex-1">
+                <Input
+                  value={prompt}
+                  onChange={(e) => setPrompt(e.target.value)}
+                  placeholder="描述要重绘的内容…"
+                  aria-label="重绘描述"
+                  compact
+                />
+              </div>
+            </>
+          )}
+        </div>
+      </header>
 
       <div
         ref={containerRef}
         className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden p-6"
       >
         {resultUrl ? (
-          <div className="flex h-full flex-col items-center gap-3">
+          <div className="flex h-full min-h-0 flex-col items-center gap-3">
             <SafeImg
               src={resultUrl}
               alt="重绘结果"
-              className="max-h-full max-w-full rounded-xl object-contain shadow-pop"
+              className="min-h-0 max-h-full max-w-full rounded-card border border-line object-contain shadow-pop"
             />
-            <div className="flex gap-2 text-xs">
-              <button
-                onClick={() => setResultUrl(null)}
-                className="rounded-lg border border-theme px-3 py-1.5 text-secondary transition-colors hover:bg-hover"
-              >
+            <div className="flex shrink-0 gap-2">
+              <Button size="sm" onClick={() => setResultUrl(null)}>
                 继续编辑
-              </button>
-              <button
-                onClick={closeEditor}
-                className="pressable rounded-[10px] bg-accent px-3 py-1.5 text-white"
-              >
+              </Button>
+              <Button size="sm" variant="primary" onClick={closeEditor}>
                 完成，返回对话
-              </button>
+              </Button>
             </div>
           </div>
         ) : image ? (
           <div
-            className="relative overflow-hidden rounded-xl shadow-pop"
+            className="relative overflow-hidden rounded-card shadow-pop"
             style={{ width: display.w, height: display.h }}
           >
             <SafeImg
@@ -297,27 +269,24 @@ export default function EditorView() {
               alt="编辑对象"
               className="absolute inset-0 h-full w-full"
             />
-            <canvas
-              ref={maskCanvasRef}
+            <MaskCanvas
+              ref={maskRef}
+              image={image}
+              brushSize={brushSize}
+              eraser={eraser}
               className="absolute inset-0 h-full w-full opacity-60"
-              style={{ touchAction: "none" }}
-              onPointerDown={(e) => {
-                e.currentTarget.setPointerCapture(e.pointerId);
-                paintAt(e);
-              }}
-              onPointerMove={(e) => {
-                if (e.buttons === 1) stroke(e);
-              }}
-              onPointerUp={() => (drawing.current = false)}
             />
           </div>
         ) : (
-          <span className="text-sm text-tertiary">加载中…</span>
+          <span className="text-body text-tertiary">加载中…</span>
         )}
       </div>
 
       {error && (
-        <div className="shrink-0 border-t border-danger/30 bg-danger/10 px-4 py-2 text-xs text-danger">
+        <div
+          role="alert"
+          className="shrink-0 border-t border-danger/25 bg-danger/10 px-6 py-2 text-footnote text-danger"
+        >
           {error}
         </div>
       )}

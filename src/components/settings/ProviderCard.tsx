@@ -2,6 +2,7 @@ import { useState } from "react";
 import { api, parseAdapterError, ProviderItem } from "../../lib/api";
 import { useProviderStore } from "../../stores/providerStore";
 import { KIND_OPTIONS } from "./ui";
+import { Button } from "../ui/Button";
 
 export default function ProviderCard({
   item,
@@ -15,6 +16,7 @@ export default function ProviderCard({
   const setDefaultProvider = useProviderStore((s) => s.setDefaultProvider);
   const [status, setStatus] = useState("");
   const p = item.provider;
+  const isDefault = defaultProviderId === p.id;
 
   const doTest = async () => {
     setStatus("测试中…");
@@ -31,16 +33,23 @@ export default function ProviderCard({
   };
 
   return (
-    <div className="rounded-[var(--radius-card)] border border-theme p-4">
-      <div className="flex items-center justify-between">
-        <div>
+    <div className="border-b border-separator px-4 py-3 last:border-b-0">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+        <div className="flex min-w-0 flex-1 flex-col gap-0.5">
           <div className="flex items-center gap-2">
-            <span className="font-medium">{p.name}</span>
-            <span className="rounded bg-hover px-1.5 py-0.5 text-[10px] text-secondary">
+            <span className="truncate text-body font-medium text-primary">
+              {p.name}
+            </span>
+            <span className="rounded-chip bg-fill px-1.5 py-0.5 text-caption text-secondary">
               {KIND_OPTIONS.find((k) => k.id === p.kind)?.label ?? p.kind}
             </span>
+            {isDefault && (
+              <span className="rounded-chip bg-accent-soft px-1.5 py-0.5 text-caption text-accent">
+                默认
+              </span>
+            )}
           </div>
-          <div className="mt-1 text-xs text-tertiary">
+          <div className="truncate text-footnote text-tertiary">
             {p.baseUrl || "（无地址）"} ·{" "}
             {item.keyCount > 1
               ? `${item.keyCount} 个 Key${
@@ -52,45 +61,48 @@ export default function ProviderCard({
             {p.defaultModel && ` · 默认: ${p.defaultModel}`}
           </div>
           {item.keyError && (
-            <div className="mt-1 inline-flex items-center gap-1 rounded-full border border-danger/25 bg-danger/10 px-2 py-0.5 text-[11px] text-danger">
+            <div className="mt-1 inline-flex w-fit items-center gap-1 rounded-pill border border-danger/25 bg-danger/10 px-2 py-0.5 text-caption text-danger">
               Key 失效：请重新填写
             </div>
           )}
           {status && (
-            <div className="mt-1 text-xs text-secondary">{status}</div>
+            <div className="mt-0.5 text-footnote text-secondary">{status}</div>
           )}
         </div>
-        <div className="flex items-center gap-2 text-xs">
-          <label className="flex cursor-pointer items-center gap-1 text-secondary">
+        <div className="flex shrink-0 items-center gap-1.5">
+          <label className="mr-1 flex cursor-pointer items-center gap-1.5 text-subhead text-secondary">
             <input
               type="radio"
               name="defaultProvider"
-              checked={defaultProviderId === p.id}
+              checked={isDefault}
               onChange={() => setDefaultProvider(p.id!)}
+              aria-label={`把 ${p.name} 设为默认服务商`}
+              className="size-4 cursor-pointer accent-accent-fill"
             />
             默认
           </label>
-          <button
+          <Button
+            size="sm"
             onClick={onEdit}
             aria-label={`编辑服务商 ${p.name}`}
-            className="rounded-[8px] border border-theme px-2 py-1"
           >
             编辑
-          </button>
-          <button
-            onClick={doTest}
+          </Button>
+          <Button
+            size="sm"
+            onClick={() => void doTest()}
             aria-label={`测试服务商 ${p.name}`}
-            className="rounded-[8px] border border-theme px-2 py-1"
           >
             测试
-          </button>
-          <button
+          </Button>
+          <Button
+            size="sm"
+            variant="danger"
             onClick={() => p.id && remove(p.id)}
             aria-label={`删除服务商 ${p.name}`}
-            className="rounded-[8px] border border-theme px-2 py-1 text-danger"
           >
             删除
-          </button>
+          </Button>
         </div>
       </div>
     </div>

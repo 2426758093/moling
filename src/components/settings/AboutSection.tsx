@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { api, UpdateStatus } from "../../lib/api";
+import { Button } from "../ui/Button";
+import { Row, Section } from "../ui/List";
 
 interface DownloadProgress {
   downloaded: number;
@@ -83,76 +85,71 @@ export default function AboutSection() {
       : null;
 
   return (
-    <section>
-      <h2 className="mb-4 text-lg font-semibold">关于与更新</h2>
-      <div className="space-y-3 rounded-[var(--radius-card)] border border-theme p-4">
-        <div className="flex items-center justify-between text-sm">
-          <span className="text-secondary">当前版本</span>
-          <span className="text-xs text-tertiary">
-            {status?.currentVersion ?? "—"}
-          </span>
-        </div>
-
-        <div className="flex flex-wrap items-center gap-2">
-          <button
-            onClick={() => void check()}
-            disabled={checking || installing}
-            className="rounded-[8px] border border-theme px-3 py-1.5 text-xs disabled:opacity-50"
-          >
-            {checking ? "检查中…" : "检查更新"}
-          </button>
-          {available && (
-            <button
-              onClick={() => void install()}
-              disabled={installing}
-              className="rounded-[8px] bg-accent px-3 py-1.5 text-xs text-white disabled:opacity-50"
-            >
-              {installing ? "安装中…" : `下载并安装 ${available.version}`}
-            </button>
-          )}
-        </div>
-
+    <Section title="关于与更新">
+      <Row label="当前版本">
+        <span className="text-subhead text-tertiary">
+          {status?.currentVersion ?? "—"}
+        </span>
+      </Row>
+      <Row
+        label="检查更新"
+        hint={
+          msg || (installing ? "安装过程中应用会自动退出并重新启动" : undefined)
+        }
+      >
+        <Button
+          size="sm"
+          loading={checking}
+          disabled={installing}
+          onClick={() => void check()}
+        >
+          检查更新
+        </Button>
         {available && (
-          <div className="space-y-1 rounded-[8px] border border-theme p-3">
-            <div className="flex items-center justify-between text-xs">
-              <span className="text-secondary">新版本 {available.version}</span>
-              {available.date && (
-                <span className="text-tertiary">
-                  {available.date.slice(0, 10)}
-                </span>
-              )}
-            </div>
-            {available.notes && (
-              <p className="max-h-40 overflow-y-auto whitespace-pre-wrap text-xs leading-relaxed text-tertiary">
-                {available.notes}
-              </p>
+          <Button
+            size="sm"
+            variant="primary"
+            loading={installing}
+            onClick={() => void install()}
+          >
+            下载并安装 {available.version}
+          </Button>
+        )}
+      </Row>
+
+      {available && (
+        <div className="border-b border-separator px-4 py-3 last:border-b-0">
+          <div className="flex items-center justify-between text-footnote">
+            <span className="text-secondary">新版本 {available.version}</span>
+            {available.date && (
+              <span className="text-tertiary">
+                {available.date.slice(0, 10)}
+              </span>
             )}
           </div>
-        )}
-
-        {progress && (
-          <div className="space-y-1">
-            <div className="h-1 overflow-hidden rounded-full bg-sunken">
-              <div
-                className="h-full rounded-full bg-accent transition-[width] duration-200"
-                style={{ width: `${percent ?? 5}%` }}
-              />
-            </div>
-            <p className="text-xs text-tertiary">
-              {percent !== null
-                ? `${percent}% · ${formatBytes(progress.downloaded)} / ${formatBytes(progress.total ?? 0)}`
-                : `已下载 ${formatBytes(progress.downloaded)}`}
+          {available.notes && (
+            <p className="mt-1 max-h-40 overflow-y-auto whitespace-pre-wrap text-footnote leading-relaxed text-tertiary">
+              {available.notes}
             </p>
-          </div>
-        )}
+          )}
+        </div>
+      )}
 
-        {installing && (
-          <p className="text-xs text-tertiary">
-            安装过程中应用会自动退出，安装器完成后会重新启动。
+      {progress && (
+        <div className="space-y-1.5 px-4 py-3">
+          <div className="h-1 overflow-hidden rounded-pill bg-sunken">
+            <div
+              className="h-full rounded-pill bg-accent-fill transition-[width] duration-200 ease-ios"
+              style={{ width: `${percent ?? 5}%` }}
+            />
+          </div>
+          <p className="text-footnote text-tertiary">
+            {percent !== null
+              ? `${percent}% · ${formatBytes(progress.downloaded)} / ${formatBytes(progress.total ?? 0)}`
+              : `已下载 ${formatBytes(progress.downloaded)}`}
           </p>
-        )}
-        {msg && <p className="text-xs text-tertiary">{msg}</p>}
-      </div>
-    </section>
+        </div>
+      )}
+    </Section>
   );
 }

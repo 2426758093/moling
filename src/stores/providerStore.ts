@@ -5,7 +5,7 @@ interface ProviderState {
   providers: ProviderItem[];
   loaded: boolean;
   refresh: () => Promise<void>;
-  save: (input: ProviderInput) => Promise<void>;
+  save: (input: ProviderInput) => Promise<ProviderItem>;
   remove: (id: number) => Promise<void>;
   defaultProviderId: number | null;
   setDefaultProvider: (id: number | null) => Promise<void>;
@@ -25,8 +25,9 @@ export const useProviderStore = create<ProviderState>((set, get) => ({
     });
   },
   save: async (input) => {
-    await api.saveProvider(input);
+    const item = await api.saveProvider(input);
     await get().refresh();
+    return item;
   },
   remove: async (id) => {
     await api.deleteProvider(id);

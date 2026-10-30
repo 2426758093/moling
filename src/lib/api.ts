@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { ReferenceRole } from "./types";
 
 export interface ProviderInput {
   id?: number | null;
@@ -12,6 +13,14 @@ export interface ProviderInput {
   templateUrl: string;
   templateBody: string;
   templateResponsePath: string;
+  /** 编辑模板（局部重绘 / 消除 / 扩图），三项全空表示未配置 */
+  editTemplateUrl: string;
+  editTemplateBody: string;
+  editTemplateResponsePath: string;
+  /** 变换模板（放大 / 风格转换），三项全空表示未配置 */
+  transformTemplateUrl: string;
+  transformTemplateBody: string;
+  transformTemplateResponsePath: string;
   extraParams?: string | null;
 }
 
@@ -33,12 +42,22 @@ export interface ProviderItem {
   keys: ProviderKeyView[];
 }
 
+/** 模型能力元数据：只驱动界面开关，不改变请求形状 */
+export interface ModelCaps {
+  negative: boolean;
+  edit: boolean;
+  transform: boolean;
+  maxSide: number;
+  multiImage: boolean;
+}
+
 export type AdapterError =
   | { type: "auth_invalid"; message: string; status?: number }
   | { type: "quota_exceeded"; message: string }
   | { type: "timeout"; message: string }
   | { type: "content_blocked"; message: string }
   | { type: "network"; message: string }
+  | { type: "unsupported"; message: string }
   | { type: "other"; message: string };
 
 export function parseAdapterError(raw: string): AdapterError {
@@ -61,6 +80,8 @@ export function adapterErrorTitle(e: AdapterError): string {
       return "请求超时";
     case "content_blocked":
       return "内容审核拦截";
+    case "unsupported":
+      return "该服务商不支持此操作";
     default:
       return "请求失败";
   }
@@ -82,6 +103,9 @@ export interface HistoryItem {
     filePath: string;
     favorite: boolean;
     createdAt: string;
+    /** 派生图血统：父记录 id 与来源操作（generate / edit / upscale / style…） */
+    parentId: number | null;
+    op: string;
   };
   /** 列表只带缩略图；下载/打包导出需按 id 取原图 */
   thumbUrl: string;
@@ -94,6 +118,45 @@ export interface GeneratedImage {
   prompt: string;
   model: string;
   seed: number | null;
+}
+
+export interface DirStat {
+  files: number;
+  bytes: number;
+}
+
+/** 存储占用：媒体根下的图片/缩略图/参考图/回收站 + 数据库文件 */
+export interface StorageStats {
+  mediaRoot: string;
+  dataDir: string;
+  images: DirStat;
+  thumbs: DirStat;
+  refs: DirStat;
+  trash: DirStat;
+  database: DirStat;
+}
+
+export interface MediaMigrationReport {
+  from: string;
+  to: string;
+  filesCopied: number;
+  bytesCopied: number;
+  pathsRewritten: number;
+}
+
+/** 清理缓存结果（与启动清理共用 Rust 侧 Stats） */
+export interface CacheCleanReport {
+  scanned: number;
+  kept: number;
+  skippedRecent: number;
+  candidates: number;
+  moved: number;
+  pruned: number;
+  thumbsCreated: number;
+  errors: number;
+  refsScanned: number;
+  refsKept: number;
+  refsMoved: number;
 }
 
 export type ProxyMode = "system" | "direct" | "manual";
@@ -141,6 +204,8 @@ export interface QueueJob {
   createdAt: string;
   startedAt: string | null;
   finishedAt: string | null;
+  /** 扩展参数 JSON：{referencePaths, references}，空串表示无参考图 */
+  inputJson: string;
 }
 
 export interface EnqueueJobInput {
@@ -155,12 +220,58 @@ export interface EnqueueJobInput {
   steps?: number | null;
   seed?: number | null;
   count: number;
+  /** 已落盘（refs/）的参考图路径，按位置与 references 对齐 */
+  referencePaths?: string[];
+  references?: { role: ReferenceRole; strength: number }[];
+}
+
+/** 队列任务扩展参数（与后端 JobExtras 对应） */
+export interface QueueJobExtras {
+  referencePaths?: string[];
+  references?: { role: ReferenceRole; strength: number }[];
 }
 
 export interface AvailableUpdate {
   version: string;
   notes: string | null;
   date: string | null;
+}
+
+/** 收藏的提示词：文本唯一，重复收藏只更新标签 */
+export interface PromptFavorite {
+  id: number;
+  text: string;
+  tags: string[];
+  createdAt: string;
+}
+
+/** 预设参考图只记路径；角色 / 强度随路径一起保存 */
+export interface PresetRef {
+  path: string;
+  role: ReferenceRole;
+  strength: number;
+}
+
+/** 工作流预设：提示词 + 负向词 + 生成参数 + 参考图 */
+export interface WorkflowPreset {
+  id: number;
+  name: string;
+  prompt: string;
+  negativePrompt: string;
+  /** JSON 字符串（ratio / width / height / style / count） */
+  paramsJson: string;
+  refs: PresetRef[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PresetInput {
+  id?: number | null;
+  name: string;
+  prompt: string;
+  negativePrompt: string;
+  params: Record<string, unknown>;
+  refs: PresetRef[];
 }
 
 /** 思考模型流式增量（Tauri 事件 thinking:delta） */
@@ -189,6 +300,25 @@ export interface UpdateStatus {
   error: string | null;
 }
 
+/** 画布元信息：列表不返回布局数据 */
+export interface CanvasBoardMeta {
+  id: number;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 画布完整数据；dataJson 结构由 canvasStore 定义并校验 */
+export interface CanvasBoard extends CanvasBoardMeta {
+  dataJson: string;
+}
+
+/** 批量缩略图：后端会跳过文件缺失的记录 */
+export interface CanvasThumb {
+  historyId: number;
+  thumbUrl: string;
+}
+
 export const api = {
   saveProvider: (input: ProviderInput) =>
     invoke<ProviderItem>("save_provider", { input }),
@@ -205,6 +335,10 @@ export const api = {
   pullModels: (id: number) => invoke<string[]>("pull_models", { id }),
   testModels: (input: ProviderInput) =>
     invoke<string[]>("test_models", { input }),
+  getModelCaps: (providerId: number) =>
+    invoke<Record<string, ModelCaps>>("get_model_caps", { providerId }),
+  setModelCaps: (providerId: number, model: string, caps: ModelCaps) =>
+    invoke<void>("set_model_caps", { providerId, model, caps }),
   testConnection: (id: number) =>
     invoke<{
       ok: boolean;
@@ -236,6 +370,8 @@ export const api = {
     style: string;
     count: number;
     images?: string[];
+    /// 与 images 按位置对应；只在专家模式下发（省略即不追加角色说明）
+    references?: { role: ReferenceRole; strength: number }[];
     // 生成任务 id：stop() 用它调用 cancel_generation 中断在途生成
     jobId?: string;
   }) =>
@@ -251,39 +387,133 @@ export const api = {
   editImage: (input: {
     providerId: number;
     prompt: string;
+    negativePrompt?: string | null;
     model: string;
     imageB64: string;
     maskB64?: string | null;
     width: number;
     height: number;
+    /** edit | erase | outpaint（血统用；缺省按后端推断） */
+    op?: "edit" | "erase" | "outpaint";
+    /** 原图记录 id */
+    parentId?: number | null;
   }) =>
-    invoke<{ historyId: number; dataUrl: string; filePath: string }>(
-      "edit_image",
-      { input },
-    ),
+    invoke<{
+      historyId: number;
+      dataUrl: string;
+      filePath: string;
+      op: string;
+    }>("edit_image", { input }),
+  /** 高清放大 / 风格转换：scale=1 且带 prompt 为风格转换 */
+  transformImage: (input: {
+    providerId: number;
+    model: string;
+    imageB64: string;
+    scale: number;
+    mode: "detail" | "faithful";
+    prompt?: string;
+    parentId?: number | null;
+  }) =>
+    invoke<{
+      historyId: number;
+      dataUrl: string;
+      filePath: string;
+      width: number;
+      height: number;
+      op: string;
+      parentId: number | null;
+    }>("transform_image", { input }),
+  /** 基础编辑：本地像素运算，ops 按顺序应用 */
+  applyEdit: (input: {
+    imageB64: string;
+    ops: Array<
+      | { type: "crop"; x: number; y: number; width: number; height: number }
+      | { type: "rotate"; deg: 90 | 180 | 270 }
+      | { type: "flip"; axis: "horizontal" | "vertical" }
+      | {
+          type: "adjust";
+          brightness: number;
+          contrast: number;
+          saturation: number;
+        }
+    >;
+    parentId?: number | null;
+  }) =>
+    invoke<{
+      historyId: number;
+      dataUrl: string;
+      filePath: string;
+      width: number;
+      height: number;
+      op: string;
+      parentId: number | null;
+    }>("apply_edit", { input }),
+  /** 换背景：纯色 / 渐变本地合成，ai 走服务商编辑接口 */
+  replaceBackground: (input: {
+    imageB64: string;
+    maskB64: string;
+    parentId?: number | null;
+    kind: "solid" | "gradient" | "ai";
+    color?: string;
+    colorFrom?: string;
+    colorTo?: string;
+    direction?: "horizontal" | "vertical" | "diagonal";
+    prompt?: string;
+    providerId?: number | null;
+    model?: string;
+    negativePrompt?: string | null;
+  }) =>
+    invoke<{
+      historyId: number;
+      dataUrl: string;
+      filePath: string;
+      width: number;
+      height: number;
+      op: string;
+      parentId: number | null;
+    }>("replace_background", { input }),
+  /** 同族图片（根 + 直接派生） */
+  listDerived: (historyId: number) =>
+    invoke<{ items: HistoryItem["history"][] }>("list_derived", {
+      historyId,
+    }),
   listHistory: (
     limit?: number,
     offset?: number,
     model?: string,
     style?: string,
+    favoriteOnly?: boolean,
   ) =>
     invoke<{ items: HistoryItem[] }>("list_history", {
       limit,
       offset,
       model,
       style,
+      favoriteOnly,
     }),
   getHistoryImage: (id: number) =>
     invoke<{ historyId: number; dataUrl: string; filePath: string }>(
       "get_history_image",
       { id },
     ),
+  /** 画廊记录元信息（画布节点复用参数 / 编辑浮层提示词） */
+  getHistoryItem: (id: number) =>
+    invoke<HistoryItem["history"] | null>("get_history_item", { id }),
   setFavorite: (id: number, favorite: boolean) =>
     invoke<void>("set_favorite", { id, favorite }),
   deleteHistory: (id: number) => invoke<void>("delete_history", { id }),
   setSetting: (key: string, value: string) =>
     invoke<void>("set_setting", { key, value }),
   getSetting: (key: string) => invoke<string | null>("get_setting", { key }),
+  /** 媒体根（图片与参考图所在目录；数据库与日志始终在 appData） */
+  getMediaRoot: () => invoke<string>("get_media_root"),
+  /** 更改媒体根：复制 → 改库 → 切换，返回迁移统计；队列运行中会被拒绝 */
+  setMediaRoot: (path: string) =>
+    invoke<MediaMigrationReport>("set_media_root", { path }),
+  storageStats: () => invoke<StorageStats>("storage_stats"),
+  /** 立即清理缓存；days 缺省取设置里的保留天数 */
+  cleanCache: (days?: number) =>
+    invoke<CacheCleanReport>("clean_cache", { days }),
   getAppDataDir: () => invoke<string>("get_app_data_dir"),
   getLogsDir: () => invoke<string>("get_logs_dir"),
   /** 导出脱敏诊断包（近 7 天日志 + 元信息），返回 zip 绝对路径 */
@@ -337,11 +567,18 @@ export const api = {
       jobs: QueueJob[];
       counts: Record<string, number>;
       paused: boolean;
+      concurrency: number;
     }>("list_jobs"),
   cancelQueueJob: (id: number) => invoke<void>("cancel_queue_job", { id }),
   retryQueueJob: (id: number) => invoke<void>("retry_queue_job", { id }),
   resumeQueue: () => invoke<{ paused: boolean }>("resume_queue"),
   clearFinishedJobs: () => invoke<number>("clear_finished_jobs"),
+  /** 参考图落盘到 appData/refs/，返回路径（入队时只传路径） */
+  saveReferenceImage: (dataUrl: string) =>
+    invoke<string>("save_reference_image", { dataUrl }),
+  /** 读取 refs/ 下的参考图为 data URL（队列缩略图） */
+  readReferenceImage: (path: string) =>
+    invoke<string>("read_reference_image", { path }),
   /// keyset 分页：不传 beforeId 取最新一页，返回按 id 升序，hasMore 表示还有更旧的消息
   listMessages: (
     conversationId: number,
@@ -365,6 +602,34 @@ export const api = {
       "reverse_prompt",
       { imageB64 },
     ),
+  /** 提示词翻译：含汉字按中→英，否则英→中；依赖思考模型 */
+  translatePrompt: (text: string) =>
+    invoke<{
+      ok: boolean;
+      translated?: string;
+      direction?: "zh2en" | "en2zh";
+      error?: AdapterError;
+    }>("translate_prompt", { text }),
+  listFavorites: () => invoke<PromptFavorite[]>("list_favorites"),
+  upsertFavorite: (text: string, tags: string[]) =>
+    invoke<PromptFavorite>("upsert_favorite", { text, tags }),
+  deleteFavorite: (id: number) => invoke<boolean>("delete_favorite", { id }),
+  listPresets: () => invoke<WorkflowPreset[]>("list_presets"),
+  savePreset: (input: PresetInput) =>
+    invoke<WorkflowPreset>("save_preset", { input }),
+  deletePreset: (id: number) => invoke<boolean>("delete_preset", { id }),
+  listCanvasBoards: () => invoke<CanvasBoardMeta[]>("list_canvas_boards"),
+  createCanvasBoard: (name: string) =>
+    invoke<CanvasBoard>("create_canvas_board", { name }),
+  getCanvasBoard: (id: number) =>
+    invoke<CanvasBoard | null>("get_canvas_board", { id }),
+  saveCanvasBoard: (id: number, name: string, dataJson: string) =>
+    invoke<CanvasBoard>("save_canvas_board", { id, name, dataJson }),
+  deleteCanvasBoard: (id: number) =>
+    invoke<boolean>("delete_canvas_board", { id }),
+  /** 画布节点缩略图：一次最多 200 个 id，缺失文件跳过 */
+  batchHistoryThumbs: (ids: number[]) =>
+    invoke<CanvasThumb[]>("batch_history_thumbs", { ids }),
 };
 
 export interface PromptTemplate {
@@ -421,5 +686,11 @@ export const EMPTY_PROVIDER: ProviderInput = {
   templateUrl: "",
   templateBody: "",
   templateResponsePath: "",
+  editTemplateUrl: "",
+  editTemplateBody: "",
+  editTemplateResponsePath: "",
+  transformTemplateUrl: "",
+  transformTemplateBody: "",
+  transformTemplateResponsePath: "",
   extraParams: "",
 };
