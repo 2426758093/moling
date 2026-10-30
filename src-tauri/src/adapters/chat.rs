@@ -22,13 +22,24 @@ pub async fn chat_complete(
     system: &str,
     user: &str,
 ) -> Result<String, AdapterError> {
+    chat_complete_at(config, model, system, user, CHAT_TEMPERATURE).await
+}
+
+/// 指定 temperature 的版本：翻译要求稳定，用低温度。
+pub async fn chat_complete_at(
+    config: &ProviderConfig,
+    model: &str,
+    system: &str,
+    user: &str,
+    temperature: f64,
+) -> Result<String, AdapterError> {
     let body = serde_json::json!({
         "model": model,
         "messages": [
             { "role": "system", "content": system },
             { "role": "user", "content": user },
         ],
-        "temperature": CHAT_TEMPERATURE,
+        "temperature": temperature,
     });
     let resp = http_client()
         .post(format!(
@@ -289,6 +300,29 @@ pub const REVERSE_SYSTEM_PROMPT: &str = "\
 1. 仔细观察图片的主体、场景、构图、光线、色彩、风格、质感细节；
 2. 输出一段高质量的英文文生图提示词（80 词以内），能高度还原这张图；
 3. 只输出提示词文本本身，不要任何解释、引号或 Markdown。";
+
+pub const TRANSLATE_SYSTEM_PROMPT: &str = "\
+你是一名 AI 绘画提示词翻译。用户会给出中文或英文提示词，请把它翻译成目标语言：
+- 保留原有的风格词、英文关键词、权重标记与逗号分隔结构；
+- 不增删画面内容，不解释，不加引号或 Markdown；
+- 只输出译文本身。";
+
+/// 提示词翻译：低温度保证术语稳定；调用方决定目标语言。
+pub async fn translate_prompt(
+    config: &ProviderConfig,
+    model: &str,
+    text: &str,
+    zh_to_en: bool,
+) -> Result<String, AdapterError> {
+    let target = if zh_to_en {
+        "英文（English）"
+    } else {
+        "简体中文"
+    };
+    let system = format!("{TRANSLATE_SYSTEM_PROMPT}\n本次目标语言：{target}。");
+    let out = chat_complete_at(config, model, &system, text, 0.2).await?;
+    Ok(out.trim().to_string())
+}
 
 /// 多模态反推：图片以 data URL 随 chat completions 上送
 pub async fn reverse_prompt(

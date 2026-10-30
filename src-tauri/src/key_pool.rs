@@ -37,6 +37,10 @@ fn base_config(row: &storage::ProviderRow) -> ProviderConfig {
         template_url: row.template_url.clone(),
         template_body: row.template_body.clone(),
         template_response_path: row.template_response_path.clone(),
+        edit_template: crate::adapters::template::TemplateSpec::from_json(&row.edit_template_json),
+        transform_template: crate::adapters::template::TemplateSpec::from_json(
+            &row.transform_template_json,
+        ),
         extra_params,
     }
 }
@@ -56,6 +60,11 @@ fn order_indexes(total: usize, start: usize, invalid: &[bool]) -> Vec<usize> {
     }
 }
 
+/// 只有 Mock 适配器不校验 Key（界面上也不给 Key 输入框）。
+fn may_run_without_keys(kind: &str) -> bool {
+    kind == crate::adapters::KIND_MOCK
+}
+
 /// 候选序列：当前 Key → 其后 → 其余。全部失效时仍返回整组作为兜底，
 /// 避免「所有 Key 都被标记」时服务商彻底不可用（用户可重置或补新 Key）。
 pub fn candidates(provider_id: i64) -> Result<Vec<Candidate>, String> {
@@ -63,6 +72,12 @@ pub fn candidates(provider_id: i64) -> Result<Vec<Candidate>, String> {
     let keys = storage::load_provider_keys(provider_id)?;
     let total = keys.len();
     if total == 0 {
+        if may_run_without_keys(&row.kind) {
+            return Ok(vec![Candidate {
+                index: 0,
+                config: base_config(&row),
+            }]);
+        }
         return Ok(Vec::new());
     }
     let start = cursors().get(&provider_id).copied().unwrap_or(0);
@@ -120,6 +135,13 @@ mod tests {
         // 全失效兜底：整组仍按游标顺序尝试，不返回空列表
         assert_eq!(order_indexes(3, 0, &[true, true, true]), vec![0, 1, 2]);
         assert_eq!(order_indexes(2, 1, &[true, true]), vec![1, 0]);
+    }
+
+    #[test]
+    fn mock_may_run_without_keys() {
+        assert!(may_run_without_keys(crate::adapters::KIND_MOCK));
+        assert!(!may_run_without_keys(crate::adapters::KIND_OPENAI));
+        assert!(!may_run_without_keys(crate::adapters::KIND_TEMPLATE));
     }
 
     #[test]

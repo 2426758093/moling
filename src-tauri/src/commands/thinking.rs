@@ -147,6 +147,8 @@ fn resolve_thinking_provider() -> Result<Option<(ProviderConfig, String)>, Strin
                 template_url: String::new(),
                 template_body: String::new(),
                 template_response_path: String::new(),
+                edit_template: None,
+                transform_template: None,
                 extra_params: String::new(),
             },
             cfg.model,
@@ -314,6 +316,87 @@ pub fn cancel_refine(
     state: tauri::State<'_, crate::commands::GenerationRegistry>,
 ) -> bool {
     state.cancel(&format!("refine:{request_id}"))
+}
+
+/// 文本含 CJK 汉字即视为中文（用于选择翻译方向）
+fn contains_cjk(text: &str) -> bool {
+    text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c))
+}
+
+/// 中→英 或 英→中；纯数字/符号按英译中处理
+fn translation_direction(text: &str) -> &'static str {
+    if contains_cjk(text) {
+        "zh2en"
+    } else {
+        "en2zh"
+    }
+}
+
+#[tauri::command]
+pub async fn translate_prompt(text: String) -> Result<serde_json::Value, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": { "type": "other", "message": "请先输入要翻译的提示词" },
+        }));
+    }
+    let direction = translation_direction(trimmed);
+    let resolved = resolve_thinking_provider()?;
+    let Some((config, model)) = resolved else {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "direction": direction,
+            "error": { "type": "other", "message": "请先在「设置 → 思考模型」中启用并配置模型" },
+        }));
+    };
+    let result = if config.kind == adapters::KIND_MOCK {
+        Ok(if direction == "zh2en" {
+            "(mock 翻译) a serene lake under moonlight, mist drifting over still water, cinematic lighting, ultra detailed"
+                .to_string()
+        } else {
+            "(mock 翻译) 月光下宁静的湖面，薄雾漂过平静的水面，电影级光影，极其精细".to_string()
+        })
+    } else {
+        adapters::chat::translate_prompt(&config, &model, trimmed, direction == "zh2en").await
+    };
+    match result {
+        Ok(translated) => Ok(serde_json::json!({
+            "ok": true,
+            "translated": translated,
+            "direction": direction,
+        })),
+        Err(e) => Ok(serde_json::json!({
+            "ok": false,
+            "direction": direction,
+            "error": e,
+        })),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn translation_direction_detects_script() {
+        assert_eq!(translation_direction("一只橘猫在窗台上打盹"), "zh2en");
+        assert_eq!(
+            translation_direction("a cat napping on a windowsill"),
+            "en2zh"
+        );
+        assert_eq!(translation_direction("cat 橘猫, soft light"), "zh2en");
+        assert_eq!(translation_direction(""), "en2zh");
+        assert_eq!(translation_direction("12345, ---"), "en2zh");
+    }
+
+    #[test]
+    fn contains_cjk_boundaries() {
+        assert!(contains_cjk("墨"));
+        assert!(!contains_cjk("MoLing 0.8.0"));
+        // 假名与全角标点不算汉字，避免把日文误判为中文输入
+        assert!(!contains_cjk("こんにちは、"));
+    }
 }
 
 #[tauri::command]

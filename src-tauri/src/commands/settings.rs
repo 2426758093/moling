@@ -6,11 +6,18 @@ use tauri::Manager;
 /// 这里**不能**放 thinkingConfig：它包含加密后的思考模型 API Key，写入路径
 /// 必须走 commands::thinking::save_thinking_config（先校验再加密），否则前端
 /// 拿到一个可以直写任意字符串的后门，绕过校验把密文写坏。
+///
+/// 新增一项时必须同步 `storage::BACKUP_SETTING_KEYS`（否则备份/导入丢设置），
+/// 并有单测守住两者一致。
 const ALLOWED_SETTING_KEYS: &[&str] = &[
     "defaultProviderId",
     "defaultParams",
     "promptTemplates",
     "theme",
+    "glassAppearance",
+    "uiMode",
+    "queueConcurrency",
+    "cacheRetentionDays",
 ];
 
 fn check_setting_key(key: &str) -> Result<(), String> {
@@ -21,12 +28,38 @@ fn check_setting_key(key: &str) -> Result<(), String> {
     }
 }
 
-/// 枚举型设置的取值校验。目前只有 theme：写入脏值后启动恢复会静默回退到
-/// system，用户只会看到"设置没保存"却无从排查，因此在写入端直接拒绝。
+/// 枚举型设置的取值校验。写入脏值后启动恢复会静默回退到默认值，用户只会看到
+/// "设置没保存"却无从排查，因此在写入端直接拒绝。
 fn check_setting_value(key: &str, value: &str) -> Result<(), String> {
     match key {
         "theme" if !matches!(value, "system" | "light" | "dark") => {
             Err(format!("主题取值非法: {value}"))
+        }
+        "glassAppearance" if !matches!(value, "clear" | "standard" | "tinted") => {
+            Err(format!("玻璃质感取值非法: {value}"))
+        }
+        "uiMode" if !matches!(value, "simple" | "expert") => {
+            Err(format!("界面模式取值非法: {value}"))
+        }
+        "queueConcurrency"
+            if !matches!(
+                value.trim().parse::<i64>(),
+                Ok(n) if (crate::commands::queue::MIN_CONCURRENCY
+                    ..=crate::commands::queue::MAX_CONCURRENCY)
+                    .contains(&n)
+            ) =>
+        {
+            Err(format!("队列并发数取值非法: {value}"))
+        }
+        "cacheRetentionDays"
+            if !matches!(
+                value.trim().parse::<i64>(),
+                Ok(n) if (storage::MIN_CACHE_RETENTION_DAYS
+                    ..=storage::MAX_CACHE_RETENTION_DAYS)
+                    .contains(&n)
+            ) =>
+        {
+            Err(format!("缓存保留天数取值非法（应为 1–365）: {value}"))
         }
         _ => Ok(()),
     }
@@ -111,8 +144,21 @@ mod tests {
         assert!(check_setting_key("defaultParams").is_ok());
         assert!(check_setting_key("promptTemplates").is_ok());
         assert!(check_setting_key("theme").is_ok());
+        assert!(check_setting_key("glassAppearance").is_ok());
+        assert!(check_setting_key("queueConcurrency").is_ok());
+        assert!(check_setting_key("cacheRetentionDays").is_ok());
         assert!(check_setting_key("extraParams:1").is_err());
         assert!(check_setting_key("任意 key").is_err());
+    }
+
+    /// 白名单与备份清单必须逐项一致：漏在备份清单里，用户会发现"设置重启后没了"
+    #[test]
+    fn whitelist_matches_backup_keys() {
+        let mut allowed = ALLOWED_SETTING_KEYS.to_vec();
+        let mut backup = crate::storage::BACKUP_SETTING_KEYS.to_vec();
+        allowed.sort_unstable();
+        backup.sort_unstable();
+        assert_eq!(allowed, backup);
     }
 
     /// 主题只接受三态值：脏值会让启动恢复静默回退，故写入端直接拒绝
@@ -127,10 +173,56 @@ mod tests {
         assert!(check_setting_value("defaultParams", "anything").is_ok());
     }
 
+    #[test]
+    fn glass_value_validation() {
+        for ok in ["clear", "standard", "tinted"] {
+            assert!(
+                check_setting_value("glassAppearance", ok).is_ok(),
+                "{ok} 应被接受"
+            );
+        }
+        assert!(check_setting_value("glassAppearance", "blurred").is_err());
+        assert!(check_setting_value("glassAppearance", "").is_err());
+    }
+
+    /// 队列并发数只接受 1–4 的整数字符串
+    #[test]
+    fn queue_concurrency_value_validation() {
+        for ok in ["1", "2", "3", "4", " 2 "] {
+            assert!(
+                check_setting_value("queueConcurrency", ok).is_ok(),
+                "{ok} 应被接受"
+            );
+        }
+        for bad in ["0", "5", "-1", "1.5", "", "two"] {
+            assert!(
+                check_setting_value("queueConcurrency", bad).is_err(),
+                "{bad} 应被拒绝"
+            );
+        }
+    }
+
     /// A4：thinkingConfig 含加密 Key，只能经 save_thinking_config 写入
     #[test]
     fn whitelist_rejects_thinking_config() {
         assert!(check_setting_key("thinkingConfig").is_err());
+    }
+
+    /// 缓存保留天数只接受 1–365 的整数字符串
+    #[test]
+    fn cache_retention_value_validation() {
+        for ok in ["1", "30", "365", " 7 "] {
+            assert!(
+                check_setting_value("cacheRetentionDays", ok).is_ok(),
+                "{ok} 应被接受"
+            );
+        }
+        for bad in ["0", "366", "-1", "1.5", "", "thirty"] {
+            assert!(
+                check_setting_value("cacheRetentionDays", bad).is_err(),
+                "{bad} 应被拒绝"
+            );
+        }
     }
 
     #[test]

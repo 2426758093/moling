@@ -1,15 +1,18 @@
 //! 启动时的孤儿图片回收。
 //!
-//! 磁盘上的图片是「无主」的：`history.file_path` 与 `messages.images_json[].path`
-//! 各自引用同一文件，两处删除互不知情，删会话/删消息都不回收磁盘文件。长期使用后
-//! `images/` 会持续膨胀。
+//! 磁盘上的图片是「无主」的：`history.file_path`、`messages.images_json[].path`、
+//! `jobs.input_json.referencePaths`、`workflow_presets.refs_json[].path` 各自引用
+//! 同一批文件，多处删除互不知情，删会话/删消息/删排队都不会回收磁盘文件。长期
+//! 使用后 `images/` 与 `refs/` 会持续膨胀。
 //!
-//! 这里在启动后**后台**扫一次，把「磁盘有、数据库全无引用、且已存在超过 1 小时」
-//! 的图片**移动**到 `images/.trash/` 保留 30 天，而不是直接删除——误删用户作品
-//! 无法挽回，而移动是同盘原子操作、可人工恢复。
+//! 这里在启动后**后台**扫一次（设置里的「立即清理缓存」复用同一实现），把
+//! 「磁盘有、数据库全无引用、且已存在超过 1 小时」的图片**移动**到各目录下的
+//! `.trash/`，保留期到期后再删除——误删用户作品无法挽回，而移动是同盘原子操作、
+//! 可人工恢复。
 
 use crate::image_store;
 use crate::storage;
+use serde::Serialize;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -20,9 +23,6 @@ use std::time::{Duration, SystemTime};
 /// 之间的毫秒级窗口，以及生成被停止/崩溃打断后的短暂残留。1 小时比该窗口宽
 /// 六个数量级，代价只是孤儿多留到下一次启动。
 const ORPHAN_MIN_AGE: Duration = Duration::from_secs(60 * 60);
-
-/// 回收站保留期：误判可人工恢复的时间窗
-const TRASH_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 /// 启动后延迟多久开始扫描：让首屏 `list_history`（全量读盘 + base64）先占 IO
 const STARTUP_DELAY: Duration = Duration::from_secs(2);
@@ -44,11 +44,12 @@ enum Mode {
     DryRun,
     /// 完全关闭
     Off,
-    /// 越过两道安全哨兵强制清理（人为确认后使用）
+    /// 越过安全哨兵强制清理（人为确认后使用）
     Force,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Stats {
     pub scanned: usize,
     pub kept: usize,
@@ -60,6 +61,10 @@ pub struct Stats {
     /// 本次回填生成的缩略图数量
     pub thumbs_created: usize,
     pub errors: usize,
+    /// 参考图目录扫描结果（单独统计，避免和画廊图混淆）
+    pub refs_scanned: usize,
+    pub refs_kept: usize,
+    pub refs_moved: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,19 +79,34 @@ enum Decision {
     Ignore,
 }
 
+/// 保留天数（设置项 cacheRetentionDays 已做 1–365 校验，这里兜底 clamps）
+fn retention_duration(days: i64) -> Duration {
+    let days = days.clamp(
+        storage::MIN_CACHE_RETENTION_DAYS,
+        storage::MAX_CACHE_RETENTION_DAYS,
+    );
+    Duration::from_secs(days as u64 * 24 * 60 * 60)
+}
+
 /// 启动入口：后台线程调用，**绝不 panic**（release 是 `panic = "abort"`，
 /// 扫描线程 panic 会直接杀掉整个应用）。
-pub fn run(data_dir: &Path) {
+pub fn run(media_root: &Path) {
     let mode = mode_from_env();
     if mode == Mode::Off {
         tracing::info!("孤儿图片扫描已关闭（MOLING_IMAGE_GC=off）");
         return;
     }
     std::thread::sleep(STARTUP_DELAY);
-    match scan(data_dir, mode, SystemTime::now()) {
+    let retention = retention_duration(storage::cache_retention_days());
+    match scan(media_root, mode, SystemTime::now(), retention) {
         Ok(stats) => {
             // 日志默认只落 WARN 以上：有动作才留痕，无动作保持安静
-            if stats.moved > 0 || stats.pruned > 0 || stats.thumbs_created > 0 || stats.errors > 0 {
+            if stats.moved > 0
+                || stats.refs_moved > 0
+                || stats.pruned > 0
+                || stats.thumbs_created > 0
+                || stats.errors > 0
+            {
                 tracing::warn!("孤儿图片扫描完成: {stats:?}");
             } else {
                 tracing::info!("孤儿图片扫描完成（无动作）: {stats:?}");
@@ -94,6 +114,16 @@ pub fn run(data_dir: &Path) {
         }
         Err(e) => tracing::warn!("孤儿图片扫描失败（不影响启动）: {e}"),
     }
+}
+
+/// 设置页「立即清理缓存」：与启动清理同一实现，保留天数取当前设置。
+pub fn clean_cache(media_root: &Path, retention_days: i64) -> Result<Stats, String> {
+    scan(
+        media_root,
+        Mode::Move,
+        SystemTime::now(),
+        retention_duration(retention_days),
+    )
 }
 
 fn mode_from_env() -> Mode {
@@ -110,27 +140,99 @@ fn mode_from_env() -> Mode {
     }
 }
 
-fn scan(data_dir: &Path, mode: Mode, now: SystemTime) -> Result<Stats, String> {
-    let images = data_dir.join("images");
-    if !images.is_dir() {
+fn scan(
+    media_root: &Path,
+    mode: Mode,
+    now: SystemTime,
+    retention: Duration,
+) -> Result<Stats, String> {
+    let images = media_root.join("images");
+    let refs_dir = media_root.join("refs");
+    if !images.is_dir() && !refs_dir.is_dir() {
         return Ok(Stats::default());
     }
     let refs = storage::referenced_image_paths_snapshot().map_err(|e| e.to_string())?;
 
     let mut stats = Stats::default();
-    let mut candidates: Vec<(PathBuf, String, Duration)> = Vec::new();
-    let mut stale = 0usize;
-    // 原图 stem 集合：用于清理源文件已消失的缩略图
-    let mut stems: HashSet<String> = HashSet::new();
 
-    let entries = std::fs::read_dir(&images).map_err(|e| format!("读取图片目录失败: {e}"))?;
+    if images.is_dir() {
+        let mut stems = HashSet::new();
+        let collected = collect(&images, &refs, now, Some(&mut stems))?;
+        stats.scanned = collected.scanned;
+        stats.kept = collected.kept;
+        stats.skipped_recent = collected.skipped_recent;
+        stats.candidates = collected.candidates.len();
+
+        // 安全哨兵：引用集合与当前目录完全不匹配时，一律不动文件
+        if let Some(reason) = sanity_skip(&refs, &images, collected.stale, mode == Mode::Force) {
+            tracing::error!(
+                "孤儿图片扫描已整体跳过：{reason}；如确认无误可设 MOLING_IMAGE_GC=force"
+            );
+            return Ok(stats);
+        }
+
+        // dry-run 只观察不写入：跳过缩略图回填
+        if mode != Mode::DryRun {
+            backfill_thumbs(&images, &refs, now, &mut stats);
+        }
+        move_candidates(
+            &images,
+            collected.candidates,
+            mode,
+            &mut stats,
+            ScanKind::Images,
+        );
+        prune_thumbs(&images, &stems, now, &mut stats);
+        prune_trash(&images.join(".trash"), now, retention, &mut stats);
+    }
+
+    if refs_dir.is_dir() {
+        let collected = collect(&refs_dir, &refs, now, None)?;
+        stats.refs_scanned = collected.scanned;
+        stats.refs_kept = collected.kept;
+        // 参考图是缓存性质：库里没有任何参考图引用时，全部视为可回收，
+        // 不做「空引用即疑似库损坏」的哨兵（否则永远清不掉孤儿参考图）。
+        move_candidates(
+            &refs_dir,
+            collected.candidates,
+            mode,
+            &mut stats,
+            ScanKind::Refs,
+        );
+        prune_trash(&refs_dir.join(".trash"), now, retention, &mut stats);
+    }
+
+    Ok(stats)
+}
+
+struct Collected {
+    candidates: Vec<(PathBuf, String, Duration)>,
+    /// 超龄文件数（kept + candidates），安全哨兵用
+    stale: usize,
+    scanned: usize,
+    kept: usize,
+    skipped_recent: usize,
+}
+
+fn collect(
+    dir: &Path,
+    refs: &HashSet<String>,
+    now: SystemTime,
+    mut stems: Option<&mut HashSet<String>>,
+) -> Result<Collected, String> {
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("读取图片目录失败: {e}"))?;
+    let mut out = Collected {
+        candidates: Vec::new(),
+        stale: 0,
+        scanned: 0,
+        kept: 0,
+        skipped_recent: 0,
+    };
     for entry in entries {
         let Ok(entry) = entry else {
-            stats.errors += 1;
             continue;
         };
         let Ok(file_type) = entry.file_type() else {
-            stats.errors += 1;
             continue;
         };
         let name = entry.file_name().to_string_lossy().to_string();
@@ -143,38 +245,46 @@ fn scan(data_dir: &Path, mode: Mode, now: SystemTime) -> Result<Stats, String> {
         let path_key = storage::normalize_path_key(&entry.path().to_string_lossy());
         let referenced = refs.contains(&path_key);
         if file_type.is_file() {
-            stats.scanned += 1;
-            if let Some(stem) = Path::new(&name).file_stem().and_then(|s| s.to_str()) {
-                stems.insert(stem.to_string());
+            out.scanned += 1;
+            if let Some(set) = stems.as_deref_mut() {
+                if let Some(stem) = Path::new(&name).file_stem().and_then(|s| s.to_str()) {
+                    set.insert(stem.to_string());
+                }
             }
         }
         match decide(&name, file_type.is_file(), age, referenced) {
             Decision::Reclaim => {
-                stale += 1;
-                candidates.push((entry.path(), name, age));
+                out.stale += 1;
+                out.candidates.push((entry.path(), name, age));
             }
             Decision::Keep => {
-                stale += 1;
-                stats.kept += 1;
+                out.stale += 1;
+                out.kept += 1;
             }
-            Decision::SkipRecent => stats.skipped_recent += 1,
+            Decision::SkipRecent => out.skipped_recent += 1,
             Decision::Ignore => {}
         }
     }
-    stats.candidates = candidates.len();
+    Ok(out)
+}
 
-    // 安全哨兵：引用集合与当前目录完全不匹配时，一律不动文件
-    if let Some(reason) = sanity_skip(&refs, &images, stale, mode == Mode::Force) {
-        tracing::error!("孤儿图片扫描已整体跳过：{reason}；如确认无误可设 MOLING_IMAGE_GC=force");
-        return Ok(stats);
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ScanKind {
+    Images,
+    Refs,
+}
+
+fn move_candidates(
+    dir: &Path,
+    candidates: Vec<(PathBuf, String, Duration)>,
+    mode: Mode,
+    stats: &mut Stats,
+    kind: ScanKind,
+) {
+    if candidates.is_empty() {
+        return;
     }
-
-    // dry-run 只观察不写入：跳过缩略图回填
-    if mode != Mode::DryRun {
-        backfill_thumbs(&images, &refs, now, &mut stats);
-    }
-
-    let trash = images.join(".trash");
+    let trash = dir.join(".trash");
     for (path, name, age) in candidates {
         if mode == Mode::DryRun {
             tracing::warn!("[dry-run] 将回收 {}（已存在 {:?}）", path.display(), age);
@@ -189,8 +299,12 @@ fn scan(data_dir: &Path, mode: Mode, now: SystemTime) -> Result<Stats, String> {
         let target = trash.join(format!("{}_{:04x}_{}", stamp, rand::random::<u16>(), name));
         match std::fs::rename(&path, &target) {
             Ok(()) => {
-                stats.moved += 1;
-                image_store::remove_thumb(&path.to_string_lossy());
+                if kind == ScanKind::Images {
+                    stats.moved += 1;
+                    image_store::remove_thumb(&path.to_string_lossy());
+                } else {
+                    stats.refs_moved += 1;
+                }
                 tracing::warn!(
                     "孤儿图片已移入回收站: {} → {}",
                     path.display(),
@@ -203,10 +317,6 @@ fn scan(data_dir: &Path, mode: Mode, now: SystemTime) -> Result<Stats, String> {
             }
         }
     }
-
-    prune_thumbs(&images, &stems, now, &mut stats);
-    prune_trash(&trash, now, &mut stats);
-    Ok(stats)
 }
 
 /// 为存量作品回填缩略图：只处理仍在库中引用、且已存在超过 1 小时的原图，
@@ -346,7 +456,7 @@ fn sanity_skip(
     }
 }
 
-fn prune_trash(trash: &Path, now: SystemTime, stats: &mut Stats) {
+fn prune_trash(trash: &Path, now: SystemTime, retention: Duration, stats: &mut Stats) {
     let Ok(entries) = std::fs::read_dir(trash) else {
         return;
     };
@@ -360,7 +470,7 @@ fn prune_trash(trash: &Path, now: SystemTime, stats: &mut Stats) {
         let Ok(modified) = meta.modified() else {
             continue;
         };
-        if now.duration_since(modified).unwrap_or_default() < TRASH_RETENTION {
+        if now.duration_since(modified).unwrap_or_default() < retention {
             continue;
         }
         match std::fs::remove_file(entry.path()) {
@@ -384,14 +494,20 @@ mod tests {
             .collect()
     }
 
-    /// 缩略图回填只处理仍被引用的超龄原图；源文件消失的缩略图会被清理
-    #[test]
-    fn thumbs_are_backfilled_and_pruned() {
+    fn temp_images(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "moling_gc_thumb_{}_{:04x}",
+            "moling_gc_{tag}_{}_{:04x}",
             std::process::id(),
             rand::random::<u16>()
         ));
+        std::fs::create_dir_all(&dir).expect("创建目录");
+        dir
+    }
+
+    /// 缩略图回填只处理仍被引用的超龄原图；源文件消失的缩略图会被清理
+    #[test]
+    fn thumbs_are_backfilled_and_pruned() {
+        let dir = temp_images("thumb");
         let images = dir.join("images");
         let thumbs = images.join(".thumb");
         std::fs::create_dir_all(&thumbs).expect("创建目录");
@@ -417,6 +533,66 @@ mod tests {
         prune_thumbs(&images, &stems, now, &mut stats);
         assert!(!thumbs.join("gone.jpg").exists());
         assert!(keep_thumb.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 参考图目录：未引用的超龄文件进入 refs/.trash，被引用的保留
+    #[test]
+    fn orphan_refs_move_to_trash_and_referenced_stay() {
+        let dir = temp_images("refs");
+        let keep = dir.join("keep.png");
+        let orphan = dir.join("orphan.png");
+        std::fs::write(&keep, b"keep").unwrap();
+        std::fs::write(&orphan, b"orphan").unwrap();
+
+        let refs = refs_with(&[keep.to_str().unwrap()]);
+        let now = SystemTime::now() + Duration::from_secs(2 * 60 * 60);
+        let collected = collect(&dir, &refs, now, None).expect("扫描参考图");
+        assert_eq!(collected.candidates.len(), 1);
+        assert_eq!(collected.kept, 1);
+
+        let mut stats = Stats::default();
+        move_candidates(
+            &dir,
+            collected.candidates,
+            Mode::Move,
+            &mut stats,
+            ScanKind::Refs,
+        );
+        assert_eq!(stats.refs_moved, 1);
+        assert!(keep.exists(), "被引用的参考图不能被移动");
+        assert!(!orphan.exists());
+        let trash_entries = std::fs::read_dir(dir.join(".trash")).unwrap().count();
+        assert_eq!(trash_entries, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 回收站保留期：未到期保留，到期删除
+    #[test]
+    fn trash_prunes_only_after_retention() {
+        let dir = temp_images("trash");
+        let trash = dir.join(".trash");
+        std::fs::create_dir_all(&trash).unwrap();
+        let old = trash.join("old.png");
+        std::fs::write(&old, b"x").unwrap();
+        let retention = Duration::from_secs(30 * 24 * 60 * 60);
+
+        let mut stats = Stats::default();
+        prune_trash(
+            &trash,
+            SystemTime::now() + Duration::from_secs(10 * 24 * 60 * 60),
+            retention,
+            &mut stats,
+        );
+        assert!(old.exists(), "未到保留期不得删除");
+        prune_trash(
+            &trash,
+            SystemTime::now() + Duration::from_secs(31 * 24 * 60 * 60),
+            retention,
+            &mut stats,
+        );
+        assert!(!old.exists());
+        assert_eq!(stats.pruned, 1);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -484,5 +660,19 @@ mod tests {
         // 少量文件（首次使用）允许清理
         assert!(sanity_skip(&empty, images, EMPTY_REFS_FILE_THRESHOLD - 1, false).is_none());
         assert!(sanity_skip(&empty, images, 10, true).is_none());
+    }
+
+    /// 保留天数越界被夹到 1–365，避免设置被手改成 0 导致清理永不执行
+    #[test]
+    fn retention_duration_is_clamped() {
+        assert_eq!(retention_duration(0), Duration::from_secs(24 * 60 * 60));
+        assert_eq!(
+            retention_duration(999),
+            Duration::from_secs(365 * 24 * 60 * 60)
+        );
+        assert_eq!(
+            retention_duration(30),
+            Duration::from_secs(30 * 24 * 60 * 60)
+        );
     }
 }

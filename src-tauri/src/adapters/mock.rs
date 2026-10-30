@@ -1,7 +1,56 @@
-use super::{AdapterError, EditRequest, GenerateRequest, ImageAdapter, ProviderConfig};
+use super::{
+    AdapterError, EditRequest, GenerateRequest, ImageAdapter, ProviderConfig, TransformRequest,
+};
 use base64::Engine;
 
 pub struct MockAdapter;
+
+impl MockAdapter {
+    /// 本地真实放大（Lanczos3），让放大链路不联网也能完整验收。
+    /// detail 模式额外做轻微 unsharpen；`restyle` 用通道轮换模拟换风格（Mock 没有风格模型）。
+    fn upscale_data_url(
+        image_b64: &str,
+        scale: u32,
+        mode: &str,
+        restyle: bool,
+    ) -> Result<String, AdapterError> {
+        let raw = crate::image_store::strip_data_url(image_b64);
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(raw)
+            .map_err(|e| AdapterError::Other {
+                message: format!("图片 base64 解码失败: {e}"),
+            })?;
+        let img = image::load_from_memory(&bytes).map_err(|e| AdapterError::Other {
+            message: format!("图片解码失败: {e}"),
+        })?;
+        let w = img.width().saturating_mul(scale.max(1)).max(1);
+        let h = img.height().saturating_mul(scale.max(1)).max(1);
+        let resized = img.resize_exact(w, h, image::imageops::FilterType::Lanczos3);
+        let mut out_img = if mode == "detail" {
+            resized.unsharpen(0.8, 1)
+        } else {
+            resized
+        };
+        if restyle {
+            let mut rgba = out_img.to_rgba8();
+            for px in rgba.pixels_mut() {
+                px.0.swap(0, 2);
+                px.0[1] = px.0[1].saturating_add(20);
+            }
+            out_img = image::DynamicImage::ImageRgba8(rgba);
+        }
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        out_img
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .map_err(|e| AdapterError::Other {
+                message: format!("放大结果编码失败: {e}"),
+            })?;
+        Ok(format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(cursor.into_inner())
+        ))
+    }
+}
 
 fn placeholder_svg(prompt: &str, width: u32, height: u32, seed: u64) -> String {
     let hue = (seed % 360) as f32;
@@ -93,6 +142,16 @@ impl ImageAdapter for MockAdapter {
                 } else {
                     format!("[参考图x{}] {}", req.images.len(), req.prompt)
                 };
+                // 回显负向词，便于在 GUI 里确认整条参数链路生效
+                let label = match req
+                    .negative_prompt
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                {
+                    Some(neg) => format!("{label} [负向] {neg}"),
+                    None => label,
+                };
                 let svg =
                     placeholder_svg(&label, req.width, req.height, seed.wrapping_add(hue_shift));
                 let b64 = base64::engine::general_purpose::STANDARD.encode(svg.as_bytes());
@@ -114,16 +173,87 @@ impl ImageAdapter for MockAdapter {
             } else {
                 "edited"
             };
-            let svg = placeholder_svg(
-                &format!("{} [{}]", req.prompt, marker),
-                req.width,
-                req.height,
-                seed,
-            );
+            let label = match req
+                .negative_prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|n| !n.is_empty())
+            {
+                Some(neg) => format!("{} [{}] [负向] {}", req.prompt, marker, neg),
+                None => format!("{} [{}]", req.prompt, marker),
+            };
+            let svg = placeholder_svg(&label, req.width, req.height, seed);
             Ok(format!(
                 "data:image/svg+xml;base64,{}",
                 base64::engine::general_purpose::STANDARD.encode(svg.as_bytes())
             ))
         })
+    }
+
+    fn transform<'a>(
+        &'a self,
+        _config: &'a ProviderConfig,
+        req: &'a TransformRequest,
+    ) -> super::BoxFuture<'a, Result<String, AdapterError>> {
+        Box::pin(async move {
+            let restyle = req.scale <= 1 && !req.prompt.trim().is_empty();
+            Self::upscale_data_url(&req.image_b64, req.scale, &req.mode, restyle)
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png_b64(w: u32, h: u32) -> String {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(w, h))
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .unwrap();
+        base64::engine::general_purpose::STANDARD.encode(cursor.into_inner())
+    }
+
+    /// Mock 放大是真实 resize：尺寸必须严格翻倍（支持 data URL 与裸 base64 两种入参）
+    #[test]
+    fn upscale_doubles_dimensions() {
+        let b64 = png_b64(64, 32);
+        let out = MockAdapter::upscale_data_url(
+            &format!("data:image/png;base64,{b64}"),
+            2,
+            "detail",
+            false,
+        )
+        .unwrap();
+        let raw = out.split_once(',').expect("必须返回 data URL").1;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(raw)
+            .unwrap();
+        let img = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((img.width(), img.height()), (128, 64));
+
+        let out = MockAdapter::upscale_data_url(&b64, 4, "faithful", false).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(out.split_once(',').unwrap().1)
+            .unwrap();
+        let img = image::load_from_memory(&bytes).unwrap();
+        assert_eq!((img.width(), img.height()), (256, 128));
+    }
+
+    /// 风格转换（restyle）必须真的改变像素，否则界面上看不出任何差别
+    #[test]
+    fn upscale_restyle_changes_pixels() {
+        let b64 = png_b64(16, 16);
+        let plain = MockAdapter::upscale_data_url(&b64, 1, "faithful", false).unwrap();
+        let styled = MockAdapter::upscale_data_url(&b64, 1, "faithful", true).unwrap();
+        assert_ne!(plain, styled, "restyle 必须改变输出");
+    }
+
+    /// 坏图给出可读错误，不 panic
+    #[test]
+    fn upscale_rejects_broken_base64() {
+        let err =
+            MockAdapter::upscale_data_url("!!!not-base64!!!", 2, "detail", false).unwrap_err();
+        assert!(err.message().contains("解码失败"), "{}", err.message());
     }
 }

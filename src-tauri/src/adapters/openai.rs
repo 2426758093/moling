@@ -1,6 +1,6 @@
 use super::{
-    classify_http, classify_reqwest, http_client, AdapterError, EditRequest, GenerateRequest,
-    ImageAdapter, ProviderConfig,
+    classify_http, classify_reqwest, http_client, prompt_with_negative, AdapterError, EditRequest,
+    GenerateRequest, ImageAdapter, ProviderConfig, TransformRequest,
 };
 use base64::Engine;
 
@@ -89,6 +89,70 @@ impl OpenAiAdapter {
         std::time::Duration::from_secs(config.timeout_secs)
     }
 
+    /// 构造并发送 /images/edits 请求（编辑与变换共用同一端点）。
+    async fn post_edit(
+        config: &ProviderConfig,
+        model: &str,
+        prompt: &str,
+        image_bytes: Vec<u8>,
+        mask_bytes: Option<Vec<u8>>,
+        size: Option<String>,
+    ) -> Result<ImageResponse, AdapterError> {
+        let mut form = reqwest::multipart::Form::new()
+            .text("model", model.to_string())
+            .text("prompt", prompt.to_string());
+        // RA-02：编辑分支同样吸附到服务商支持的尺寸档位，与 generate 保持一致
+        if let Some(size) = size {
+            form = form.text("size", size);
+        }
+        form = form.part(
+            "image",
+            reqwest::multipart::Part::bytes(image_bytes)
+                .file_name("image.png")
+                .mime_str("image/png")
+                .map_err(|e| AdapterError::Other {
+                    message: e.to_string(),
+                })?,
+        );
+        if let Some(mask_bytes) = mask_bytes {
+            form = form.part(
+                "mask",
+                reqwest::multipart::Part::bytes(mask_bytes)
+                    .file_name("mask.png")
+                    .mime_str("image/png")
+                    .map_err(|e| AdapterError::Other {
+                        message: e.to_string(),
+                    })?,
+            );
+        }
+        let resp = http_client()
+            .post(format!("{}/images/edits", Self::base(config)))
+            .timeout(Self::timeout(config))
+            .bearer_auth(&config.api_key)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| classify_reqwest(&e))?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(classify_http(status, &text));
+        }
+        resp.json().await.map_err(|e| AdapterError::Other {
+            message: format!("响应解析失败: {}", e),
+        })
+    }
+
+    async fn first_image_b64(
+        parsed: ImageResponse,
+        timeout: std::time::Duration,
+    ) -> Result<String, AdapterError> {
+        let entry = parsed.data.first().ok_or_else(|| AdapterError::Other {
+            message: "API 未返回图片".into(),
+        })?;
+        Self::fetch_image_b64(entry, timeout).await
+    }
+
     /// 下载图片 URL（RA-05：必须带服务商超时，避免下载阶段无限挂起）
     async fn fetch_image_b64(
         entry: &ImageEntry,
@@ -111,6 +175,47 @@ impl OpenAiAdapter {
             message: "API 返回的图片缺少 b64_json 与 url 字段".into(),
         })
     }
+}
+
+/// 无原生超分端点时，用指令化编辑表达放大：faithful 保真、detail 加细节。
+/// 风格转换（scale ≤ 1 且带风格描述）换用换风格措辞，不出现无意义的 "1x"。
+pub(crate) fn transform_prompt(mode: &str, scale: u32, extra: &str) -> String {
+    let extra = extra.trim();
+    if scale <= 1 && !extra.is_empty() {
+        return format!(
+            "Restyle this image following the description below. Keep the subject, composition, \
+             identity and layout intact; only change the rendering style.\n\n{extra}"
+        );
+    }
+    let base = if mode == "faithful" {
+        format!(
+            "Upscale this image to {scale}x resolution. Preserve the exact composition, colors, \
+             identity and text; do not add, remove or restyle any element."
+        )
+    } else {
+        format!(
+            "Upscale this image to {scale}x resolution. Enhance fine details, texture and \
+             sharpness while keeping composition and colors faithful."
+        )
+    };
+    if extra.is_empty() {
+        base
+    } else {
+        format!("{base}\n\n{extra}")
+    }
+}
+
+/// 按原图尺寸 × 倍数得到服务商支持的尺寸档位；图片无法解码时不带 size 字段。
+/// 风格转换（scale ≤ 1）不带 size：让服务商保持原尺寸，只换风格。
+fn scaled_size(bytes: &[u8], scale: u32) -> Option<String> {
+    if scale <= 1 {
+        return None;
+    }
+    let img = image::load_from_memory(bytes).ok()?;
+    Some(snap_size(
+        img.width().saturating_mul(scale.max(1)),
+        img.height().saturating_mul(scale.max(1)),
+    ))
 }
 
 impl ImageAdapter for OpenAiAdapter {
@@ -149,7 +254,7 @@ impl ImageAdapter for OpenAiAdapter {
         Box::pin(async move {
             let mut body = serde_json::to_value(GenerationBody {
                 model: req.model.clone(),
-                prompt: req.prompt.clone(),
+                prompt: prompt_with_negative(&req.prompt, req.negative_prompt.as_deref()),
                 // count 映射为 OpenAI n 参数；多图返回在下方按 data 数组逐项解析
                 n: req.count.max(1),
                 size: snap_size(req.width, req.height),
@@ -242,56 +347,45 @@ impl ImageAdapter for OpenAiAdapter {
                 .map_err(|e| AdapterError::Other {
                     message: format!("图片 base64 解码失败: {}", e),
                 })?;
-            let mut form = reqwest::multipart::Form::new()
-                .text("model", req.model.clone())
-                .text("prompt", req.prompt.clone())
-                // RA-02：编辑分支同样吸附到服务商支持的尺寸档位，与 generate 保持一致
-                .text("size", snap_size(req.width, req.height))
-                .part(
-                    "image",
-                    reqwest::multipart::Part::bytes(image_bytes)
-                        .file_name("image.png")
-                        .mime_str("image/png")
+            let mask_bytes = match &req.mask_b64 {
+                Some(mask_b64) => Some(
+                    base64::engine::general_purpose::STANDARD
+                        .decode(mask_b64)
                         .map_err(|e| AdapterError::Other {
-                            message: e.to_string(),
+                            message: format!("蒙版 base64 解码失败: {}", e),
                         })?,
-                );
-            if let Some(mask_b64) = &req.mask_b64 {
-                let mask_bytes = base64::engine::general_purpose::STANDARD
-                    .decode(mask_b64)
-                    .map_err(|e| AdapterError::Other {
-                        message: format!("蒙版 base64 解码失败: {}", e),
-                    })?;
-                form = form.part(
-                    "mask",
-                    reqwest::multipart::Part::bytes(mask_bytes)
-                        .file_name("mask.png")
-                        .mime_str("image/png")
-                        .map_err(|e| AdapterError::Other {
-                            message: e.to_string(),
-                        })?,
-                );
-            }
-            let resp = http_client()
-                .post(format!("{}/images/edits", Self::base(config)))
-                .timeout(Self::timeout(config))
-                .bearer_auth(&config.api_key)
-                .multipart(form)
-                .send()
-                .await
-                .map_err(|e| classify_reqwest(&e))?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                return Err(classify_http(status, &text));
-            }
-            let parsed: ImageResponse = resp.json().await.map_err(|e| AdapterError::Other {
-                message: format!("响应解析失败: {}", e),
-            })?;
-            let entry = parsed.data.first().ok_or_else(|| AdapterError::Other {
-                message: "API 未返回图片".into(),
-            })?;
-            Self::fetch_image_b64(entry, Self::timeout(config)).await
+                ),
+                None => None,
+            };
+            let parsed = Self::post_edit(
+                config,
+                &req.model,
+                &prompt_with_negative(&req.prompt, req.negative_prompt.as_deref()),
+                image_bytes,
+                mask_bytes,
+                Some(snap_size(req.width, req.height)),
+            )
+            .await?;
+            Self::first_image_b64(parsed, Self::timeout(config)).await
+        })
+    }
+
+    fn transform<'a>(
+        &'a self,
+        config: &'a ProviderConfig,
+        req: &'a TransformRequest,
+    ) -> super::BoxFuture<'a, Result<String, AdapterError>> {
+        Box::pin(async move {
+            let image_bytes = base64::engine::general_purpose::STANDARD
+                .decode(&req.image_b64)
+                .map_err(|e| AdapterError::Other {
+                    message: format!("图片 base64 解码失败: {}", e),
+                })?;
+            let size = scaled_size(&image_bytes, req.scale);
+            let prompt = transform_prompt(&req.mode, req.scale, &req.prompt);
+            let parsed =
+                Self::post_edit(config, &req.model, &prompt, image_bytes, None, size).await?;
+            Self::first_image_b64(parsed, Self::timeout(config)).await
         })
     }
 }
@@ -317,5 +411,44 @@ mod tests {
         // 恰好等于上限时不截断、不补省略号
         let exact: String = "边".repeat(300);
         assert_eq!(truncate_preview(&exact, 300), exact);
+    }
+
+    /// 放大提示词：倍数写进指令；faithful 强调保真，detail 强调细节；风格词追加在末尾
+    #[test]
+    fn transform_prompt_modes_and_extra() {
+        let faithful = transform_prompt("faithful", 2, "");
+        assert!(faithful.contains("2x"), "{faithful}");
+        assert!(
+            faithful.contains("Preserve the exact composition"),
+            "{faithful}"
+        );
+        let detail = transform_prompt("detail", 4, "  watercolor style  ");
+        assert!(detail.contains("4x"), "{detail}");
+        assert!(detail.contains("Enhance fine details"), "{detail}");
+        assert!(detail.ends_with("watercolor style"), "{detail}");
+        assert_ne!(faithful, transform_prompt("detail", 2, ""));
+        // 风格转换：scale=1 带风格词时是换风格指令，不出现 "1x"
+        let style = transform_prompt("detail", 1, "  ukiyo-e woodblock  ");
+        assert!(style.contains("Restyle this image"), "{style}");
+        assert!(!style.contains("1x"), "{style}");
+        assert!(style.ends_with("ukiyo-e woodblock"), "{style}");
+    }
+
+    /// 放大尺寸按原图 × 倍数吸附到服务商档位；坏图不带 size；风格转换不带 size
+    #[test]
+    fn scaled_size_snaps_from_decoded_image() {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(400, 400))
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .unwrap();
+        assert_eq!(
+            scaled_size(cursor.get_ref(), 2).as_deref(),
+            Some("1024x1024")
+        );
+        assert!(scaled_size(b"not an image", 2).is_none());
+        assert!(
+            scaled_size(cursor.get_ref(), 1).is_none(),
+            "风格转换保持原尺寸，不带 size 字段"
+        );
     }
 }

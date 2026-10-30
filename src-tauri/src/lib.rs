@@ -1,4 +1,6 @@
 mod adapters;
+mod background;
+mod basic_edit;
 mod commands;
 mod error;
 mod image_gc;
@@ -6,6 +8,7 @@ mod image_store;
 mod key_pool;
 mod logging;
 mod paths;
+mod reference;
 mod storage;
 
 use tauri::Manager;
@@ -64,6 +67,8 @@ fn init_storage_with_recovery(data_dir: &std::path::Path) -> Result<(), String> 
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        // 媒体目录选择（设置页「更改位置」）
+        .plugin(tauri_plugin_dialog::init())
         // 应用内自动更新：端点为空时不联网，不影响启动
         .plugin(tauri_plugin_updater::Builder::new().build())
         // RA-06：生成任务取消注册表（jobId → 取消标记），供 generate_images / cancel_generation 共享
@@ -75,6 +80,9 @@ pub fn run() {
                 .expect("failed to resolve app data dir");
             std::fs::create_dir_all(&data_dir).expect("failed to create app data dir");
             init_tracing(&data_dir);
+            // 媒体根先于数据库初始化：图片落盘路径由它决定，数据库仍在 appData。
+            // 引导文件损坏只回退默认目录，不影响启动。
+            let media_root = paths::init_media_root(app.handle());
             init_storage_with_recovery(&data_dir)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             // 代理需在首个生成请求前生效；配置损坏只落日志，不阻断启动
@@ -91,9 +99,9 @@ pub fn run() {
             commands::spawn_worker(app.handle().clone(), queue_state);
             // 孤儿图片回收：后台执行，不阻塞首屏；内部自带失败兜底与两道安全哨兵，
             // 任何异常都只落日志，不影响启动。显式 drop 句柄 = 刻意 detach。
-            let gc_dir = data_dir.clone();
+            let gc_root = media_root.clone();
             std::mem::drop(tauri::async_runtime::spawn_blocking(move || {
-                image_gc::run(&gc_dir)
+                image_gc::run(&gc_root)
             }));
             // 日志保留：只清理超过 7 天的滚动文件，跳过当天；失败仅落日志
             let logs = logging::logs_dir(&data_dir);
@@ -115,12 +123,19 @@ pub fn run() {
             commands::delete_provider,
             commands::pull_models,
             commands::test_models,
+            commands::get_model_caps,
+            commands::set_model_caps,
             commands::test_connection,
             commands::generate_images,
             commands::cancel_generation,
             commands::edit_image,
+            commands::transform_image,
+            commands::apply_edit,
+            commands::replace_background,
+            commands::list_derived,
             commands::list_history,
             commands::get_history_image,
+            commands::get_history_item,
             commands::set_favorite,
             commands::delete_history,
             commands::set_setting,
@@ -138,11 +153,14 @@ pub fn run() {
             commands::retry_queue_job,
             commands::resume_queue,
             commands::clear_finished_jobs,
+            commands::save_reference_image,
+            commands::read_reference_image,
             commands::get_thinking_config,
             commands::save_thinking_config,
             commands::test_thinking_connection,
             commands::refine_prompt,
             commands::cancel_refine,
+            commands::translate_prompt,
             commands::create_conversation,
             commands::list_conversations,
             commands::delete_conversation,
@@ -154,6 +172,22 @@ pub fn run() {
             commands::get_prompt_templates,
             commands::save_prompt_templates,
             commands::reverse_prompt,
+            commands::list_favorites,
+            commands::upsert_favorite,
+            commands::delete_favorite,
+            commands::list_presets,
+            commands::save_preset,
+            commands::delete_preset,
+            commands::get_media_root,
+            commands::set_media_root,
+            commands::storage_stats,
+            commands::clean_cache,
+            commands::list_canvas_boards,
+            commands::create_canvas_board,
+            commands::get_canvas_board,
+            commands::save_canvas_board,
+            commands::delete_canvas_board,
+            commands::batch_history_thumbs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -110,13 +110,27 @@ fn providers_json() -> serde_json::Value {
 }
 
 /// 明确排除 promptTemplates（含用户提示词）与 thinkingConfig（含密钥密文）；
-/// 代理只保留非密钥字段。
+/// 代理只保留非密钥字段。`mediaRoot` 是机器相关设置，不进备份，只在诊断包输出。
 fn settings_json() -> serde_json::Value {
     let mut out = serde_json::Map::new();
-    for key in ["theme", "defaultProviderId", "defaultParams"] {
+    for key in [
+        "theme",
+        "glassAppearance",
+        "uiMode",
+        "queueConcurrency",
+        "cacheRetentionDays",
+        "defaultProviderId",
+        "defaultParams",
+    ] {
         if let Ok(Some(value)) = storage::get_setting(key) {
             out.insert(key.to_string(), serde_json::Value::String(value));
         }
+    }
+    if let Some(root) = crate::paths::current_media_root() {
+        out.insert(
+            "storage".into(),
+            serde_json::json!({ "mediaRoot": root.to_string_lossy() }),
+        );
     }
     let proxy = crate::adapters::http::stored_config();
     out.insert(

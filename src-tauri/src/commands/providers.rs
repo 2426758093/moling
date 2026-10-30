@@ -1,4 +1,4 @@
-use crate::adapters::{self, ProviderConfig};
+use crate::adapters::{self, template::TemplateSpec, ProviderConfig};
 use crate::key_pool;
 use crate::storage;
 
@@ -16,6 +16,20 @@ pub struct ProviderInput {
     pub template_url: String,
     pub template_body: String,
     pub template_response_path: String,
+    /// 编辑模板（局部重绘 / 消除 / 扩图）；三项全空 = 未配置
+    #[serde(default)]
+    pub edit_template_url: String,
+    #[serde(default)]
+    pub edit_template_body: String,
+    #[serde(default)]
+    pub edit_template_response_path: String,
+    /// 变换模板（放大 / 风格转换）；三项全空 = 未配置
+    #[serde(default)]
+    pub transform_template_url: String,
+    #[serde(default)]
+    pub transform_template_body: String,
+    #[serde(default)]
+    pub transform_template_response_path: String,
     pub extra_params: Option<String>,
 }
 
@@ -27,7 +41,28 @@ fn load_extra_params(id: i64) -> String {
         .unwrap_or_default()
 }
 
-fn row_to_draft<'a>(input: &'a ProviderInput) -> storage::ProviderDraft<'a> {
+/// 编辑/变换模板的三项字段 → 存储列 JSON（全空 → 空串）
+fn spec_json(input: &ProviderInput, transform: bool) -> String {
+    if transform {
+        storage::template_spec_json(
+            &input.transform_template_url,
+            &input.transform_template_body,
+            &input.transform_template_response_path,
+        )
+    } else {
+        storage::template_spec_json(
+            &input.edit_template_url,
+            &input.edit_template_body,
+            &input.edit_template_response_path,
+        )
+    }
+}
+
+fn row_to_draft<'a>(
+    input: &'a ProviderInput,
+    edit_template_json: &'a str,
+    transform_template_json: &'a str,
+) -> storage::ProviderDraft<'a> {
     storage::ProviderDraft {
         name: &input.name,
         base_url: &input.base_url,
@@ -39,6 +74,8 @@ fn row_to_draft<'a>(input: &'a ProviderInput) -> storage::ProviderDraft<'a> {
         template_url: &input.template_url,
         template_body: &input.template_body,
         template_response_path: &input.template_response_path,
+        edit_template_json,
+        transform_template_json,
     }
 }
 
@@ -71,6 +108,8 @@ impl TryFrom<&storage::ProviderRow> for ProviderConfig {
             template_url: row.template_url.clone(),
             template_body: row.template_body.clone(),
             template_response_path: row.template_response_path.clone(),
+            edit_template: TemplateSpec::from_json(&row.edit_template_json),
+            transform_template: TemplateSpec::from_json(&row.transform_template_json),
             extra_params: load_extra_params(row.id),
         })
     }
@@ -121,6 +160,8 @@ fn provider_item(row: &storage::ProviderRow) -> serde_json::Value {
 
 fn to_input(p: &storage::ProviderRow) -> ProviderInput {
     let extra_params = load_extra_params(p.id);
+    let edit = TemplateSpec::from_json(&p.edit_template_json).unwrap_or_default();
+    let transform = TemplateSpec::from_json(&p.transform_template_json).unwrap_or_default();
     ProviderInput {
         id: Some(p.id),
         name: p.name.clone(),
@@ -133,6 +174,12 @@ fn to_input(p: &storage::ProviderRow) -> ProviderInput {
         template_url: p.template_url.clone(),
         template_body: p.template_body.clone(),
         template_response_path: p.template_response_path.clone(),
+        edit_template_url: edit.url,
+        edit_template_body: edit.body,
+        edit_template_response_path: edit.response_path,
+        transform_template_url: transform.url,
+        transform_template_body: transform.body,
+        transform_template_response_path: transform.response_path,
         extra_params: if extra_params.is_empty() {
             None
         } else {
@@ -143,7 +190,12 @@ fn to_input(p: &storage::ProviderRow) -> ProviderInput {
 
 #[tauri::command]
 pub async fn save_provider(input: ProviderInput) -> Result<serde_json::Value, String> {
-    let row = storage::save_provider(input.id, &row_to_draft(&input))?;
+    let edit_template_json = spec_json(&input, false);
+    let transform_template_json = spec_json(&input, true);
+    let row = storage::save_provider(
+        input.id,
+        &row_to_draft(&input, &edit_template_json, &transform_template_json),
+    )?;
     if let Some(ep) = &input.extra_params {
         storage::set_setting(&format!("extraParams:{}", row.id), ep)?;
     }
@@ -230,6 +282,8 @@ pub async fn pull_models(id: i64) -> Result<Vec<String>, String> {
 /// 不落库——用户取消向导不会留下半成品服务商（M6）。
 #[tauri::command]
 pub async fn test_models(input: ProviderInput) -> Result<Vec<String>, String> {
+    let edit_template = TemplateSpec::from_json(&spec_json(&input, false));
+    let transform_template = TemplateSpec::from_json(&spec_json(&input, true));
     let config = ProviderConfig {
         id: None,
         name: input.name,
@@ -242,6 +296,8 @@ pub async fn test_models(input: ProviderInput) -> Result<Vec<String>, String> {
         template_url: input.template_url,
         template_body: input.template_body,
         template_response_path: input.template_response_path,
+        edit_template,
+        transform_template,
         extra_params: input.extra_params.unwrap_or_default(),
     };
     let adapter = adapters::get_adapter(&config.kind).map_err(adapters::adapter_error_json)?;
@@ -297,8 +353,9 @@ pub async fn test_connection(id: i64) -> Result<serde_json::Value, String> {
     }))
 }
 
-/// 导出配置（备份 v3）：`include_keys` 默认 false，不把明文 API Key 写进文件；
+/// 导出配置（备份 v4）：`include_keys` 默认 false，不把明文 API Key 写进文件；
 /// 服务商仍带 id，供导入时把 defaultProviderId / 思考模型 providerId 重映射到新自增 id。
+/// v4 起附带提示词收藏与工作流预设，预设参考图以 dataUrl 内联（只读不到文件时跳过）。
 #[tauri::command]
 pub async fn export_config(include_keys: Option<bool>) -> Result<serde_json::Value, String> {
     let include_keys = include_keys.unwrap_or(false);
@@ -329,6 +386,8 @@ pub async fn export_config(include_keys: Option<bool>) -> Result<serde_json::Val
             } else {
                 (Vec::new(), Vec::new())
             };
+            let edit = TemplateSpec::from_json(&r.edit_template_json).unwrap_or_default();
+            let transform = TemplateSpec::from_json(&r.transform_template_json).unwrap_or_default();
             serde_json::json!({
                 "id": r.id,
                 "name": r.name,
@@ -343,26 +402,67 @@ pub async fn export_config(include_keys: Option<bool>) -> Result<serde_json::Val
                 "templateUrl": r.template_url,
                 "templateBody": r.template_body,
                 "templateResponsePath": r.template_response_path,
+                "editTemplateUrl": edit.url,
+                "editTemplateBody": edit.body,
+                "editTemplateResponsePath": edit.response_path,
+                "transformTemplateUrl": transform.url,
+                "transformTemplateBody": transform.body,
+                "transformTemplateResponsePath": transform.response_path,
                 "extraParams": load_extra_params(r.id),
             })
         })
         .collect();
-    let settings = [
-        "defaultProviderId",
-        "defaultParams",
-        "theme",
-        "promptTemplates",
-    ]
-    .iter()
-    .filter_map(|k| {
-        storage::get_setting(k)
-            .ok()
-            .flatten()
-            .map(|v| (k.to_string(), serde_json::Value::String(v)))
-    })
-    .collect::<serde_json::Map<String, serde_json::Value>>();
-    Ok(serde_json::json!({
-        "version": 3,
+    let settings = storage::BACKUP_SETTING_KEYS
+        .iter()
+        .filter_map(|k| {
+            storage::get_setting(k)
+                .ok()
+                .flatten()
+                .map(|v| (k.to_string(), serde_json::Value::String(v)))
+        })
+        .collect::<serde_json::Map<String, serde_json::Value>>();
+    let favorites: Vec<serde_json::Value> = storage::list_favorites()?
+        .into_iter()
+        .map(|f| {
+            serde_json::json!({
+                "text": f.text,
+                "tags": f.tags,
+                "createdAt": f.created_at,
+            })
+        })
+        .collect();
+    let presets: Vec<serde_json::Value> = storage::list_presets()?
+        .into_iter()
+        .map(|p| {
+            let refs: Vec<serde_json::Value> = p
+                .refs
+                .iter()
+                .filter_map(|r| match crate::image_store::path_to_data_url(&r.path) {
+                    Some(data_url) => Some(serde_json::json!({
+                        "role": r.role,
+                        "strength": r.strength,
+                        "dataUrl": data_url,
+                    })),
+                    None => {
+                        tracing::warn!("导出预设「{}」：参考图读取失败已跳过: {}", p.name, r.path);
+                        None
+                    }
+                })
+                .collect();
+            serde_json::json!({
+                "name": p.name,
+                "prompt": p.prompt,
+                "negativePrompt": p.negative_prompt,
+                "params": serde_json::from_str::<serde_json::Value>(&p.params_json)
+                    .unwrap_or_else(|_| serde_json::json!({})),
+                "refs": refs,
+                "createdAt": p.created_at,
+                "updatedAt": p.updated_at,
+            })
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "version": 4,
         "exportedAt": storage::timestamp_millis(),
         "providers": providers,
         "settings": serde_json::Value::Object(settings),
@@ -370,7 +470,18 @@ pub async fn export_config(include_keys: Option<bool>) -> Result<serde_json::Val
         "network": network_backup_value(),
         // 思考模型只导出非密钥字段，绝不导出 API Key（明文或密文）
         "thinking": super::thinking::backup_value(),
-    }))
+        "favorites": favorites,
+        "presets": presets,
+    });
+    if let Ok(raw) = serde_json::to_string(&payload) {
+        if raw.len() > 32 * 1024 * 1024 {
+            tracing::warn!(
+                "备份体积 {} 字节，预设参考图较多，导入导出可能较慢",
+                raw.len()
+            );
+        }
+    }
+    Ok(payload)
 }
 
 /// 代理设置的非密钥快照（mode/url/noProxy），供备份导出。
@@ -383,20 +494,28 @@ fn network_backup_value() -> serde_json::Value {
     })
 }
 
-/// 导入配置（替换语义）：version 1 / 2 / 3 都接受；整体在一个事务内完成，
+/// 导入配置（替换语义）：version 1 / 2 / 3 / 4 都接受；整体在一个事务内完成，
 /// 先删除旧服务商再写入，中途失败回滚不留半导入状态（R5）。
-/// v2 起额外恢复设置、主题、自定义模板与思考模型配置；v3 增加整组 Key 与代理非密钥字段。
+/// v2 起额外恢复设置、主题、自定义模板与思考模型配置；v3 增加整组 Key 与代理非密钥字段；
+/// v4 增加提示词收藏与工作流预设（预设参考图重新写入 refs/）。
 /// 不含 Key 时按 name+baseUrl 复用本机旧密文（见 storage::import_config_in）。
 #[tauri::command]
-pub async fn import_config(data: serde_json::Value) -> Result<(), String> {
+pub async fn import_config(app: tauri::AppHandle, data: serde_json::Value) -> Result<(), String> {
     match data.get("version").and_then(|v| v.as_u64()) {
-        Some(1) | Some(2) | Some(3) => {}
-        _ => return Err("配置版本不受支持，仅支持 version=1 / 2 / 3".to_string()),
+        Some(1) | Some(2) | Some(3) | Some(4) => {}
+        _ => return Err("配置版本不受支持，仅支持 version=1 / 2 / 3 / 4".to_string()),
     }
-    let count = storage::import_config(&data).map_err(|e| -> String {
-        tracing::warn!("配置导入失败，已整体回滚: {e}");
-        e.into()
-    })?;
+    let counter = std::sync::atomic::AtomicUsize::new(0);
+    let write_ref = |data_url: &str| -> crate::error::AppResult<String> {
+        let index = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = crate::image_store::unique_name("preset_", &storage::timestamp_millis(), index);
+        crate::image_store::save_ref_image(&app, data_url, &name)
+    };
+    let count =
+        storage::import_config_with_refs(&data, Some(&write_ref)).map_err(|e| -> String {
+            tracing::warn!("配置导入失败，已整体回滚: {e}");
+            e.into()
+        })?;
     // 导入可能改了代理设置：按新配置重建客户端（失败时保留旧客户端并落日志）
     adapters::http::init_from_storage();
     tracing::warn!("配置导入完成（替换语义）：{count} 个服务商");

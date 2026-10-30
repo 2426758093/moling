@@ -8,7 +8,7 @@ use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 static DB: OnceLock<Mutex<Connection>> = OnceLock::new();
@@ -39,6 +39,9 @@ pub struct ProviderRow {
     pub template_url: String,
     pub template_body: String,
     pub template_response_path: String,
+    /// 编辑/变换模板（JSON：{url, body, responsePath}），空串表示未配置
+    pub edit_template_json: String,
+    pub transform_template_json: String,
     pub api_key_masked: String,
     pub has_key: bool,
     /// 密文非空但解密失败（主密钥丢失/密文损坏），前端据此提示"密钥损坏，请重新填写"
@@ -98,6 +101,90 @@ pub struct HistoryRow {
     pub file_path: String,
     pub favorite: bool,
     pub created_at: String,
+    /// 派生图的父记录（放大 / 风格 / 编辑 / 画布导出）；原创为 None
+    #[serde(default)]
+    pub parent_id: Option<i64>,
+    /// generate | edit | erase | outpaint | upscale | style | background | basic-edit | canvas
+    #[serde(default = "default_op")]
+    pub op: String,
+}
+
+fn default_op() -> String {
+    "generate".to_string()
+}
+
+/// 提示词收藏与工作流预设的上限：与参考图上限保持一致，避免预设比一次生成能用的图还多。
+pub const MAX_PRESET_REFS: usize = 4;
+pub const MAX_FAVORITE_TAGS: usize = 8;
+pub const MAX_PRESET_NAME_CHARS: usize = 80;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptFavorite {
+    pub id: i64,
+    pub text: String,
+    pub tags: Vec<String>,
+    pub created_at: String,
+}
+
+/// 预设里的参考图：只存文件路径，角色 / 强度随路径一起打包。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PresetRef {
+    pub path: String,
+    #[serde(default = "default_preset_role")]
+    pub role: String,
+    #[serde(default = "default_preset_strength")]
+    pub strength: u32,
+}
+
+fn default_preset_role() -> String {
+    "composition".to_string()
+}
+
+fn default_preset_strength() -> u32 {
+    crate::reference::DEFAULT_STRENGTH
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowPreset {
+    pub id: i64,
+    pub name: String,
+    pub prompt: String,
+    pub negative_prompt: String,
+    pub params_json: String,
+    pub refs: Vec<PresetRef>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// 画布上限：JSON 2MB / 500 节点，避免一次保存把 SQLite 与 IPC 拖垮。
+pub const MAX_CANVAS_NODES: usize = 500;
+pub const MAX_CANVAS_JSON_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_CANVAS_NAME_CHARS: usize = 80;
+
+pub const CANVAS_DEFAULT_DATA: &str =
+    r#"{"version":1,"nodes":[],"edges":[],"viewport":{"x":0,"y":0,"zoom":1}}"#;
+
+/// 画布列表只带元信息，避免把所有画布的节点数据一起读出来。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanvasBoardMeta {
+    pub id: i64,
+    pub name: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanvasBoard {
+    pub id: i64,
+    pub name: String,
+    pub data_json: String,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 /// 服务商可编辑字段（save_provider / import_config 共用）
@@ -113,6 +200,8 @@ pub struct ProviderDraft<'a> {
     pub template_url: &'a str,
     pub template_body: &'a str,
     pub template_response_path: &'a str,
+    pub edit_template_json: &'a str,
+    pub transform_template_json: &'a str,
 }
 
 /// 建表 SQL（迁移 001 的基线）。**发布后不要再改这里**：旧库已经跑过 001，
@@ -210,12 +299,89 @@ const JOBS_SQL: &str = "
         CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, id);
 ";
 
+/// 迁移 005：自定义模板服务商的编辑 / 变换端点。存 JSON（{url, body, responsePath}）
+/// 而不是拆成多列：模板端点后续可能扩展 method/headers，JSON 不需要再加迁移。
+const PROVIDER_TEMPLATES_SQL: &str = "
+        ALTER TABLE providers ADD COLUMN edit_template_json TEXT NOT NULL DEFAULT '';
+        ALTER TABLE providers ADD COLUMN transform_template_json TEXT NOT NULL DEFAULT '';
+";
+
+/// 迁移 006：模型能力元数据（只驱动界面开关，不改变请求形状）。
+const MODEL_CAPS_SQL: &str = "
+        CREATE TABLE IF NOT EXISTS model_caps (
+            provider_id INTEGER NOT NULL,
+            model TEXT NOT NULL,
+            caps_json TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (provider_id, model)
+        );
+";
+
 /// (名称, SQL)，按顺序执行；`PRAGMA user_version` 记录已应用到的序号（从 1 起）。
+/// 迁移 007：派生图血统。`op` 记录这张图是怎么来的（放大 / 风格 / 编辑 / 画布…），
+/// `parent_id` 指向父图；两者都只增列，存量行自动是 generate + NULL。
+const HISTORY_LINEAGE_SQL: &str = "
+        ALTER TABLE history ADD COLUMN parent_id INTEGER;
+        ALTER TABLE history ADD COLUMN op TEXT NOT NULL DEFAULT 'generate';
+        CREATE INDEX IF NOT EXISTS idx_history_parent ON history(parent_id);
+";
+
+/// 迁移 008：队列参考图。`input_json` 存列里没有的入队扩展字段
+/// （参考图路径 + 角色 / 强度），老行为空串按「无参考图」处理。
+const JOBS_INPUT_SQL: &str = "
+        ALTER TABLE jobs ADD COLUMN input_json TEXT NOT NULL DEFAULT '';
+";
+
+/// 迁移 009：提示词资产。收藏按文本去重（UNIQUE + upsert），标签存 JSON 数组；
+/// 工作流预设的参考图仍只存路径（`{path, role, strength}`），备份导出时才内联 dataUrl。
+const PROMPT_ASSETS_SQL: &str = "
+        CREATE TABLE IF NOT EXISTS prompt_favorites (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text TEXT NOT NULL UNIQUE,
+            tags_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_prompt_favorites_created
+            ON prompt_favorites(created_at DESC);
+        CREATE TABLE IF NOT EXISTS workflow_presets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            prompt TEXT NOT NULL DEFAULT '',
+            negative_prompt TEXT NOT NULL DEFAULT '',
+            params_json TEXT NOT NULL DEFAULT '{}',
+            refs_json TEXT NOT NULL DEFAULT '[]',
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_workflow_presets_updated
+            ON workflow_presets(updated_at DESC);
+";
+
+/// 迁移 010：画布工作区。只存 historyId 与布局，不存 dataUrl / base64；
+/// 画布引用本机 history，不参与配置备份。
+const CANVAS_SQL: &str = "
+        CREATE TABLE IF NOT EXISTS canvas_boards (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            data_json TEXT NOT NULL DEFAULT '{\"version\":1,\"nodes\":[],\"edges\":[],\"viewport\":{\"x\":0,\"y\":0,\"zoom\":1}}',
+            created_at TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_canvas_boards_updated
+            ON canvas_boards(updated_at DESC);
+";
+
 const MIGRATIONS: &[(&str, &str)] = &[
     ("001_tables", SCHEMA_SQL),
     ("002_indexes", INDEXES_SQL),
     ("003_provider_keys", PROVIDER_KEYS_SQL),
     ("004_jobs", JOBS_SQL),
+    ("005_provider_templates", PROVIDER_TEMPLATES_SQL),
+    ("006_model_caps", MODEL_CAPS_SQL),
+    ("007_history_lineage", HISTORY_LINEAGE_SQL),
+    ("008_jobs_input", JOBS_INPUT_SQL),
+    ("009_prompt_assets", PROMPT_ASSETS_SQL),
+    ("010_canvas", CANVAS_SQL),
 ];
 
 /// 当前 schema 版本 = 迁移条数
@@ -494,6 +660,8 @@ fn row_to_provider(row: &rusqlite::Row) -> rusqlite::Result<ProviderRow> {
         template_url: row.get(8)?,
         template_body: row.get(9)?,
         template_response_path: row.get(10)?,
+        edit_template_json: row.get(11)?,
+        transform_template_json: row.get(12)?,
         api_key_masked: mask_key(&key),
         has_key: !key.is_empty(),
         key_error,
@@ -510,7 +678,8 @@ pub fn save_provider(id: Option<i64>, draft: &ProviderDraft) -> AppResult<Provid
                 let n = tx.execute(
                     "UPDATE providers SET name=?1, base_url=?2, kind=?3, models_json=?4,
                      default_model=?5, timeout_secs=?6, template_url=?7, template_body=?8,
-                     template_response_path=?9 WHERE id=?10",
+                     template_response_path=?9, edit_template_json=?10,
+                     transform_template_json=?11 WHERE id=?12",
                     params![
                         draft.name,
                         draft.base_url,
@@ -521,6 +690,8 @@ pub fn save_provider(id: Option<i64>, draft: &ProviderDraft) -> AppResult<Provid
                         draft.template_url,
                         draft.template_body,
                         draft.template_response_path,
+                        draft.edit_template_json,
+                        draft.transform_template_json,
                         existing
                     ],
                 )?;
@@ -534,8 +705,9 @@ pub fn save_provider(id: Option<i64>, draft: &ProviderDraft) -> AppResult<Provid
                 let enc = encrypt_secret("")?;
                 tx.execute(
                     "INSERT INTO providers (name, base_url, api_key_enc, kind, models_json,
-                     default_model, timeout_secs, template_url, template_body, template_response_path)
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                     default_model, timeout_secs, template_url, template_body, template_response_path,
+                     edit_template_json, transform_template_json)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
                     params![
                         draft.name,
                         draft.base_url,
@@ -546,7 +718,9 @@ pub fn save_provider(id: Option<i64>, draft: &ProviderDraft) -> AppResult<Provid
                         draft.timeout_secs as i64,
                         draft.template_url,
                         draft.template_body,
-                        draft.template_response_path
+                        draft.template_response_path,
+                        draft.edit_template_json,
+                        draft.transform_template_json
                     ],
                 )?;
                 tx.last_insert_rowid()
@@ -581,7 +755,8 @@ pub fn get_provider(id: i64) -> AppResult<Option<ProviderRow>> {
     let c = conn()?;
     let mut stmt = c.prepare(
         "SELECT id, name, base_url, api_key_enc, kind, models_json, default_model,
-         timeout_secs, template_url, template_body, template_response_path
+         timeout_secs, template_url, template_body, template_response_path,
+         edit_template_json, transform_template_json
          FROM providers WHERE id = ?1",
     )?;
     let mut rows = stmt.query_map(params![id], row_to_provider)?;
@@ -592,7 +767,8 @@ pub fn list_providers() -> AppResult<Vec<ProviderRow>> {
     let c = conn()?;
     let mut stmt = c.prepare(
         "SELECT id, name, base_url, api_key_enc, kind, models_json, default_model,
-         timeout_secs, template_url, template_body, template_response_path
+         timeout_secs, template_url, template_body, template_response_path,
+         edit_template_json, transform_template_json
          FROM providers ORDER BY id",
     )?;
     let rows = stmt.query_map([], row_to_provider)?;
@@ -600,8 +776,47 @@ pub fn list_providers() -> AppResult<Vec<ProviderRow>> {
 }
 
 pub fn delete_provider(id: i64) -> AppResult<()> {
-    conn()?.execute("DELETE FROM providers WHERE id = ?1", params![id])?;
+    let mut c = conn()?;
+    let tx = c.transaction()?;
+    tx.execute("DELETE FROM model_caps WHERE provider_id = ?1", params![id])?;
+    tx.execute("DELETE FROM providers WHERE id = ?1", params![id])?;
+    tx.commit()?;
     Ok(())
+}
+
+/// 写入模型能力覆盖值（JSON）；同 (provider, model) 覆盖旧值。
+pub fn save_model_caps(provider_id: i64, model: &str, caps_json: &str) -> AppResult<()> {
+    let guard = conn()?;
+    save_model_caps_in(&guard, provider_id, model, caps_json)
+}
+
+fn save_model_caps_in(
+    c: &Connection,
+    provider_id: i64,
+    model: &str,
+    caps_json: &str,
+) -> AppResult<()> {
+    c.execute(
+        "INSERT INTO model_caps (provider_id, model, caps_json, updated_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(provider_id, model)
+         DO UPDATE SET caps_json = excluded.caps_json, updated_at = excluded.updated_at",
+        params![provider_id, model, caps_json, timestamp_millis()],
+    )?;
+    Ok(())
+}
+
+/// 读取某服务商全部模型的能力覆盖值（model, caps_json）。
+pub fn list_model_caps(provider_id: i64) -> AppResult<Vec<(String, String)>> {
+    let guard = conn()?;
+    list_model_caps_in(&guard, provider_id)
+}
+
+fn list_model_caps_in(c: &Connection, provider_id: i64) -> AppResult<Vec<(String, String)>> {
+    let mut stmt =
+        c.prepare("SELECT model, caps_json FROM model_caps WHERE provider_id = ?1 ORDER BY model")?;
+    let rows = stmt.query_map(params![provider_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// 优先读 Key 列表密文；为空时回退旧单 Key 列（迁移回填完成前/旧备份导入后）。
@@ -780,6 +995,47 @@ fn require_providers(data: &serde_json::Value) -> AppResult<&[serde_json::Value]
         .ok_or_else(|| AppError::Other("导入文件缺少 providers 数组，已取消导入".into()))
 }
 
+/// 经由「通用 set/get_setting」通道持久化、并且会进备份与诊断包的设置项。
+///
+/// 与 `commands::settings::ALLOWED_SETTING_KEYS` 必须逐项一致（有单测守住）：
+/// 新增一项只改动其中一处的后果是"设置能存但备份丢了"或反过来，两者都不报错。
+pub const BACKUP_SETTING_KEYS: &[&str] = &[
+    "defaultProviderId",
+    "defaultParams",
+    "promptTemplates",
+    "theme",
+    "glassAppearance",
+    "uiMode",
+    "queueConcurrency",
+    "cacheRetentionDays",
+];
+
+/// 缓存（回收站）保留天数的合法区间与默认值
+pub const MIN_CACHE_RETENTION_DAYS: i64 = 1;
+pub const MAX_CACHE_RETENTION_DAYS: i64 = 365;
+pub const DEFAULT_CACHE_RETENTION_DAYS: i64 = 30;
+
+/// 读缓存保留天数；未设置/脏值回退默认（启动清理不能因为设置损坏而停摆）
+pub fn cache_retention_days() -> i64 {
+    let c = match conn() {
+        Ok(c) => c,
+        Err(_) => return DEFAULT_CACHE_RETENTION_DAYS,
+    };
+    cache_retention_days_in(&c)
+}
+
+pub(crate) fn cache_retention_days_in(c: &Connection) -> i64 {
+    c.query_row(
+        "SELECT value FROM settings WHERE key = 'cacheRetentionDays'",
+        [],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|v| v.trim().parse::<i64>().ok())
+    .filter(|n| (MIN_CACHE_RETENTION_DAYS..=MAX_CACHE_RETENTION_DAYS).contains(n))
+    .unwrap_or(DEFAULT_CACHE_RETENTION_DAYS)
+}
+
 /// 导入时允许写入的设置项。v1 只有旧版导出的两项；v2 增加主题与自定义模板。
 const IMPORT_SETTINGS_V1: &[&str] = &["defaultProviderId", "defaultParams"];
 const IMPORT_SETTINGS_V2: &[&str] = &[
@@ -787,6 +1043,10 @@ const IMPORT_SETTINGS_V2: &[&str] = &[
     "defaultParams",
     "theme",
     "promptTemplates",
+    "glassAppearance",
+    "uiMode",
+    "queueConcurrency",
+    "cacheRetentionDays",
 ];
 
 fn invalid_import(msg: &str) -> AppError {
@@ -813,8 +1073,47 @@ fn validate_import_settings(
             return Err(invalid_import("导入文件中的主题取值非法"));
         }
     }
+    if let Some(glass) = settings.get("glassAppearance") {
+        let ok = glass
+            .as_str()
+            .is_some_and(|g| matches!(g, "clear" | "standard" | "tinted"));
+        if !ok {
+            return Err(invalid_import("导入文件中的玻璃质感取值非法"));
+        }
+    }
     if let Some(templates) = settings.get("promptTemplates") {
         validate_import_templates(templates)?;
+    }
+    if let Some(mode) = settings.get("uiMode") {
+        let ok = mode
+            .as_str()
+            .is_some_and(|m| matches!(m, "simple" | "expert"));
+        if !ok {
+            return Err(invalid_import("导入文件中的界面模式取值非法"));
+        }
+    }
+    if let Some(concurrency) = settings.get("queueConcurrency") {
+        let ok = concurrency
+            .as_str()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .is_some_and(|n| {
+                (crate::commands::queue::MIN_CONCURRENCY..=crate::commands::queue::MAX_CONCURRENCY)
+                    .contains(&n)
+            });
+        if !ok {
+            return Err(invalid_import("导入文件中的队列并发数取值非法"));
+        }
+    }
+    if let Some(days) = settings.get("cacheRetentionDays") {
+        let ok = days
+            .as_str()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .is_some_and(|n| (MIN_CACHE_RETENTION_DAYS..=MAX_CACHE_RETENTION_DAYS).contains(&n));
+        if !ok {
+            return Err(invalid_import(
+                "导入文件中的缓存保留天数取值非法（应为 1–365）",
+            ));
+        }
     }
     Ok(())
 }
@@ -1010,14 +1309,267 @@ fn import_network(tx: &rusqlite::Transaction<'_>, value: &serde_json::Value) -> 
 /// 事务内导入配置（替换语义，R5）：先清空旧 providers 及其 extraParams 设置项，
 /// 再写入全部导入内容；中途任何失败整体回滚，不留半导入状态。
 /// `data` 为前端导出的 JSON（version 校验由调用方完成），返回导入的服务商数量。
+/// 把编辑/变换模板的三项字段拼成 JSON 存列；全空时存空串（= 未配置）。
+/// providers/save 与 import 共用，保证两条写入路径的格式一致。
+pub(crate) fn template_spec_json(url: &str, body: &str, response_path: &str) -> String {
+    if url.trim().is_empty() && body.trim().is_empty() && response_path.trim().is_empty() {
+        return String::new();
+    }
+    serde_json::json!({
+        "url": url,
+        "body": body,
+        "responsePath": response_path,
+    })
+    .to_string()
+}
+
+#[cfg(test)]
 pub fn import_config(data: &serde_json::Value) -> AppResult<usize> {
     let mut c = conn()?;
     import_config_in(&mut c, data)
 }
 
+/// 预设参考图的落盘回调：输入 data URL，返回保存后的绝对路径。
+pub type RefWriter<'a> = Option<&'a dyn Fn(&str) -> AppResult<String>>;
+
+/// 备份 v4 的预设参考图需要重新落盘：由调用方注入写文件闭包（单测传 None）。
+pub fn import_config_with_refs(
+    data: &serde_json::Value,
+    write_ref: RefWriter<'_>,
+) -> AppResult<usize> {
+    let mut c = conn()?;
+    import_config_in_with_refs(&mut c, data, write_ref)
+}
+
+#[derive(Debug)]
+struct ImportFavorite {
+    text: String,
+    tags_json: String,
+    created_at: String,
+}
+
+#[derive(Debug)]
+struct ImportPreset {
+    name: String,
+    prompt: String,
+    negative_prompt: String,
+    params_json: String,
+    refs_json: String,
+    created_at: String,
+    updated_at: String,
+}
+
+const MAX_IMPORT_FAVORITES: usize = 500;
+const MAX_IMPORT_PRESETS: usize = 200;
+const MAX_IMPORT_REF_DATA_URL: usize = 12 * 1024 * 1024;
+
+fn import_ref_role_ok(role: &str) -> bool {
+    matches!(role, "composition" | "style" | "face" | "element")
+}
+
+/// v4：收藏与预设数组的结构校验。任何一项非法都在事务与 DELETE 之前失败。
+fn parse_import_prompt_assets(
+    data: &serde_json::Value,
+    write_ref: RefWriter<'_>,
+) -> AppResult<(Vec<ImportFavorite>, Vec<ImportPreset>)> {
+    let favorites_raw = data
+        .get("favorites")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| invalid_import("导入文件缺少 favorites 数组"))?;
+    if favorites_raw.len() > MAX_IMPORT_FAVORITES {
+        return Err(invalid_import("导入文件中的收藏数量过多"));
+    }
+    let mut favorites = Vec::with_capacity(favorites_raw.len());
+    for item in favorites_raw {
+        let text = item
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| invalid_import("收藏条目缺少提示词文本"))?;
+        let tags: Vec<String> = match item.get("tags") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(v) => {
+                let arr = v
+                    .as_array()
+                    .ok_or_else(|| invalid_import("收藏标签必须是字符串数组"))?;
+                arr.iter()
+                    .map(|t| {
+                        t.as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| invalid_import("收藏标签必须是字符串数组"))
+                    })
+                    .collect::<AppResult<Vec<_>>>()?
+            }
+        };
+        let tags = normalize_tags(&tags);
+        favorites.push(ImportFavorite {
+            text: text.to_string(),
+            tags_json: serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into()),
+            created_at: item
+                .get("createdAt")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+
+    let presets_raw = data
+        .get("presets")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| invalid_import("导入文件缺少 presets 数组"))?;
+    if presets_raw.len() > MAX_IMPORT_PRESETS {
+        return Err(invalid_import("导入文件中的预设数量过多"));
+    }
+    let mut presets = Vec::with_capacity(presets_raw.len());
+    for item in presets_raw {
+        let name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| invalid_import("预设缺少名称"))?;
+        if name.chars().count() > MAX_PRESET_NAME_CHARS {
+            return Err(invalid_import("预设名称过长"));
+        }
+        let params = match item.get("params") {
+            None | Some(serde_json::Value::Null) => serde_json::json!({}),
+            Some(v) if v.is_object() => v.clone(),
+            Some(_) => return Err(invalid_import("预设参数必须是对象")),
+        };
+        let refs_raw = match item.get("refs") {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(v) => v
+                .as_array()
+                .cloned()
+                .ok_or_else(|| invalid_import("预设参考图必须是数组"))?,
+        };
+        if refs_raw.len() > MAX_PRESET_REFS {
+            return Err(invalid_import("预设参考图超过上限"));
+        }
+        let mut refs = Vec::with_capacity(refs_raw.len());
+        for r in refs_raw {
+            let role = r.get("role").and_then(|v| v.as_str()).unwrap_or_default();
+            if !import_ref_role_ok(role) {
+                return Err(invalid_import("预设参考角色非法"));
+            }
+            let strength = r.get("strength").and_then(|v| v.as_u64()).unwrap_or(60);
+            if strength > 100 {
+                return Err(invalid_import("预设参考强度必须在 0–100 之间"));
+            }
+            let data_url = r
+                .get("dataUrl")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if !data_url.starts_with("data:image/") {
+                return Err(invalid_import("预设参考图缺少有效的 dataUrl"));
+            }
+            if data_url.len() > MAX_IMPORT_REF_DATA_URL {
+                return Err(invalid_import("预设参考图过大"));
+            }
+            let path = match write_ref {
+                Some(write) => write(data_url)?,
+                None => String::new(),
+            };
+            if path.is_empty() {
+                continue;
+            }
+            refs.push(PresetRef {
+                path,
+                role: role.to_string(),
+                strength: strength as u32,
+            });
+        }
+        presets.push(ImportPreset {
+            name: name.to_string(),
+            prompt: item
+                .get("prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            negative_prompt: item
+                .get("negativePrompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            params_json: serde_json::to_string(&params).unwrap_or_else(|_| "{}".into()),
+            refs_json: serde_json::to_string(&refs).unwrap_or_else(|_| "[]".into()),
+            created_at: item
+                .get("createdAt")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            updated_at: item
+                .get("updatedAt")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        });
+    }
+    Ok((favorites, presets))
+}
+
+fn insert_import_prompt_assets(
+    tx: &rusqlite::Transaction<'_>,
+    favorites: &[ImportFavorite],
+    presets: &[ImportPreset],
+) -> AppResult<()> {
+    tx.execute("DELETE FROM prompt_favorites", [])?;
+    tx.execute("DELETE FROM workflow_presets", [])?;
+    let now = timestamp_millis();
+    for f in favorites {
+        let created = if f.created_at.is_empty() {
+            now.as_str()
+        } else {
+            f.created_at.as_str()
+        };
+        tx.execute(
+            "INSERT INTO prompt_favorites (text, tags_json, created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(text) DO UPDATE SET tags_json = excluded.tags_json",
+            params![f.text, f.tags_json, created],
+        )?;
+    }
+    for p in presets {
+        let created = if p.created_at.is_empty() {
+            now.as_str()
+        } else {
+            p.created_at.as_str()
+        };
+        let updated = if p.updated_at.is_empty() {
+            created
+        } else {
+            p.updated_at.as_str()
+        };
+        tx.execute(
+            "INSERT INTO workflow_presets
+             (name, prompt, negative_prompt, params_json, refs_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                p.name,
+                p.prompt,
+                p.negative_prompt,
+                p.params_json,
+                p.refs_json,
+                created,
+                updated
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 /// import_config 的可测接缝：在给定连接上执行导入（单测用内存库，避免共享全局 DB）。
 /// 入参校验放在事务与 DELETE 之前，非法导入绝不触碰表内旧数据。
+#[cfg(test)]
 fn import_config_in(c: &mut Connection, data: &serde_json::Value) -> AppResult<usize> {
+    import_config_in_with_refs(c, data, None)
+}
+
+fn import_config_in_with_refs(
+    c: &mut Connection,
+    data: &serde_json::Value,
+    write_ref: RefWriter<'_>,
+) -> AppResult<usize> {
     let version = data.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
     let providers = require_providers(data)?;
     let settings = match data.get("settings") {
@@ -1045,6 +1597,12 @@ fn import_config_in(c: &mut Connection, data: &serde_json::Value) -> AppResult<u
             validate_import_network(net)?;
         }
     }
+    // v4：收藏与预设先校验（预设参考图此时落盘；后续事务失败只会留下孤儿文件，由 GC 回收）
+    let prompt_assets = if version >= 4 {
+        Some(parse_import_prompt_assets(data, write_ref)?)
+    } else {
+        None
+    };
 
     let tx = c.transaction()?;
     // v2/v3 默认不导出明文 Key：删除前记录旧密文，导入项无 Key 且
@@ -1115,8 +1673,9 @@ fn import_config_in(c: &mut Connection, data: &serde_json::Value) -> AppResult<u
         };
         tx.execute(
             "INSERT INTO providers (name, base_url, api_key_enc, api_keys_enc, kind, models_json,
-             default_model, timeout_secs, template_url, template_body, template_response_path)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+             default_model, timeout_secs, template_url, template_body, template_response_path,
+             edit_template_json, transform_template_json)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             params![
                 name,
                 base_url,
@@ -1128,7 +1687,17 @@ fn import_config_in(c: &mut Connection, data: &serde_json::Value) -> AppResult<u
                 p.get("timeoutSecs").and_then(|v| v.as_u64()).unwrap_or(60) as i64,
                 get("templateUrl"),
                 get("templateBody"),
-                get("templateResponsePath")
+                get("templateResponsePath"),
+                template_spec_json(
+                    &get("editTemplateUrl"),
+                    &get("editTemplateBody"),
+                    &get("editTemplateResponsePath")
+                ),
+                template_spec_json(
+                    &get("transformTemplateUrl"),
+                    &get("transformTemplateBody"),
+                    &get("transformTemplateResponsePath")
+                )
             ],
         )?;
         let new_id = tx.last_insert_rowid();
@@ -1215,6 +1784,10 @@ fn import_config_in(c: &mut Connection, data: &serde_json::Value) -> AppResult<u
             import_network(&tx, net)?;
         }
     }
+    // v4：收藏与预设为替换语义；v1–v3 备份不触碰本机现有资产
+    if let Some((favorites, presets)) = &prompt_assets {
+        insert_import_prompt_assets(&tx, favorites, presets)?;
+    }
     tx.commit()?;
     Ok(providers.len())
 }
@@ -1223,8 +1796,8 @@ pub fn add_history(h: &HistoryRow) -> AppResult<i64> {
     let c = conn()?;
     c.execute(
         "INSERT INTO history (prompt, negative_prompt, model, provider_name, seed, width,
-         height, guidance, steps, style, file_path, favorite, created_at)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+         height, guidance, steps, style, file_path, favorite, created_at, parent_id, op)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
         params![
             h.prompt,
             h.negative_prompt,
@@ -1238,7 +1811,9 @@ pub fn add_history(h: &HistoryRow) -> AppResult<i64> {
             h.style,
             h.file_path,
             h.favorite as i64,
-            h.created_at
+            h.created_at,
+            h.parent_id,
+            h.op
         ],
     )?;
     Ok(c.last_insert_rowid())
@@ -1249,14 +1824,29 @@ pub fn list_history(
     offset: i64,
     model_filter: &str,
     style_filter: &str,
+    favorite_only: bool,
 ) -> AppResult<Vec<HistoryRow>> {
     let c = conn()?;
+    list_history_in(&c, limit, offset, model_filter, style_filter, favorite_only)
+}
+
+pub(crate) fn list_history_in(
+    c: &Connection,
+    limit: i64,
+    offset: i64,
+    model_filter: &str,
+    style_filter: &str,
+    favorite_only: bool,
+) -> AppResult<Vec<HistoryRow>> {
     let mut conditions = Vec::new();
     if !model_filter.is_empty() {
         conditions.push("model = ?");
     }
     if !style_filter.is_empty() {
         conditions.push("style = ?");
+    }
+    if favorite_only {
+        conditions.push("favorite = 1");
     }
     let where_clause = if conditions.is_empty() {
         String::new()
@@ -1265,7 +1855,7 @@ pub fn list_history(
     };
     let sql = format!(
         "SELECT id, prompt, negative_prompt, model, provider_name, seed, width, height,
-         guidance, steps, style, file_path, favorite, created_at
+         guidance, steps, style, file_path, favorite, created_at, parent_id, op
          FROM history{where_clause} ORDER BY id DESC LIMIT ? OFFSET ?"
     );
     let mut stmt = c.prepare(&sql)?;
@@ -1306,7 +1896,50 @@ fn history_from_row(row: &rusqlite::Row) -> rusqlite::Result<HistoryRow> {
         file_path: row.get(11)?,
         favorite: row.get::<_, i64>(12)? != 0,
         created_at: row.get(13)?,
+        parent_id: row.get(14)?,
+        op: row.get(15)?,
     })
+}
+
+/// 按 id 取一条历史记录（transform_image 需要父图的尺寸与提示词）
+pub fn history_row(id: i64) -> AppResult<Option<HistoryRow>> {
+    let c = conn()?;
+    let mut stmt = c.prepare(
+        "SELECT id, prompt, negative_prompt, model, provider_name, seed, width, height,
+         guidance, steps, style, file_path, favorite, created_at, parent_id, op
+         FROM history WHERE id = ?1",
+    )?;
+    let mut rows = stmt.query_map(params![id], history_from_row)?;
+    Ok(rows.next().transpose()?)
+}
+
+/// 同族图片：沿 parent_id 上溯到根，再返回「根 + 它的直接派生」。
+/// 上溯最多 32 跳，防止脏数据成环时死循环。
+pub fn list_derived(id: i64) -> AppResult<Vec<HistoryRow>> {
+    let Some(mut row) = history_row(id)? else {
+        return Ok(Vec::new());
+    };
+    let mut root = row.id;
+    for _ in 0..32 {
+        match row.parent_id {
+            Some(p) if p != root => match history_row(p)? {
+                Some(parent) => {
+                    root = parent.id;
+                    row = parent;
+                }
+                None => break,
+            },
+            _ => break,
+        }
+    }
+    let c = conn()?;
+    let mut stmt = c.prepare(
+        "SELECT id, prompt, negative_prompt, model, provider_name, seed, width, height,
+         guidance, steps, style, file_path, favorite, created_at, parent_id, op
+         FROM history WHERE id = ?1 OR parent_id = ?1 ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map(params![root], history_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
 }
 
 pub fn set_favorite(id: i64, favorite: bool) -> AppResult<()> {
@@ -1315,6 +1948,418 @@ pub fn set_favorite(id: i64, favorite: bool) -> AppResult<()> {
         params![id, favorite as i64],
     )?;
     Ok(())
+}
+
+// ---------- 提示词资产（迁移 009） ----------
+
+fn favorite_from_row(row: &rusqlite::Row) -> rusqlite::Result<PromptFavorite> {
+    let tags_json: String = row.get(2)?;
+    Ok(PromptFavorite {
+        id: row.get(0)?,
+        text: row.get(1)?,
+        tags: parse_tags(&tags_json),
+        created_at: row.get(3)?,
+    })
+}
+
+fn parse_tags(raw: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
+}
+
+fn normalize_tags(tags: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tag in tags {
+        let tag = tag.trim();
+        if tag.is_empty() || out.iter().any(|t| t == tag) {
+            continue;
+        }
+        out.push(tag.to_string());
+        if out.len() >= MAX_FAVORITE_TAGS {
+            break;
+        }
+    }
+    out
+}
+
+pub fn list_favorites() -> AppResult<Vec<PromptFavorite>> {
+    let c = conn()?;
+    list_favorites_in(&c)
+}
+
+pub(crate) fn list_favorites_in(c: &Connection) -> AppResult<Vec<PromptFavorite>> {
+    let mut stmt = c.prepare(
+        "SELECT id, text, tags_json, created_at FROM prompt_favorites
+         ORDER BY created_at DESC, id DESC",
+    )?;
+    let rows = stmt.query_map([], favorite_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+/// 同一段提示词重复收藏时只更新标签，不产生第二条记录。
+pub fn upsert_favorite(text: &str, tags: &[String]) -> AppResult<PromptFavorite> {
+    let c = conn()?;
+    upsert_favorite_in(&c, text, tags)
+}
+
+pub(crate) fn upsert_favorite_in(
+    c: &Connection,
+    text: &str,
+    tags: &[String],
+) -> AppResult<PromptFavorite> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(AppError::Other("收藏的提示词不能为空".into()));
+    }
+    let tags = normalize_tags(tags);
+    let tags_json = serde_json::to_string(&tags).unwrap_or_else(|_| "[]".into());
+    c.execute(
+        "INSERT INTO prompt_favorites (text, tags_json, created_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(text) DO UPDATE SET tags_json = excluded.tags_json",
+        params![text, tags_json, timestamp_millis()],
+    )?;
+    c.query_row(
+        "SELECT id, text, tags_json, created_at FROM prompt_favorites WHERE text = ?1",
+        params![text],
+        favorite_from_row,
+    )
+    .map_err(AppError::from)
+}
+
+pub fn delete_favorite(id: i64) -> AppResult<bool> {
+    let c = conn()?;
+    delete_favorite_in(&c, id)
+}
+
+pub(crate) fn delete_favorite_in(c: &Connection, id: i64) -> AppResult<bool> {
+    Ok(c.execute("DELETE FROM prompt_favorites WHERE id = ?1", params![id])? > 0)
+}
+
+fn preset_from_row(row: &rusqlite::Row) -> rusqlite::Result<WorkflowPreset> {
+    let refs_json: String = row.get(5)?;
+    Ok(WorkflowPreset {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        prompt: row.get(2)?,
+        negative_prompt: row.get(3)?,
+        params_json: row.get(4)?,
+        refs: parse_preset_refs(&refs_json),
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+    })
+}
+
+fn parse_preset_refs(raw: &str) -> Vec<PresetRef> {
+    serde_json::from_str::<Vec<PresetRef>>(raw).unwrap_or_default()
+}
+
+fn validate_preset_refs(refs: &[PresetRef]) -> AppResult<()> {
+    if refs.len() > MAX_PRESET_REFS {
+        return Err(AppError::Other(format!(
+            "预设最多保存 {MAX_PRESET_REFS} 张参考图"
+        )));
+    }
+    for r in refs {
+        if r.path.trim().is_empty() {
+            return Err(AppError::Other("预设中的参考图路径不能为空".into()));
+        }
+        if !matches!(
+            r.role.as_str(),
+            "composition" | "style" | "face" | "element"
+        ) {
+            return Err(AppError::Other(format!("预设中的参考角色非法: {}", r.role)));
+        }
+        if r.strength > 100 {
+            return Err(AppError::Other("预设中的参考强度必须在 0–100 之间".into()));
+        }
+    }
+    Ok(())
+}
+
+pub fn list_presets() -> AppResult<Vec<WorkflowPreset>> {
+    let c = conn()?;
+    list_presets_in(&c)
+}
+
+pub(crate) fn list_presets_in(c: &Connection) -> AppResult<Vec<WorkflowPreset>> {
+    let mut stmt = c.prepare(
+        "SELECT id, name, prompt, negative_prompt, params_json, refs_json, created_at, updated_at
+         FROM workflow_presets ORDER BY updated_at DESC, id DESC",
+    )?;
+    let rows = stmt.query_map([], preset_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+/// 保存预设：`id` 为空时新建，否则覆盖同名记录并刷新 `updated_at`。
+pub fn save_preset(
+    id: Option<i64>,
+    name: &str,
+    prompt: &str,
+    negative_prompt: &str,
+    params_json: &str,
+    refs: &[PresetRef],
+) -> AppResult<WorkflowPreset> {
+    let c = conn()?;
+    save_preset_in(&c, id, name, prompt, negative_prompt, params_json, refs)
+}
+
+pub(crate) fn save_preset_in(
+    c: &Connection,
+    id: Option<i64>,
+    name: &str,
+    prompt: &str,
+    negative_prompt: &str,
+    params_json: &str,
+    refs: &[PresetRef],
+) -> AppResult<WorkflowPreset> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(AppError::Other("预设名称不能为空".into()));
+    }
+    if name.chars().count() > MAX_PRESET_NAME_CHARS {
+        return Err(AppError::Other(format!(
+            "预设名称不能超过 {MAX_PRESET_NAME_CHARS} 个字符"
+        )));
+    }
+    if params_json.len() > 64 * 1024 {
+        return Err(AppError::Other("预设参数过大".into()));
+    }
+    let params: serde_json::Value = serde_json::from_str(params_json)
+        .map_err(|_| AppError::Other("预设参数不是合法 JSON".into()))?;
+    if !params.is_object() {
+        return Err(AppError::Other("预设参数必须是 JSON 对象".into()));
+    }
+    validate_preset_refs(refs)?;
+    let refs_json = serde_json::to_string(refs).unwrap_or_else(|_| "[]".into());
+    let now = timestamp_millis();
+    let preset_id = match id {
+        Some(id) => {
+            let changed = c.execute(
+                "UPDATE workflow_presets SET name = ?2, prompt = ?3, negative_prompt = ?4,
+                 params_json = ?5, refs_json = ?6, updated_at = ?7 WHERE id = ?1",
+                params![
+                    id,
+                    name,
+                    prompt,
+                    negative_prompt,
+                    params_json,
+                    refs_json,
+                    now
+                ],
+            )?;
+            if changed == 0 {
+                return Err(AppError::Other("预设不存在或已被删除".into()));
+            }
+            id
+        }
+        None => {
+            c.execute(
+                "INSERT INTO workflow_presets
+                 (name, prompt, negative_prompt, params_json, refs_json, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                params![name, prompt, negative_prompt, params_json, refs_json, now],
+            )?;
+            c.last_insert_rowid()
+        }
+    };
+    c.query_row(
+        "SELECT id, name, prompt, negative_prompt, params_json, refs_json, created_at, updated_at
+         FROM workflow_presets WHERE id = ?1",
+        params![preset_id],
+        preset_from_row,
+    )
+    .map_err(AppError::from)
+}
+
+pub fn delete_preset(id: i64) -> AppResult<bool> {
+    let c = conn()?;
+    delete_preset_in(&c, id)
+}
+
+pub(crate) fn delete_preset_in(c: &Connection, id: i64) -> AppResult<bool> {
+    Ok(c.execute("DELETE FROM workflow_presets WHERE id = ?1", params![id])? > 0)
+}
+
+fn canvas_meta_from_row(row: &rusqlite::Row) -> rusqlite::Result<CanvasBoardMeta> {
+    Ok(CanvasBoardMeta {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        created_at: row.get(2)?,
+        updated_at: row.get(3)?,
+    })
+}
+
+fn canvas_board_from_row(row: &rusqlite::Row) -> rusqlite::Result<CanvasBoard> {
+    Ok(CanvasBoard {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        data_json: row.get(2)?,
+        created_at: row.get(3)?,
+        updated_at: row.get(4)?,
+    })
+}
+
+fn validate_canvas_name(name: &str) -> AppResult<&str> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(AppError::Other("画布名称不能为空".into()));
+    }
+    if name.chars().count() > MAX_CANVAS_NAME_CHARS {
+        return Err(AppError::Other(format!(
+            "画布名称不能超过 {MAX_CANVAS_NAME_CHARS} 个字符"
+        )));
+    }
+    Ok(name)
+}
+
+/// 画布数据校验：节点 id 唯一、边只引用已存在的节点、视口数值有限。
+/// 只校验结构与引用关系，不约束节点业务字段（局部重绘等参数由编辑器自己校验）。
+fn validate_canvas_data(raw: &str) -> AppResult<()> {
+    if raw.len() > MAX_CANVAS_JSON_BYTES {
+        return Err(AppError::Other("画布数据过大（上限 2MB）".into()));
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| AppError::Other("画布数据不是合法 JSON".into()))?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| AppError::Other("画布数据必须是 JSON 对象".into()))?;
+
+    let nodes = obj
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| AppError::Other("画布数据缺少节点数组".into()))?;
+    if nodes.len() > MAX_CANVAS_NODES {
+        return Err(AppError::Other(format!(
+            "画布节点不能超过 {MAX_CANVAS_NODES} 个"
+        )));
+    }
+    let mut ids = HashSet::new();
+    for node in nodes {
+        let node = node
+            .as_object()
+            .ok_or_else(|| AppError::Other("画布节点必须是对象".into()))?;
+        let id = match node.get("id") {
+            Some(serde_json::Value::String(s)) if !s.trim().is_empty() => s.clone(),
+            Some(serde_json::Value::Number(n)) => n.to_string(),
+            _ => return Err(AppError::Other("画布节点缺少有效 id".into())),
+        };
+        if !ids.insert(id) {
+            return Err(AppError::Other("画布节点 id 不能重复".into()));
+        }
+    }
+
+    let edges = obj
+        .get("edges")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| AppError::Other("画布数据缺少连线数组".into()))?;
+    for edge in edges {
+        let edge = edge
+            .as_object()
+            .ok_or_else(|| AppError::Other("画布连线必须是对象".into()))?;
+        let from = edge
+            .get("from")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| AppError::Other("画布连线缺少起点".into()))?;
+        let to = edge
+            .get("to")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| AppError::Other("画布连线缺少终点".into()))?;
+        if !ids.contains(from) || !ids.contains(to) {
+            return Err(AppError::Other("画布连线引用了不存在的节点".into()));
+        }
+    }
+
+    let viewport = obj
+        .get("viewport")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| AppError::Other("画布数据缺少视口".into()))?;
+    for key in ["x", "y", "zoom"] {
+        let value = viewport
+            .get(key)
+            .and_then(serde_json::Value::as_f64)
+            .ok_or_else(|| AppError::Other(format!("画布视口缺少数值 {key}")))?;
+        if !value.is_finite() {
+            return Err(AppError::Other(format!("画布视口 {key} 必须是有限数值")));
+        }
+    }
+    Ok(())
+}
+
+pub fn list_canvas_boards() -> AppResult<Vec<CanvasBoardMeta>> {
+    let c = conn()?;
+    list_canvas_boards_in(&c)
+}
+
+pub(crate) fn list_canvas_boards_in(c: &Connection) -> AppResult<Vec<CanvasBoardMeta>> {
+    let mut stmt = c.prepare(
+        "SELECT id, name, created_at, updated_at FROM canvas_boards
+         ORDER BY updated_at DESC, id DESC",
+    )?;
+    let rows = stmt.query_map([], canvas_meta_from_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+fn get_canvas_board_in(c: &Connection, id: i64) -> AppResult<Option<CanvasBoard>> {
+    c.query_row(
+        "SELECT id, name, data_json, created_at, updated_at FROM canvas_boards WHERE id = ?1",
+        params![id],
+        canvas_board_from_row,
+    )
+    .optional()
+    .map_err(AppError::from)
+}
+
+pub fn create_canvas_board(name: &str) -> AppResult<CanvasBoard> {
+    let c = conn()?;
+    create_canvas_board_in(&c, name)
+}
+
+pub(crate) fn create_canvas_board_in(c: &Connection, name: &str) -> AppResult<CanvasBoard> {
+    let name = validate_canvas_name(name)?;
+    let now = timestamp_millis();
+    c.execute(
+        "INSERT INTO canvas_boards (name, data_json, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![name, CANVAS_DEFAULT_DATA, now, now],
+    )?;
+    let id = c.last_insert_rowid();
+    get_canvas_board_in(c, id)?.ok_or_else(|| AppError::Other("新建画布后读取失败".into()))
+}
+
+pub fn get_canvas_board(id: i64) -> AppResult<Option<CanvasBoard>> {
+    let c = conn()?;
+    get_canvas_board_in(&c, id)
+}
+
+pub fn save_canvas_board(id: i64, name: &str, data_json: &str) -> AppResult<CanvasBoard> {
+    let c = conn()?;
+    save_canvas_board_in(&c, id, name, data_json)
+}
+
+pub(crate) fn save_canvas_board_in(
+    c: &Connection,
+    id: i64,
+    name: &str,
+    data_json: &str,
+) -> AppResult<CanvasBoard> {
+    let name = validate_canvas_name(name)?;
+    validate_canvas_data(data_json)?;
+    let changed = c.execute(
+        "UPDATE canvas_boards SET name = ?2, data_json = ?3, updated_at = ?4 WHERE id = ?1",
+        params![id, name, data_json, timestamp_millis()],
+    )?;
+    if changed == 0 {
+        return Err(AppError::Other(format!("画布 #{id} 不存在")));
+    }
+    get_canvas_board_in(c, id)?.ok_or_else(|| AppError::Other(format!("画布 #{id} 保存后读取失败")))
+}
+
+pub fn delete_canvas_board(id: i64) -> AppResult<bool> {
+    let c = conn()?;
+    delete_canvas_board_in(&c, id)
+}
+
+pub(crate) fn delete_canvas_board_in(c: &Connection, id: i64) -> AppResult<bool> {
+    Ok(c.execute("DELETE FROM canvas_boards WHERE id = ?1", params![id])? > 0)
 }
 
 /// 文件删除决策：调用方据此决定是否回收磁盘文件。
@@ -1363,7 +2408,9 @@ pub(crate) fn normalize_path_key(p: &str) -> String {
     p.trim().replace('/', "\\").to_lowercase()
 }
 
-/// 引用集合 = `history.file_path` ∪ `messages.images_json[].path`。
+/// 引用集合 = `history.file_path` ∪ `messages.images_json[].path`
+/// ∪ `jobs.images_json[].path` ∪ `jobs.input_json.referencePaths`
+/// ∪ `workflow_presets.refs_json[].path`。
 ///
 /// 用 JSON 结构化解析而不是 LIKE：JSON 里的 Windows 路径是转义双反斜杠，
 /// LIKE 匹配不上；子串匹配还会让 `a.png` 命中 `xa.png`。
@@ -1377,7 +2424,25 @@ pub(crate) fn collect_referenced_paths_in(c: &Connection) -> AppResult<HashSet<S
         FROM messages m
         JOIN json_each(CASE WHEN json_valid(m.images_json)
                             THEN m.images_json ELSE '[]' END) AS j
-        WHERE json_type(j.value, '$.path') = 'text'
+        WHERE j.type = 'object' AND json_type(j.value, '$.path') = 'text'
+        UNION
+        SELECT json_extract(j.value, '$.path')
+        FROM jobs q
+        JOIN json_each(CASE WHEN json_valid(q.images_json)
+                            THEN q.images_json ELSE '[]' END) AS j
+        WHERE j.type = 'object' AND json_type(j.value, '$.path') = 'text'
+        UNION
+        SELECT rp.value
+        FROM jobs q
+        JOIN json_each(CASE WHEN json_valid(q.input_json)
+                            THEN q.input_json ELSE '{}' END, '$.referencePaths') AS rp
+        WHERE rp.type = 'text'
+        UNION
+        SELECT json_extract(r.value, '$.path')
+        FROM workflow_presets p
+        JOIN json_each(CASE WHEN json_valid(p.refs_json)
+                            THEN p.refs_json ELSE '[]' END) AS r
+        WHERE r.type = 'object' AND json_type(r.value, '$.path') = 'text'
     ";
     let mut stmt = c.prepare(SQL)?;
     let rows = stmt.query_map([], |r| r.get::<_, Option<String>>(0))?;
@@ -1398,6 +2463,166 @@ pub(crate) fn collect_referenced_paths_in(c: &Connection) -> AppResult<HashSet<S
 pub(crate) fn referenced_image_paths_snapshot() -> AppResult<HashSet<String>> {
     let c = conn()?;
     collect_referenced_paths_in(&c)
+}
+
+/// 媒体根归一化键：分隔符统一、忽略大小写、去掉尾部分隔符。
+fn media_root_key(p: &Path) -> String {
+    normalize_path_key(&p.to_string_lossy())
+        .trim_end_matches('\\')
+        .to_string()
+}
+
+/// 单条路径改写：只有落在旧根之下的路径才改写，其余原样不动。
+fn rewrite_path(p: &str, old_key: &str, new_root: &str) -> Option<String> {
+    let orig = p.trim();
+    let key = normalize_path_key(orig);
+    let prefix = format!("{old_key}\\");
+    if !key.starts_with(&prefix) {
+        return None;
+    }
+    // 保留原路径的相对部分与大小写；非 ASCII 大小写折叠可能改变字节长度，
+    // 切不出原串时退回归一化尾段（Windows 下大小写不敏感，仍可解析）。
+    let tail = orig
+        .get(old_key.len()..)
+        .map(|t| t.replace('/', "\\"))
+        .unwrap_or_else(|| key[old_key.len()..].to_string());
+    Some(format!("{new_root}{tail}"))
+}
+
+/// 改写 `[{path}]` 形态的 JSON 列（messages / jobs 的 images_json、预设 refs_json）
+fn rewrite_json_path_array(
+    tx: &Connection,
+    table: &str,
+    column: &str,
+    old_key: &str,
+    new_root: &str,
+) -> AppResult<usize> {
+    let rows: Vec<(i64, String)> = {
+        let sql = format!("SELECT id, \"{column}\" FROM \"{table}\" WHERE \"{column}\" <> ''");
+        let mut stmt = tx.prepare(&sql)?;
+        let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut changed = 0usize;
+    for (id, raw) in rows {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(items) = value.as_array_mut() else {
+            continue;
+        };
+        let mut touched = 0usize;
+        for item in items {
+            let Some(path) = item.get("path").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if let Some(next) = rewrite_path(path, old_key, new_root) {
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("path".into(), next.into());
+                    touched += 1;
+                }
+            }
+        }
+        if touched == 0 {
+            continue;
+        }
+        let sql = format!("UPDATE \"{table}\" SET \"{column}\" = ?1 WHERE id = ?2");
+        tx.execute(&sql, params![json_string(&value)?, id])?;
+        changed += touched;
+    }
+    Ok(changed)
+}
+
+/// 改写后的 JSON 序列化（`AppError` 没有 serde_json 转换，就地映射）
+fn json_string(value: &serde_json::Value) -> AppResult<String> {
+    serde_json::to_string(value).map_err(|e| AppError::Other(format!("序列化 JSON 失败: {e}")))
+}
+
+/// 改写 `jobs.input_json.referencePaths`（队列参考图路径数组）
+fn rewrite_job_inputs(tx: &Connection, old_key: &str, new_root: &str) -> AppResult<usize> {
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = tx.prepare("SELECT id, input_json FROM jobs WHERE input_json <> ''")?;
+        let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut changed = 0usize;
+    for (id, raw) in rows {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(paths) = value
+            .get_mut("referencePaths")
+            .and_then(|v| v.as_array_mut())
+        else {
+            continue;
+        };
+        let mut touched = 0usize;
+        for item in paths.iter_mut() {
+            let Some(path) = item.as_str() else { continue };
+            if let Some(next) = rewrite_path(path, old_key, new_root) {
+                *item = serde_json::Value::String(next);
+                touched += 1;
+            }
+        }
+        if touched == 0 {
+            continue;
+        }
+        tx.execute(
+            "UPDATE jobs SET input_json = ?1 WHERE id = ?2",
+            params![json_string(&value)?, id],
+        )?;
+        changed += touched;
+    }
+    Ok(changed)
+}
+
+/// 媒体根搬家后的路径改写：覆盖库中全部 5 处引用，单事务提交。
+///
+/// 只改写落在旧根下的路径（前缀按目录边界比较，`images2` 不会被 `images` 命中）；
+/// 对已经是新根的库再次调用不会产生任何变更，可安全重试。
+pub fn rewrite_media_root(old: &Path, new: &Path) -> AppResult<usize> {
+    let c = conn()?;
+    rewrite_media_root_in(&c, old, new)
+}
+
+pub(crate) fn rewrite_media_root_in(c: &Connection, old: &Path, new: &Path) -> AppResult<usize> {
+    let old_key = media_root_key(old);
+    let new_root = new
+        .to_string_lossy()
+        .trim_end_matches(['\\', '/'])
+        .to_string();
+    if old_key.is_empty() || new_root.is_empty() {
+        return Err(AppError::Other("媒体目录路径为空，无法改写".into()));
+    }
+    let tx = c.unchecked_transaction()?;
+    let mut changed = 0usize;
+
+    // 1) history.file_path
+    let history_rows: Vec<(i64, String)> = {
+        let mut stmt = tx.prepare("SELECT id, file_path FROM history WHERE file_path <> ''")?;
+        let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, path) in history_rows {
+        if let Some(next) = rewrite_path(&path, &old_key, &new_root) {
+            tx.execute(
+                "UPDATE history SET file_path = ?1 WHERE id = ?2",
+                params![next, id],
+            )?;
+            changed += 1;
+        }
+    }
+
+    // 2) messages.images_json、3) jobs.images_json、5) workflow_presets.refs_json
+    changed += rewrite_json_path_array(&tx, "messages", "images_json", &old_key, &new_root)?;
+    changed += rewrite_json_path_array(&tx, "jobs", "images_json", &old_key, &new_root)?;
+    changed += rewrite_json_path_array(&tx, "workflow_presets", "refs_json", &old_key, &new_root)?;
+
+    // 4) jobs.input_json.referencePaths
+    changed += rewrite_job_inputs(&tx, &old_key, &new_root)?;
+
+    tx.commit()?;
+    Ok(changed)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1570,7 +2795,7 @@ pub const JOB_TERMINAL_STATUSES: &[&str] = &["done", "failed", "canceled", "inte
 
 const JOB_COLUMNS: &str = "id, status, provider_id, provider_name, model, prompt, \
      negative_prompt, style, width, height, guidance, steps, seed, count, job_key, \
-     images_json, error, created_at, started_at, finished_at";
+     images_json, error, created_at, started_at, finished_at, input_json";
 
 /// 队列任务。`images_json` 只存 `[{historyId,path}]`，绝不存 base64。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1597,6 +2822,8 @@ pub struct JobRow {
     pub created_at: String,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
+    /// 列里没有的扩展参数（参考图路径 / 角色），空串表示没有
+    pub input_json: String,
 }
 
 /// 入队参数快照（入队后不再与聊天输入联动）
@@ -1613,6 +2840,7 @@ pub struct NewJob<'a> {
     pub steps: Option<i64>,
     pub seed: Option<i64>,
     pub count: i64,
+    pub input_json: &'a str,
 }
 
 fn job_from_row(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
@@ -1637,6 +2865,7 @@ fn job_from_row(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         created_at: row.get(17)?,
         started_at: row.get(18)?,
         finished_at: row.get(19)?,
+        input_json: row.get(20)?,
     })
 }
 
@@ -1648,8 +2877,8 @@ pub fn insert_job(job: &NewJob) -> AppResult<i64> {
 fn insert_job_in(c: &Connection, job: &NewJob) -> AppResult<i64> {
     c.execute(
         "INSERT INTO jobs (status, provider_id, provider_name, model, prompt, negative_prompt,
-         style, width, height, guidance, steps, seed, count, created_at)
-         VALUES ('queued', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         style, width, height, guidance, steps, seed, count, created_at, input_json)
+         VALUES ('queued', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             job.provider_id,
             job.provider_name,
@@ -1664,6 +2893,7 @@ fn insert_job_in(c: &Connection, job: &NewJob) -> AppResult<i64> {
             job.seed,
             job.count,
             timestamp_millis(),
+            job.input_json,
         ],
     )?;
     Ok(c.last_insert_rowid())
@@ -1704,29 +2934,30 @@ pub fn job_counts() -> AppResult<Vec<(String, i64)>> {
     rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
 }
 
-pub fn next_queued_job() -> AppResult<Option<JobRow>> {
+/// 原子领取下一个排队任务：queued → running。
+///
+/// 单条 UPDATE 完成「选最早一条 + 抢占 + 并发上限判断」，多个 worker 同时调用
+/// 也不会领到同一条；`limit` 是正在运行的上限（1–4），达到上限时返回 None。
+pub fn claim_next_job(limit: i64) -> AppResult<Option<JobRow>> {
     let c = conn()?;
-    next_queued_job_in(&c)
+    claim_next_job_in(&c, limit)
 }
 
-fn next_queued_job_in(c: &Connection) -> AppResult<Option<JobRow>> {
-    let sql =
-        format!("SELECT {JOB_COLUMNS} FROM jobs WHERE status = 'queued' ORDER BY id ASC LIMIT 1");
-    Ok(c.query_row(&sql, [], job_from_row).optional()?)
-}
-
-/// queued → running。返回 false 表示该 job 已被取消/被其它 worker 取走。
-pub fn start_job(id: i64) -> AppResult<bool> {
-    let c = conn()?;
-    start_job_in(&c, id)
-}
-
-fn start_job_in(c: &Connection, id: i64) -> AppResult<bool> {
-    let affected = c.execute(
-        "UPDATE jobs SET status = 'running', started_at = ?2 WHERE id = ?1 AND status = 'queued'",
-        params![id, timestamp_millis()],
-    )?;
-    Ok(affected > 0)
+fn claim_next_job_in(c: &Connection, limit: i64) -> AppResult<Option<JobRow>> {
+    let id: Option<i64> = c
+        .query_row(
+            "UPDATE jobs SET status = 'running', started_at = ?1
+             WHERE id = (SELECT id FROM jobs WHERE status = 'queued' ORDER BY id ASC LIMIT 1)
+               AND (SELECT COUNT(*) FROM jobs WHERE status = 'running') < ?2
+             RETURNING id",
+            params![timestamp_millis(), limit.max(1)],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match id {
+        Some(id) => get_job_in(c, id),
+        None => Ok(None),
+    }
 }
 
 /// running → 终态。只允许从 running 迁移，防止已 canceled 的行被 done 覆盖。
@@ -1790,6 +3021,21 @@ fn requeue_job_in(c: &Connection, id: i64) -> AppResult<bool> {
 pub fn mark_running_interrupted() -> AppResult<usize> {
     let c = conn()?;
     mark_running_interrupted_in(&c)
+}
+
+/// 是否有正在执行的任务（媒体根迁移前必须为空：运行中的任务正在写图片）
+pub fn has_running_jobs() -> AppResult<bool> {
+    let c = conn()?;
+    has_running_jobs_in(&c)
+}
+
+pub(crate) fn has_running_jobs_in(c: &Connection) -> AppResult<bool> {
+    let n: i64 = c.query_row(
+        "SELECT COUNT(*) FROM jobs WHERE status = 'running'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 fn mark_running_interrupted_in(c: &Connection) -> AppResult<usize> {
@@ -1950,6 +3196,8 @@ mod tests {
             template_url: "",
             template_body: "",
             template_response_path: "",
+            edit_template_json: "",
+            transform_template_json: "",
         }
     }
 
@@ -2018,6 +3266,28 @@ mod tests {
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, "Mock 服务商");
 
+        // M2：编辑/变换模板 JSON 列往返（保存 → 重读 → 清空写回）
+        let spec = template_spec_json(
+            "https://api.example.com/edit",
+            "{\"m\":\"{{mask}}\"}",
+            "data.0.url",
+        );
+        let mut tpl_draft = draft("模板服务商", None, None);
+        tpl_draft.kind = "template";
+        tpl_draft.edit_template_json = &spec;
+        let tpl = save_provider(None, &tpl_draft).expect("save template provider");
+        assert_eq!(tpl.edit_template_json, spec);
+        assert_eq!(tpl.transform_template_json, "");
+        let reloaded = get_provider(tpl.id)
+            .unwrap()
+            .expect("template provider exists");
+        assert_eq!(reloaded.edit_template_json, spec);
+        assert_eq!(reloaded.transform_template_json, "");
+        tpl_draft.edit_template_json = "";
+        let cleared = save_provider(Some(tpl.id), &tpl_draft).expect("clear template spec");
+        assert_eq!(cleared.edit_template_json, "");
+        delete_provider(tpl.id).unwrap();
+
         // 不传 Key 更新时保留旧密文
         let updated =
             save_provider(Some(row.id), &draft("改名", None, None)).expect("update without key");
@@ -2058,6 +3328,12 @@ mod tests {
                 "templateUrl": "",
                 "templateBody": "",
                 "templateResponsePath": "",
+                "editTemplateUrl": "https://api.example.com/edit?img={{image}}",
+                "editTemplateBody": "{\"mask\":\"{{mask}}\"}",
+                "editTemplateResponsePath": "data.0.url",
+                "transformTemplateUrl": "https://api.example.com/up",
+                "transformTemplateBody": "{\"scale\":{{scale}}}",
+                "transformTemplateResponsePath": "",
                 "extraParams": r#"{"quality":"high"}"#,
             }],
             "settings": { "defaultProviderId": "7" },
@@ -2068,6 +3344,20 @@ mod tests {
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].name, "导入的服务商");
         assert_eq!(after[0].timeout_secs, 30);
+        // M2：模板列随备份导入还原
+        let edit_spec: serde_json::Value =
+            serde_json::from_str(&after[0].edit_template_json).expect("edit spec json");
+        assert_eq!(
+            edit_spec["url"],
+            "https://api.example.com/edit?img={{image}}"
+        );
+        assert_eq!(edit_spec["body"], "{\"mask\":\"{{mask}}\"}");
+        assert_eq!(edit_spec["responsePath"], "data.0.url");
+        let transform_spec: serde_json::Value =
+            serde_json::from_str(&after[0].transform_template_json).expect("transform spec json");
+        assert_eq!(transform_spec["url"], "https://api.example.com/up");
+        assert_eq!(transform_spec["body"], "{\"scale\":{{scale}}}");
+        assert_eq!(transform_spec["responsePath"], "");
         // 旧服务商及其 extraParams 已随替换删除
         assert!(get_setting(&format!("extraParams:{}", row.id))
             .unwrap()
@@ -2103,18 +3393,70 @@ mod tests {
             file_path: "/tmp/x.png".into(),
             favorite: false,
             created_at: "1".into(),
+            parent_id: None,
+            op: "generate".into(),
         })
         .unwrap();
-        let history = list_history(10, 0, "", "").unwrap();
+        let history = list_history(10, 0, "", "", false).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].id, hid);
         assert_eq!(history[0].seed, Some(7));
         set_favorite(hid, true).unwrap();
-        assert!(list_history(10, 0, "", "").unwrap()[0].favorite);
+        assert!(list_history(10, 0, "", "", false).unwrap()[0].favorite);
         let plan = delete_history(hid).unwrap();
         assert_eq!(plan.file_path.as_deref(), Some("/tmp/x.png"));
         assert!(!plan.still_referenced, "无消息引用时应允许回收文件");
-        assert!(list_history(10, 0, "", "").unwrap().is_empty());
+        assert!(list_history(10, 0, "", "", false).unwrap().is_empty());
+
+        // 迁移 007：派生图血统 —— 父图 + 放大子图，list_derived 以根为单位返回同族
+        let parent = add_history(&HistoryRow {
+            id: 0,
+            prompt: "root".into(),
+            negative_prompt: String::new(),
+            model: "mock-draw-v1".into(),
+            provider_name: "Mock".into(),
+            seed: None,
+            width: 1024,
+            height: 1024,
+            guidance: 0.0,
+            steps: 0,
+            style: String::new(),
+            file_path: "/tmp/root.png".into(),
+            favorite: false,
+            created_at: "2".into(),
+            parent_id: None,
+            op: "generate".into(),
+        })
+        .unwrap();
+        let child = add_history(&HistoryRow {
+            id: 0,
+            prompt: "upscale 2x".into(),
+            negative_prompt: String::new(),
+            model: "mock-draw-v1".into(),
+            provider_name: "Mock".into(),
+            seed: None,
+            width: 2048,
+            height: 2048,
+            guidance: 0.0,
+            steps: 0,
+            style: String::new(),
+            file_path: "/tmp/child.png".into(),
+            favorite: false,
+            created_at: "3".into(),
+            parent_id: Some(parent),
+            op: "upscale".into(),
+        })
+        .unwrap();
+        let family = list_derived(child).unwrap();
+        assert_eq!(
+            family.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![parent, child]
+        );
+        assert_eq!(family[1].parent_id, Some(parent));
+        assert_eq!(family[1].op, "upscale");
+        // 从父图查同族结果一致（根节点不因入参不同而变）
+        assert_eq!(list_derived(parent).unwrap().len(), 2);
+        assert!(list_derived(999_999).unwrap().is_empty());
 
         delete_provider(after[0].id).unwrap();
         assert!(list_providers().unwrap().is_empty());
@@ -2288,6 +3630,7 @@ mod tests {
             "settings": {
                 "defaultProviderId": "9",
                 "theme": "dark",
+                "glassAppearance": "tinted",
                 "promptTemplates": r#"[{"id":"my","title":"我的模板","text":"a {subject}"}]"#,
                 "unknownKey": "ignored",
             },
@@ -2328,6 +3671,11 @@ mod tests {
             .contains("我的模板"));
         // 白名单外的设置项不落库
         assert!(setting_of(&c, "unknownKey").is_none());
+        assert_eq!(
+            setting_of(&c, "glassAppearance").as_deref(),
+            Some("tinted"),
+            "玻璃质感随备份往返"
+        );
 
         let raw = setting_of(&c, "thinkingConfig").expect("思考配置已导入");
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -2359,6 +3707,10 @@ mod tests {
         .unwrap();
         let bad_settings = [
             (serde_json::json!({ "theme": "purple" }), "主题取值非法"),
+            (
+                serde_json::json!({ "glassAppearance": "blurred" }),
+                "玻璃质感取值非法",
+            ),
             (
                 serde_json::json!({ "promptTemplates": "not-json" }),
                 "自定义模板",
@@ -2674,6 +4026,192 @@ mod tests {
         assert!(set.contains(&normalize_path_key("/tmp/keep.png")));
     }
 
+    /// 引用集合还要覆盖队列参考图与工作流预设参考图：
+    /// 漏掉任何一处，清理缓存都会把仍在排队/预设里的参考图当孤儿移走
+    #[test]
+    fn referenced_paths_include_jobs_and_presets() {
+        let c = mem_conn();
+        insert_history_row(&c, r"C:\media\images\h.png");
+        c.execute(
+            "INSERT INTO jobs (provider_id, created_at, images_json, input_json)
+             VALUES (1, '0', ?1, ?2)",
+            params![
+                r#"[{"historyId":1,"path":"C:\\media\\images\\job.png"}]"#,
+                r#"{"referencePaths":["C:\\media\\refs\\queue.png"],"references":[]}"#
+            ],
+        )
+        .unwrap();
+        save_preset_in(
+            &c,
+            None,
+            "夜景",
+            "",
+            "",
+            "{}",
+            &[PresetRef {
+                path: r"C:\media\refs\preset.png".into(),
+                role: "style".into(),
+                strength: 60,
+            }],
+        )
+        .expect("save preset");
+
+        let set = collect_referenced_paths_in(&c).expect("collect");
+        for p in [
+            r"C:\media\images\h.png",
+            r"C:\media\images\job.png",
+            r"C:\media\refs\queue.png",
+            r"C:\media\refs\preset.png",
+        ] {
+            assert!(set.contains(&normalize_path_key(p)), "缺少引用: {p}");
+        }
+        assert_eq!(set.len(), 4);
+    }
+
+    /// 队列 input_json / 预设 refs_json 损坏时不得让整条引用查询失败
+    #[test]
+    fn referenced_paths_survive_corrupt_job_and_preset_json() {
+        let c = mem_conn();
+        c.execute(
+            "INSERT INTO jobs (provider_id, created_at, images_json, input_json)
+             VALUES (1, '0', 'not-json', 'not-json')",
+            [],
+        )
+        .unwrap();
+        let preset = save_preset_in(&c, None, "p", "", "", "{}", &[]).expect("save preset");
+        c.execute(
+            "UPDATE workflow_presets SET refs_json = 'oops' WHERE id = ?1",
+            params![preset.id],
+        )
+        .unwrap();
+        let set = collect_referenced_paths_in(&c).expect("坏 JSON 不应导致查询失败");
+        assert!(set.is_empty());
+    }
+
+    /// 媒体根改写必须覆盖全部 5 处引用、保留大小写、不动旧根之外的路径，且幂等
+    #[test]
+    fn rewrite_media_root_updates_all_references_and_is_idempotent() {
+        let c = mem_conn();
+        let old = Path::new(r"E:\old root");
+        let new = Path::new(r"D:\new\media");
+
+        let history_id = insert_history_row(&c, r"E:\old root\images\a.PNG");
+        let message_id = insert_message(&c, 1, "hi");
+        set_message_images(
+            &c,
+            message_id,
+            r#"[{"historyId":1,"path":"E:\\old root\\images\\b.png"},{"path":"E:\\other\\keep.png"}]"#,
+        );
+        c.execute(
+            "INSERT INTO jobs (provider_id, created_at, images_json, input_json)
+             VALUES (1, '0', ?1, ?2)",
+            params![
+                r#"[{"historyId":1,"path":"E:\\old root\\images\\c.png"}]"#,
+                r#"{"referencePaths":["E:\\old root\\refs\\q.png","E:\\other\\r2.png"],"references":[]}"#
+            ],
+        )
+        .unwrap();
+        let preset = save_preset_in(
+            &c,
+            None,
+            "p",
+            "",
+            "",
+            "{}",
+            &[PresetRef {
+                path: r"E:\old root\refs\preset.png".into(),
+                role: "style".into(),
+                strength: 80,
+            }],
+        )
+        .expect("save preset");
+        // 旧根的「兄弟目录」不能被前缀误改
+        insert_history_row(&c, r"E:\old root2\images\sibling.png");
+
+        let changed = rewrite_media_root_in(&c, old, new).expect("rewrite");
+        assert_eq!(
+            changed, 5,
+            "history/message/job 图/队列参考图/预设参考图各一处"
+        );
+
+        let file_path: String = c
+            .query_row(
+                "SELECT file_path FROM history WHERE id = ?1",
+                params![history_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(file_path, r"D:\new\media\images\a.PNG");
+
+        let images_json: String = c
+            .query_row(
+                "SELECT images_json FROM messages WHERE id = ?1",
+                params![message_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(images_json.contains(r"D:\\new\\media\\images\\b.png"));
+        assert!(
+            images_json.contains(r"E:\\other\\keep.png"),
+            "旧根外路径不动"
+        );
+
+        let (job_images, job_input): (String, String) = c
+            .query_row(
+                "SELECT images_json, input_json FROM jobs LIMIT 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(job_images.contains(r"D:\\new\\media\\images\\c.png"));
+        assert!(job_input.contains(r"D:\\new\\media\\refs\\q.png"));
+        assert!(job_input.contains(r"E:\\other\\r2.png"), "旧根外路径不动");
+
+        let refs_json: String = c
+            .query_row(
+                "SELECT refs_json FROM workflow_presets WHERE id = ?1",
+                params![preset.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(refs_json.contains(r"D:\\new\\media\\refs\\preset.png"));
+
+        let sibling: String = c
+            .query_row(
+                "SELECT file_path FROM history WHERE file_path LIKE '%sibling.png'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sibling, r"E:\old root2\images\sibling.png");
+
+        // 幂等：再跑一次不应有任何变更
+        assert_eq!(rewrite_media_root_in(&c, old, new).unwrap(), 0);
+    }
+
+    /// 缓存保留天数：缺省 30，合法值生效，脏值/越界回退默认
+    #[test]
+    fn cache_retention_days_defaults_and_validates() {
+        let c = mem_conn();
+        assert_eq!(cache_retention_days_in(&c), DEFAULT_CACHE_RETENTION_DAYS);
+        for (raw, expected) in [
+            ("7", 7),
+            ("365", 365),
+            (" 1 ", 1),
+            ("0", DEFAULT_CACHE_RETENTION_DAYS),
+            ("366", DEFAULT_CACHE_RETENTION_DAYS),
+            ("abc", DEFAULT_CACHE_RETENTION_DAYS),
+        ] {
+            c.execute(
+                "INSERT INTO settings (key, value) VALUES ('cacheRetentionDays', ?1)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![raw],
+            )
+            .unwrap();
+            assert_eq!(cache_retention_days_in(&c), expected, "raw={raw}");
+        }
+    }
+
     /// 删除判定：被消息引用必须保留；无引用才允许回收；删行不影响判定自身的引用
     #[test]
     fn delete_history_keeps_file_when_still_referenced() {
@@ -2847,6 +4385,28 @@ mod tests {
         std::env::remove_var(MASTER_KEY_ENV);
     }
 
+    /// M3：模型能力覆盖值按 (provider, model) 往返，重复写入走更新
+    #[test]
+    fn model_caps_roundtrip_upsert() {
+        let c = mem_conn();
+        save_model_caps_in(&c, 7, "flux-pro", r#"{"negative":false}"#).unwrap();
+        save_model_caps_in(&c, 7, "flux-pro", r#"{"negative":true,"edit":false}"#).unwrap();
+        save_model_caps_in(&c, 7, "dall-e-3", r#"{"negative":false}"#).unwrap();
+        save_model_caps_in(&c, 8, "flux-pro", r#"{"transform":false}"#).unwrap();
+        assert_eq!(
+            list_model_caps_in(&c, 7).unwrap(),
+            vec![
+                ("dall-e-3".to_string(), r#"{"negative":false}"#.to_string()),
+                (
+                    "flux-pro".to_string(),
+                    r#"{"negative":true,"edit":false}"#.to_string()
+                ),
+            ]
+        );
+        // 不同服务商互不影响
+        assert_eq!(list_model_caps_in(&c, 8).unwrap().len(), 1);
+    }
+
     /// C2：v3 的 Key 字段类型错误必须在事务与 DELETE 之前被拒绝
     #[test]
     fn import_v3_rejects_bad_keys_before_touching_data() {
@@ -2893,6 +4453,7 @@ mod tests {
             steps: None,
             seed: None,
             count: 1,
+            input_json: "",
         }
     }
 
@@ -2902,7 +4463,10 @@ mod tests {
         let c = mem_conn();
         let running = insert_job_in(&c, &new_job("running")).unwrap();
         let queued = insert_job_in(&c, &new_job("queued")).unwrap();
-        assert!(start_job_in(&c, running).unwrap());
+        assert_eq!(
+            claim_next_job_in(&c, 1).unwrap().map(|j| j.id),
+            Some(running)
+        );
         assert_eq!(mark_running_interrupted_in(&c).unwrap(), 1);
         assert_eq!(
             get_job_in(&c, running).unwrap().unwrap().status,
@@ -2922,9 +4486,9 @@ mod tests {
         let id = insert_job_in(&c, &new_job("job")).unwrap();
         // 未启动时不能直接 finish（只有 running 才能收尾）
         assert!(!finish_job_in(&c, id, "done", "[]", None).unwrap());
-        assert!(start_job_in(&c, id).unwrap());
-        // 重复启动（worker 竞争）必须失败
-        assert!(!start_job_in(&c, id).unwrap());
+        assert_eq!(claim_next_job_in(&c, 1).unwrap().map(|j| j.id), Some(id));
+        // 已被领取的任务不能二次领取（worker 竞争）
+        assert!(claim_next_job_in(&c, 1).unwrap().is_none());
         assert!(finish_job_in(&c, id, "done", "[]", None).unwrap());
         // 终态不可再次迁移
         assert!(!finish_job_in(&c, id, "canceled", "[]", None).unwrap());
@@ -2937,7 +4501,7 @@ mod tests {
         let c = mem_conn();
         let id = insert_job_in(&c, &new_job("job")).unwrap();
         assert!(!requeue_job_in(&c, id).unwrap(), "queued 任务无需重试");
-        assert!(start_job_in(&c, id).unwrap());
+        assert_eq!(claim_next_job_in(&c, 1).unwrap().map(|j| j.id), Some(id));
         assert!(!requeue_job_in(&c, id).unwrap(), "running 任务不能重试");
         assert!(finish_job_in(&c, id, "failed", "[]", Some("boom")).unwrap());
         assert!(requeue_job_in(&c, id).unwrap());
@@ -2957,11 +4521,46 @@ mod tests {
         let second = insert_job_in(&c, &new_job("second")).unwrap();
         assert!(cancel_queued_job_in(&c, first).unwrap());
         assert!(!cancel_queued_job_in(&c, first).unwrap(), "取消应幂等");
-        let next = next_queued_job_in(&c).unwrap().expect("仍有排队任务");
+        let next = claim_next_job_in(&c, 1).unwrap().expect("仍有排队任务");
         assert_eq!(next.id, second, "被取消的任务不能再被取到");
         let row = get_job_in(&c, first).unwrap().unwrap();
         assert_eq!(row.status, "canceled");
         assert!(row.finished_at.is_some());
+    }
+
+    /// M8：并发上限生效，同一任务不会被领取两次
+    #[test]
+    fn claim_respects_concurrency_and_never_double_claims() {
+        let c = mem_conn();
+        let first = insert_job_in(&c, &new_job("first")).unwrap();
+        let second = insert_job_in(&c, &new_job("second")).unwrap();
+        assert_eq!(claim_next_job_in(&c, 2).unwrap().map(|j| j.id), Some(first));
+        assert_eq!(
+            claim_next_job_in(&c, 2).unwrap().map(|j| j.id),
+            Some(second)
+        );
+        // 已达上限 2，再领应为空
+        insert_job_in(&c, &new_job("third")).unwrap();
+        assert!(claim_next_job_in(&c, 2).unwrap().is_none());
+        // 完成一个后空出名额，且不会重复返回已领取的任务
+        assert!(finish_job_in(&c, first, "done", "[]", None).unwrap());
+        let next = claim_next_job_in(&c, 2).unwrap().expect("应有排空任务");
+        assert_eq!(next.prompt, "third");
+        assert_eq!(get_job_in(&c, first).unwrap().unwrap().status, "done");
+    }
+
+    /// M8：input_json 随任务往返（参考图路径与角色快照）
+    #[test]
+    fn job_input_json_roundtrip() {
+        let c = mem_conn();
+        let raw = r#"{"referencePaths":["/data/refs/a.png"],"references":[{"role":"style","strength":80}]}"#;
+        let mut job = new_job("with refs");
+        job.input_json = raw;
+        let id = insert_job_in(&c, &job).unwrap();
+        assert_eq!(get_job_in(&c, id).unwrap().unwrap().input_json, raw);
+        // 未带扩展字段的任务默认空串（旧数据/旧前端兼容）
+        let plain = insert_job_in(&c, &new_job("plain")).unwrap();
+        assert_eq!(get_job_in(&c, plain).unwrap().unwrap().input_json, "");
     }
 
     /// C4 缺陷 2：消息内移除图片引用后才能回收文件；其它消息仍引用时必须保留
@@ -3006,5 +4605,374 @@ mod tests {
         // 另一条消息仍引用 → 文件保留
         let deletion = delete_history_in(&c, shared).unwrap();
         assert!(deletion.still_referenced, "仍有消息引用时不得回收文件");
+    }
+
+    /// M9：收藏按文本去重，重复收藏只更新标签
+    #[test]
+    fn prompt_favorite_upsert_and_tags() {
+        let c = mem_conn();
+        let first = upsert_favorite_in(
+            &c,
+            "  cinematic portrait  ",
+            &["人像".into(), " 人像 ".into(), "".into()],
+        )
+        .unwrap();
+        assert_eq!(first.text, "cinematic portrait");
+        assert_eq!(first.tags, vec!["人像".to_string()]);
+        let again = upsert_favorite_in(&c, "cinematic portrait", &["人像".into(), "电影感".into()])
+            .unwrap();
+        assert_eq!(again.id, first.id, "同一文本不得产生第二条收藏");
+        assert_eq!(again.tags, vec!["人像".to_string(), "电影感".to_string()]);
+        assert_eq!(list_favorites_in(&c).unwrap().len(), 1);
+        assert!(upsert_favorite_in(&c, "   ", &[]).is_err());
+        assert!(delete_favorite_in(&c, first.id).unwrap());
+        assert!(!delete_favorite_in(&c, first.id).unwrap());
+    }
+
+    /// M9：预设保存 / 更新 / 删除与参考图约束
+    #[test]
+    fn workflow_preset_roundtrip_and_validation() {
+        let c = mem_conn();
+        let refs = vec![
+            PresetRef {
+                path: r"C:\data\refs\a.png".into(),
+                role: "composition".into(),
+                strength: 60,
+            },
+            PresetRef {
+                path: r"C:\data\refs\b.png".into(),
+                role: "style".into(),
+                strength: 80,
+            },
+        ];
+        let saved = save_preset_in(
+            &c,
+            None,
+            "  夜景人像  ",
+            "neon portrait",
+            "blurry",
+            r#"{"ratio":"3:4","width":768,"height":1024}"#,
+            &refs,
+        )
+        .unwrap();
+        assert_eq!(saved.name, "夜景人像");
+        assert_eq!(saved.refs, refs);
+        assert_eq!(list_presets_in(&c).unwrap().len(), 1);
+
+        let updated = save_preset_in(
+            &c,
+            Some(saved.id),
+            "夜景人像 v2",
+            saved.prompt.as_str(),
+            "",
+            saved.params_json.as_str(),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(updated.name, "夜景人像 v2");
+        assert!(updated.refs.is_empty());
+
+        assert!(save_preset_in(&c, None, "", "p", "", "{}", &[]).is_err());
+        assert!(save_preset_in(&c, None, "x", "p", "", "not-json", &[]).is_err());
+        assert!(save_preset_in(&c, None, "x", "p", "", "[]", &[]).is_err());
+        let too_many: Vec<PresetRef> = (0..=MAX_PRESET_REFS)
+            .map(|i| PresetRef {
+                path: format!("r{i}.png"),
+                role: "composition".into(),
+                strength: 60,
+            })
+            .collect();
+        assert!(save_preset_in(&c, None, "x", "p", "", "{}", &too_many).is_err());
+        let bad_role = vec![PresetRef {
+            path: "r.png".into(),
+            role: "unknown".into(),
+            strength: 60,
+        }];
+        assert!(save_preset_in(&c, None, "x", "p", "", "{}", &bad_role).is_err());
+        assert!(save_preset_in(&c, Some(9999), "x", "p", "", "{}", &[]).is_err());
+
+        assert!(delete_preset_in(&c, saved.id).unwrap());
+        assert!(list_presets_in(&c).unwrap().is_empty());
+    }
+
+    /// M9：迁移 009 的索引存在（版本号由通用迁移测试覆盖）
+    #[test]
+    fn prompt_assets_indexes_exist() {
+        let c = mem_conn();
+        assert!(index_exists(&c, "idx_prompt_favorites_created"));
+        assert!(index_exists(&c, "idx_workflow_presets_updated"));
+    }
+
+    /// M9：008 老库升级到 009 成功且可重复执行
+    #[test]
+    fn migration_009_upgrades_from_v8() {
+        let mut c = Connection::open_in_memory().unwrap();
+        apply_migrations_with(&mut c, &MIGRATIONS[..8]).unwrap();
+        assert_eq!(user_version_of(&c), 8);
+        assert!(!index_exists(&c, "idx_prompt_favorites_created"));
+
+        apply_migrations(&mut c).unwrap();
+        assert_eq!(user_version_of(&c), MIGRATIONS.len() as i64);
+        assert!(index_exists(&c, "idx_prompt_favorites_created"));
+        assert!(index_exists(&c, "idx_workflow_presets_updated"));
+
+        // 幂等：版本已是最新时再跑不报错、不丢数据
+        upsert_favorite_in(&c, "a cat", &[]).unwrap();
+        apply_migrations(&mut c).unwrap();
+        assert_eq!(list_favorites_in(&c).unwrap().len(), 1);
+    }
+
+    /// M12：迁移 010 从 v9 升级成功且可重复执行；画布索引存在
+    #[test]
+    fn migration_010_upgrades_from_v9() {
+        let mut c = Connection::open_in_memory().unwrap();
+        apply_migrations_with(&mut c, &MIGRATIONS[..9]).unwrap();
+        assert_eq!(user_version_of(&c), 9);
+        assert!(!index_exists(&c, "idx_canvas_boards_updated"));
+
+        apply_migrations(&mut c).unwrap();
+        assert_eq!(user_version_of(&c), MIGRATIONS.len() as i64);
+        assert!(index_exists(&c, "idx_canvas_boards_updated"));
+
+        create_canvas_board_in(&c, "设计稿").unwrap();
+        apply_migrations(&mut c).unwrap();
+        assert_eq!(list_canvas_boards_in(&c).unwrap().len(), 1);
+    }
+
+    /// M12：画布 CRUD 往返，默认数据与更新时间正确
+    #[test]
+    fn canvas_board_crud_roundtrip() {
+        let c = mem_conn();
+        let created = create_canvas_board_in(&c, " 第一块画布 ").unwrap();
+        assert_eq!(created.name, "第一块画布");
+        assert_eq!(created.data_json, CANVAS_DEFAULT_DATA);
+        assert!(!created.created_at.is_empty());
+
+        let listed = list_canvas_boards_in(&c).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, created.id);
+
+        let doc = r#"{"version":1,"nodes":[{"id":"n1","historyId":3,"x":10,"y":20,"width":240}],"edges":[],"viewport":{"x":12,"y":8,"zoom":1.5}}"#;
+        let saved = save_canvas_board_in(&c, created.id, "改名", doc).unwrap();
+        assert_eq!(saved.name, "改名");
+        assert_eq!(saved.data_json, doc);
+        assert_eq!(
+            get_canvas_board_in(&c, created.id).unwrap().unwrap().name,
+            "改名"
+        );
+
+        assert!(delete_canvas_board_in(&c, created.id).unwrap());
+        assert!(get_canvas_board_in(&c, created.id).unwrap().is_none());
+        assert!(!delete_canvas_board_in(&c, created.id).unwrap());
+        assert!(save_canvas_board_in(&c, created.id, "x", doc).is_err());
+    }
+
+    /// M12：画布数据拒绝悬空边、重复 id、超量节点与超大 JSON
+    #[test]
+    fn canvas_save_rejects_invalid_documents() {
+        let c = mem_conn();
+        let board = create_canvas_board_in(&c, "校验").unwrap();
+
+        let dangling = r#"{"version":1,"nodes":[],"edges":[{"id":"e1","from":"a","to":"b"}],"viewport":{"x":0,"y":0,"zoom":1}}"#;
+        assert!(save_canvas_board_in(&c, board.id, "x", dangling).is_err());
+
+        let duplicate = r#"{"version":1,"nodes":[{"id":"n1"},{"id":"n1"}],"edges":[],"viewport":{"x":0,"y":0,"zoom":1}}"#;
+        assert!(save_canvas_board_in(&c, board.id, "x", duplicate).is_err());
+
+        let nodes: Vec<String> = (0..=MAX_CANVAS_NODES)
+            .map(|i| format!(r#"{{"id":"n{i}"}}"#))
+            .collect();
+        let too_many = format!(
+            r#"{{"version":1,"nodes":[{}],"edges":[],"viewport":{{"x":0,"y":0,"zoom":1}}}}"#,
+            nodes.join(",")
+        );
+        assert!(save_canvas_board_in(&c, board.id, "x", &too_many).is_err());
+
+        let huge = format!(
+            r#"{{"version":1,"nodes":[],"edges":[],"viewport":{{"x":0,"y":0,"zoom":1}},"pad":"{}"}}"#,
+            "x".repeat(MAX_CANVAS_JSON_BYTES)
+        );
+        assert!(save_canvas_board_in(&c, board.id, "x", &huge).is_err());
+
+        let bad_viewport =
+            r#"{"version":1,"nodes":[],"edges":[],"viewport":{"x":0,"y":0,"zoom":"1"}}"#;
+        assert!(save_canvas_board_in(&c, board.id, "x", bad_viewport).is_err());
+        assert!(create_canvas_board_in(&c, "   ").is_err());
+    }
+
+    /// M9：v4 备份导入替换收藏与预设，参考图经注入闭包重新落盘
+    #[test]
+    fn import_v4_replaces_prompt_assets() {
+        let mut c = mem_conn();
+        upsert_favorite_in(&c, "旧收藏", &["old".into()]).unwrap();
+        save_preset_in(&c, None, "旧预设", "", "", "{}", &[]).unwrap();
+
+        let data = serde_json::json!({
+            "version": 4,
+            "providers": [{ "name": "P", "baseUrl": "" }],
+            "settings": {},
+            "favorites": [
+                { "text": "a cat", "tags": ["动物", "橘猫"], "createdAt": "1700000000" },
+                { "text": "a cat", "tags": ["去重"], "createdAt": "1700000001" },
+            ],
+            "presets": [{
+                "name": "夜景",
+                "prompt": "city at night",
+                "negativePrompt": "blur",
+                "params": { "ratio": "16:9" },
+                "refs": [
+                    { "role": "style", "strength": 80, "dataUrl": "data:image/png;base64,AAAA" },
+                    { "role": "composition", "strength": 20, "dataUrl": "data:image/png;base64,BBBB" },
+                ],
+            }],
+        });
+        let written: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let write = |data_url: &str| -> AppResult<String> {
+            let mut w = written.lock().unwrap();
+            w.push(data_url.to_string());
+            Ok(format!("C:/refs/ref-{}.png", w.len()))
+        };
+        import_config_in_with_refs(&mut c, &data, Some(&write)).expect("import v4");
+
+        let favs = list_favorites_in(&c).unwrap();
+        assert_eq!(favs.len(), 1, "重复文本只保留一条收藏");
+        assert_eq!(favs[0].text, "a cat");
+        assert_eq!(favs[0].tags, vec!["去重".to_string()]);
+        let presets = list_presets_in(&c).unwrap();
+        assert_eq!(presets.len(), 1, "旧预设必须被替换");
+        assert_eq!(presets[0].name, "夜景");
+        assert_eq!(presets[0].params_json, r#"{"ratio":"16:9"}"#);
+        assert_eq!(presets[0].refs.len(), 2);
+        assert_eq!(presets[0].refs[0].path, "C:/refs/ref-1.png");
+        assert_eq!(presets[0].refs[0].role, "style");
+        assert_eq!(presets[0].refs[0].strength, 80);
+        assert_eq!(written.lock().unwrap().len(), 2);
+    }
+
+    /// M9：v4 资产非法时在事务与 DELETE 之前失败，旧收藏/预设保持原样
+    #[test]
+    fn import_v4_rejects_bad_assets_before_delete() {
+        let mut c = mem_conn();
+        upsert_favorite_in(&c, "旧收藏", &[]).unwrap();
+        save_preset_in(&c, None, "旧预设", "", "", "{}", &[]).unwrap();
+        let provider = serde_json::json!({ "name": "P", "baseUrl": "" });
+        let five_refs: Vec<serde_json::Value> = (0..=MAX_PRESET_REFS)
+            .map(|_| {
+                serde_json::json!({
+                    "role": "style",
+                    "strength": 60,
+                    "dataUrl": "data:image/png;base64,AAAA",
+                })
+            })
+            .collect();
+        for bad in [
+            serde_json::json!({
+                "version": 4, "providers": [provider.clone()], "settings": {},
+                "favorites": [], "presets": {},
+            }),
+            serde_json::json!({
+                "version": 4, "providers": [provider.clone()], "settings": {},
+                "favorites": [], "presets": [{ "name": "  " }],
+            }),
+            serde_json::json!({
+                "version": 4, "providers": [provider.clone()], "settings": {},
+                "favorites": [], "presets": [{
+                    "name": "n",
+                    "refs": [{ "role": "style", "strength": 60, "dataUrl": "not-an-image" }],
+                }],
+            }),
+            serde_json::json!({
+                "version": 4, "providers": [provider.clone()], "settings": {},
+                "favorites": [], "presets": [{ "name": "n", "refs": five_refs }],
+            }),
+            serde_json::json!({
+                "version": 4, "providers": [provider.clone()], "settings": {},
+                "favorites": "oops", "presets": [],
+            }),
+        ] {
+            import_config_in(&mut c, &bad).expect_err("非法 v4 资产必须拒绝导入");
+            assert_eq!(list_favorites_in(&c).unwrap().len(), 1);
+            assert_eq!(list_presets_in(&c).unwrap().len(), 1);
+            assert_eq!(count_providers(&c), 0, "拒绝时不得删除旧服务商");
+        }
+    }
+
+    /// M9：v1–v3 备份不触碰本机收藏与预设
+    #[test]
+    fn import_v3_leaves_prompt_assets_untouched() {
+        let mut c = mem_conn();
+        upsert_favorite_in(&c, "本机收藏", &["keep".into()]).unwrap();
+        save_preset_in(&c, None, "本机预设", "", "", "{}", &[]).unwrap();
+        let data = serde_json::json!({
+            "version": 3,
+            "providers": [{ "name": "P", "baseUrl": "" }],
+            "settings": {},
+            "favorites": [],
+            "presets": [],
+        });
+        import_config_in(&mut c, &data).expect("import v3");
+        assert_eq!(list_favorites_in(&c).unwrap().len(), 1);
+        assert_eq!(list_presets_in(&c).unwrap().len(), 1);
+    }
+
+    /// M10：收藏过滤走 SQL，与模型/风格过滤组合后分页顺序不变
+    #[test]
+    fn list_history_filters_favorites_with_filters_and_order() {
+        let c = mem_conn();
+        for (i, (model, style, favorite)) in [
+            ("m-a", "anime", false),
+            ("m-a", "anime", true),
+            ("m-b", "anime", true),
+            ("m-a", "oil", true),
+            ("m-b", "oil", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            c.execute(
+                "INSERT INTO history (prompt, model, provider_name, style, file_path, favorite, created_at, op)
+                 VALUES (?1, ?2, 'P', ?3, ?4, ?5, ?6, 'generate')",
+                params![
+                    format!("p{i}"),
+                    model,
+                    style,
+                    format!("/tmp/{i}.png"),
+                    favorite as i64,
+                    i.to_string()
+                ],
+            )
+            .unwrap();
+        }
+
+        let ids = |rows: Vec<HistoryRow>| rows.iter().map(|r| r.id).collect::<Vec<_>>();
+        // id 1..5 对应插入顺序；favorite_only 按 id DESC 返回收藏项
+        assert_eq!(
+            ids(list_history_in(&c, 10, 0, "", "", true).unwrap()),
+            vec![4, 3, 2]
+        );
+        // 与模型过滤组合
+        assert_eq!(
+            ids(list_history_in(&c, 10, 0, "m-a", "", true).unwrap()),
+            vec![4, 2]
+        );
+        // 与风格过滤组合
+        assert_eq!(
+            ids(list_history_in(&c, 10, 0, "", "anime", true).unwrap()),
+            vec![3, 2]
+        );
+        // 分页顺序不变：收藏 4、3 之后是 2
+        assert_eq!(
+            ids(list_history_in(&c, 2, 0, "", "", true).unwrap()),
+            vec![4, 3]
+        );
+        assert_eq!(
+            ids(list_history_in(&c, 2, 2, "", "", true).unwrap()),
+            vec![2]
+        );
+        // favorite_only=false 不改变全量列表
+        assert_eq!(
+            ids(list_history_in(&c, 10, 0, "", "", false).unwrap()),
+            vec![5, 4, 3, 2, 1]
+        );
     }
 }

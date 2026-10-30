@@ -14,6 +14,8 @@ fn mock_config() -> ProviderConfig {
         template_url: String::new(),
         template_body: String::new(),
         template_response_path: String::new(),
+        edit_template: None,
+        transform_template: None,
         extra_params: String::new(),
     }
 }
@@ -30,6 +32,7 @@ fn mock_req(prompt: &str) -> GenerateRequest {
         seed: Some(42),
         count: 3,
         images: vec![],
+        references: vec![],
     }
 }
 
@@ -175,4 +178,54 @@ fn mock_generate_with_reference_images() {
         .unwrap();
     let svg = String::from_utf8(decoded).unwrap();
     assert!(svg.contains("参考图x1"));
+}
+
+/// 负向提示词按「提示词尾句」表达：OpenAI 兼容接口不新增非标准字段（ADR #3）
+#[test]
+fn prompt_with_negative_appends_avoid_clause() {
+    use crate::adapters::prompt_with_negative;
+    assert_eq!(prompt_with_negative("a cat", None), "a cat");
+    assert_eq!(prompt_with_negative("a cat", Some("   ")), "a cat");
+    assert_eq!(
+        prompt_with_negative("a cat", Some(" blurry ")),
+        "a cat\n\nAvoid: blurry"
+    );
+}
+
+#[test]
+fn mock_echoes_negative_prompt() {
+    let adapter = get_adapter("mock").unwrap();
+    let mut req = mock_req("a cat");
+    req.negative_prompt = Some("blurry, low quality".into());
+    let imgs = block_on(adapter.generate(&mock_config(), &req)).unwrap();
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(imgs[0].trim_start_matches("data:image/svg+xml;base64,"))
+        .unwrap();
+    let svg = String::from_utf8(decoded).unwrap();
+    // 占位图标签截断到 24 字符，只断言负向标记与首词
+    assert!(svg.contains("[负向] blurry"));
+}
+
+/// 换背景 AI 路径：蒙版 + 指令前缀必须原样到达适配器（mock 回显 [inpainted] 标记）
+#[test]
+fn mock_edit_receives_background_prompt() {
+    use crate::background::background_ai_prompt;
+    let adapter = get_adapter("mock").unwrap();
+    let req = crate::adapters::EditRequest {
+        prompt: background_ai_prompt("starry night city"),
+        negative_prompt: None,
+        model: "mock-draw-v1".into(),
+        image_b64: "AAAA".into(),
+        mask_b64: Some("BBBB".into()),
+        width: 64,
+        height: 64,
+    };
+    let out = block_on(adapter.edit(&mock_config(), &req)).unwrap();
+    assert!(out.starts_with("data:image/svg+xml;base64,"));
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(out.trim_start_matches("data:image/svg+xml;base64,"))
+        .unwrap();
+    let svg = String::from_utf8(decoded).unwrap();
+    // 占位图标签截断到 24 字符，指令前缀必须出现在最前面
+    assert!(svg.contains("Replace the masked"), "{svg}");
 }

@@ -30,16 +30,42 @@ pub struct GenerateRequest {
     pub count: u32,
     /// 参考图（base64，无 data-url 前缀），随 multipart 上送
     pub images: Vec<String>,
+    /// 与 `images` 按位置对应的角色 / 强度；只用于提示词级说明与模板变量
+    #[serde(default)]
+    pub references: Vec<crate::reference::ReferenceSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EditRequest {
     pub prompt: String,
+    pub negative_prompt: Option<String>,
     pub model: String,
     pub image_b64: String,
     pub mask_b64: Option<String>,
     pub width: u32,
     pub height: u32,
+}
+
+/// 高清放大 / 风格转换（M4 起由 `transform_image` 命令使用）。
+/// 服务商没有原生超分端点时按指令化编辑实现，`mode` 决定保真还是加细节。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransformRequest {
+    pub prompt: String,
+    pub model: String,
+    pub image_b64: String,
+    /// 放大倍数：2 / 4
+    pub scale: u32,
+    /// detail（细节增强）| faithful（忠实还原）
+    pub mode: String,
+}
+
+/// 负向提示词的统一落法：OpenAI 兼容接口没有标准负向字段，按 ADR #3 不新增字段，
+/// 而是作为提示词尾句追加；模板服务商走原生 `{{negative_prompt}}`，不经过这里。
+pub(crate) fn prompt_with_negative(prompt: &str, negative: Option<&str>) -> String {
+    match negative.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(neg) => format!("{prompt}\n\nAvoid: {neg}"),
+        None => prompt.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +82,9 @@ pub struct ProviderConfig {
     pub template_url: String,
     pub template_body: String,
     pub template_response_path: String,
+    /// 编辑 / 变换模板；None = 该服务商未配置对应端点
+    pub edit_template: Option<template::TemplateSpec>,
+    pub transform_template: Option<template::TemplateSpec>,
     // 透传参数（JSON 对象字符串，合并进请求体）
     pub extra_params: String,
 }
@@ -81,6 +110,10 @@ pub enum AdapterError {
     Network {
         message: String,
     },
+    /// 服务商/接口不具备该能力（如模板服务商的放大端点）
+    Unsupported {
+        message: String,
+    },
     Other {
         message: String,
     },
@@ -94,6 +127,7 @@ impl AdapterError {
             | AdapterError::Timeout { message }
             | AdapterError::ContentBlocked { message }
             | AdapterError::Network { message }
+            | AdapterError::Unsupported { message }
             | AdapterError::Other { message } => message,
         }
     }
@@ -125,6 +159,18 @@ pub trait ImageAdapter: Send + Sync {
         config: &'a ProviderConfig,
         req: &'a EditRequest,
     ) -> BoxFuture<'a, Result<String, AdapterError>>;
+    /// 高清放大 / 风格转换；默认明确报「不支持」，避免被 UI 误当成网络错误
+    fn transform<'a>(
+        &'a self,
+        _config: &'a ProviderConfig,
+        _req: &'a TransformRequest,
+    ) -> BoxFuture<'a, Result<String, AdapterError>> {
+        Box::pin(async move {
+            Err(AdapterError::Unsupported {
+                message: "该服务商不支持高清放大与风格转换".into(),
+            })
+        })
+    }
 }
 
 /// 按 kind 获取适配器；未知 kind 显式报错（不再静默回退 OpenAI）

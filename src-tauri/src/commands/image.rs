@@ -1,4 +1,4 @@
-use crate::adapters::{self, AdapterError, EditRequest, GenerateRequest};
+use crate::adapters::{self, AdapterError, EditRequest, GenerateRequest, TransformRequest};
 use crate::image_store::{self, SAFE_NAME_MAX_CHARS};
 use crate::key_pool;
 use crate::storage;
@@ -109,7 +109,10 @@ fn is_retryable(err: &AdapterError) -> bool {
 
 /// 参考图上限：前端三个入口（上传 / 拖拽 / 引用图）已统一限制，
 /// 后端再截断一次，防止绕过 UI 的超大请求。
-const MAX_REFERENCE_IMAGES: usize = 4;
+pub(crate) const MAX_REFERENCE_IMAGES: usize = 4;
+
+/// 换背景合成时的蒙版羽化半径（像素）：1–2px 让边缘不出现硬锯齿
+const BACKGROUND_FEATHER: u32 = 2;
 
 /// 生成失败自动重试的最大尝试次数（仅 Network/Timeout 重试，其余错误不重试）
 const GENERATE_MAX_ATTEMPTS: u32 = 2;
@@ -131,6 +134,9 @@ pub struct GenerateCommandInput {
     pub style: String,
     pub count: u32,
     pub images: Option<Vec<String>>,
+    /// 与 `images` 按位置对应的角色 / 强度（专家模式才有值）
+    #[serde(default)]
+    pub references: Option<Vec<crate::reference::ReferenceSpec>>,
     /// RA-06：前端传入的生成任务 id（camelCase 为 jobId），用于取消；不传时行为不变
     #[serde(default)]
     pub job_id: Option<String>,
@@ -147,12 +153,16 @@ pub struct GeneratedImage {
     pub seed: Option<i64>,
 }
 
-fn build_prompt(input: &GenerateCommandInput) -> String {
-    if input.style.is_empty() {
+fn build_prompt(
+    input: &GenerateCommandInput,
+    references: &[crate::reference::ReferenceSpec],
+) -> String {
+    let base = if input.style.is_empty() {
         input.prompt.clone()
     } else {
         format!("{}, {}", input.prompt, input.style)
-    }
+    };
+    crate::reference::append_reference_guidance(&base, references)
 }
 
 /// 聊天内逐张进度的载荷；队列路径不带 jobId，返回 None（避免与 queue:progress 重复）
@@ -218,7 +228,26 @@ where
         return Err("该服务商还没有配置 API Key".to_string());
     }
 
-    let full_prompt = build_prompt(input);
+    let mut ref_images: Vec<String> = input
+        .images
+        .clone()
+        .unwrap_or_default()
+        .iter()
+        .map(|s| image_store::strip_data_url(s))
+        .collect();
+    if ref_images.len() > MAX_REFERENCE_IMAGES {
+        tracing::warn!(
+            "参考图数量 {} 超过上限 {}，已截断",
+            ref_images.len(),
+            MAX_REFERENCE_IMAGES
+        );
+        ref_images.truncate(MAX_REFERENCE_IMAGES);
+    }
+    // 角色 / 强度与图片按位置对齐：多出的说明（图片被截断或前端多传）丢弃
+    let specs = input.references.clone().unwrap_or_default();
+    let references = &specs[..specs.len().min(ref_images.len())];
+
+    let full_prompt = build_prompt(input, references);
     let req = GenerateRequest {
         prompt: full_prompt.clone(),
         negative_prompt: input.negative_prompt.clone(),
@@ -229,24 +258,8 @@ where
         steps: input.steps,
         seed: input.seed,
         count: input.count,
-        images: {
-            let mut refs: Vec<String> = input
-                .images
-                .clone()
-                .unwrap_or_default()
-                .iter()
-                .map(|s| image_store::strip_data_url(s))
-                .collect();
-            if refs.len() > MAX_REFERENCE_IMAGES {
-                tracing::warn!(
-                    "参考图数量 {} 超过上限 {}，已截断",
-                    refs.len(),
-                    MAX_REFERENCE_IMAGES
-                );
-                refs.truncate(MAX_REFERENCE_IMAGES);
-            }
-            refs
-        },
+        images: ref_images,
+        references: references.to_vec(),
     };
 
     // 失败自动重试：仅 Network/Timeout 重试一次（RA-04）；
@@ -336,6 +349,8 @@ where
                 file_path: path.clone(),
                 favorite: false,
                 created_at: now.clone(),
+                parent_id: None,
+                op: "generate".into(),
             })?;
             out.push(GeneratedImage {
                 history_id: id,
@@ -370,11 +385,56 @@ pub fn cancel_generation(job_id: String, state: tauri::State<'_, GenerationRegis
 pub struct EditCommandInput {
     pub provider_id: i64,
     pub prompt: String,
+    pub negative_prompt: Option<String>,
     pub model: String,
     pub image_b64: String,
     pub mask_b64: Option<String>,
     pub width: u32,
     pub height: u32,
+    /// edit | erase | outpaint（其它值一律按 edit 处理）
+    #[serde(default)]
+    pub op: Option<String>,
+    /// 原图记录 id（血统）
+    #[serde(default)]
+    pub parent_id: Option<i64>,
+}
+
+/// 编辑来源只接受这三种；前端传了别的值也不让脏字符串进库。
+fn normalize_edit_op(op: Option<&str>, erase: bool) -> &'static str {
+    match op {
+        Some("erase") => "erase",
+        Some("outpaint") => "outpaint",
+        Some("edit") => "edit",
+        _ if erase => "erase",
+        _ => "edit",
+    }
+}
+
+/// 编辑类请求的公共执行段：Key 轮换 + 单次调用（编辑计费，鉴权失败不重发）。
+async fn run_edit(provider_id: i64, req: &EditRequest) -> Result<String, String> {
+    let candidates = key_pool::candidates(provider_id)?;
+    if candidates.is_empty() {
+        return Err("该服务商还没有配置 API Key".to_string());
+    }
+    let mut b64 = None;
+    let mut last_err: Option<AdapterError> = None;
+    for candidate in &candidates {
+        let adapter =
+            adapters::get_adapter(&candidate.config.kind).map_err(adapters::adapter_error_json)?;
+        match adapter.edit(&candidate.config, req).await {
+            Ok(result) => {
+                key_pool::note_success(provider_id, candidate.index);
+                b64 = Some(result);
+                break;
+            }
+            Err(e) if key_pool::is_auth(&e) => {
+                key_pool::note_auth_failure(provider_id, candidate.index, &e);
+                last_err = Some(e);
+            }
+            Err(e) => return Err(adapters::adapter_error_json(e)),
+        }
+    }
+    b64.ok_or_else(|| adapters::adapter_error_json(last_err.expect("候选列表非空时必有结果或错误")))
 }
 
 #[tauri::command]
@@ -402,19 +462,111 @@ pub async fn edit_image(
     };
     let req = EditRequest {
         prompt: adapter_prompt,
+        negative_prompt: input.negative_prompt.clone(),
         model: input.model.clone(),
         image_b64: image_store::strip_data_url(&input.image_b64),
         mask_b64: input.mask_b64.as_deref().map(image_store::strip_data_url),
         width: input.width,
         height: input.height,
     };
-    // 编辑同样计费，鉴权失败不重发，只换下一个 Key
+    let b64 = run_edit(input.provider_id, &req).await?;
+    let now = storage::timestamp_millis();
+    let op = normalize_edit_op(input.op.as_deref(), erase);
+    // 统一命名：edit_ 前缀 + 纳秒 + 随机尾（旧版只到毫秒，同毫秒多张编辑会互相覆盖）
+    let name = image_store::unique_name("edit_", &now, 0);
+    let (path, data_url) = image_store::save_b64_image(&app, &b64, &name)?;
+    image_store::ensure_thumb(std::path::Path::new(&path));
+    let id = storage::add_history(&storage::HistoryRow {
+        id: 0,
+        prompt: input.prompt.clone(),
+        negative_prompt: input.negative_prompt.clone().unwrap_or_default(),
+        model: input.model.clone(),
+        provider_name: row.name.clone(),
+        seed: None,
+        width: input.width as i64,
+        height: input.height as i64,
+        guidance: 0.0,
+        steps: 0,
+        style: String::new(),
+        file_path: path.clone(),
+        favorite: false,
+        created_at: now,
+        parent_id: input.parent_id,
+        op: op.to_string(),
+    })?;
+    Ok(serde_json::json!({
+        "historyId": id,
+        "dataUrl": data_url,
+        "filePath": path,
+        "op": op,
+    }))
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransformCommandInput {
+    pub provider_id: i64,
+    pub model: String,
+    pub image_b64: String,
+    /// 放大倍数 2 / 4；风格转换固定 1（不放大，只换风格）
+    pub scale: u32,
+    /// detail（细节增强）| faithful（忠实还原）
+    pub mode: String,
+    /// 风格描述；放大时为空
+    #[serde(default)]
+    pub prompt: String,
+    /// 父图（画廊 / 聊天里的原图），用于血统与同族查询
+    #[serde(default)]
+    pub parent_id: Option<i64>,
+}
+
+/// 用 image crate 读结果图尺寸；解码失败退回 0（不阻断保存，列表按 0 显示）。
+fn decoded_size(b64: &str) -> (u32, u32) {
+    use base64::Engine;
+    let raw = image_store::strip_data_url(b64);
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(raw) else {
+        return (0, 0);
+    };
+    match image::load_from_memory(&bytes) {
+        Ok(img) => (img.width(), img.height()),
+        Err(_) => (0, 0),
+    }
+}
+
+/// 高清放大 / 风格转换：走服务商 API（无原生超分端点时按指令化编辑），
+/// 结果作为派生图入库并指向父记录；Key 轮换语义与生成 / 编辑一致。
+#[tauri::command]
+pub async fn transform_image(
+    app: tauri::AppHandle,
+    input: TransformCommandInput,
+) -> Result<serde_json::Value, String> {
+    let row =
+        storage::get_provider(input.provider_id)?.ok_or_else(|| "服务商不存在".to_string())?;
+    let candidates = key_pool::candidates(input.provider_id)?;
+    if candidates.is_empty() {
+        return Err("该服务商还没有配置 API Key".to_string());
+    }
+    let style = input.prompt.trim().to_string();
+    let op = if style.is_empty() { "upscale" } else { "style" };
+    let scale = input.scale.clamp(1, 4);
+    let mode = if input.mode == "faithful" {
+        "faithful"
+    } else {
+        "detail"
+    };
+    let req = TransformRequest {
+        prompt: style.clone(),
+        model: input.model.clone(),
+        image_b64: image_store::strip_data_url(&input.image_b64),
+        scale,
+        mode: mode.to_string(),
+    };
     let mut b64 = None;
     let mut last_err: Option<AdapterError> = None;
     for candidate in &candidates {
         let adapter =
             adapters::get_adapter(&candidate.config.kind).map_err(adapters::adapter_error_json)?;
-        match adapter.edit(&candidate.config, &req).await {
+        match adapter.transform(&candidate.config, &req).await {
             Ok(result) => {
                 key_pool::note_success(input.provider_id, candidate.index);
                 b64 = Some(result);
@@ -430,32 +582,325 @@ pub async fn edit_image(
     let b64 = b64.ok_or_else(|| {
         adapters::adapter_error_json(last_err.expect("候选列表非空时必有结果或错误"))
     })?;
+
+    let parent = match input.parent_id {
+        Some(pid) => storage::history_row(pid)?,
+        None => None,
+    };
     let now = storage::timestamp_millis();
-    // 统一命名：edit_ 前缀 + 纳秒 + 随机尾（旧版只到毫秒，同毫秒多张编辑会互相覆盖）
-    let name = image_store::unique_name("edit_", &now, 0);
+    let prefix = if op == "style" { "style_" } else { "up_" };
+    let name = image_store::unique_name(prefix, &now, 0);
     let (path, data_url) = image_store::save_b64_image(&app, &b64, &name)?;
     image_store::ensure_thumb(std::path::Path::new(&path));
+    let (width, height) = decoded_size(&b64);
+    let prompt = if op == "style" {
+        style.clone()
+    } else {
+        parent
+            .as_ref()
+            .map(|p| p.prompt.clone())
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or_else(|| format!("高清放大 {scale}x"))
+    };
     let id = storage::add_history(&storage::HistoryRow {
         id: 0,
-        prompt: input.prompt.clone(),
-        negative_prompt: String::new(),
+        prompt,
+        negative_prompt: parent
+            .as_ref()
+            .map(|p| p.negative_prompt.clone())
+            .unwrap_or_default(),
         model: input.model.clone(),
         provider_name: row.name.clone(),
         seed: None,
-        width: input.width as i64,
-        height: input.height as i64,
+        width: width as i64,
+        height: height as i64,
+        guidance: 0.0,
+        steps: 0,
+        style: parent.as_ref().map(|p| p.style.clone()).unwrap_or_default(),
+        file_path: path.clone(),
+        favorite: false,
+        created_at: now,
+        parent_id: input.parent_id,
+        op: op.to_string(),
+    })?;
+    Ok(serde_json::json!({
+        "historyId": id,
+        "dataUrl": data_url,
+        "filePath": path,
+        "width": width,
+        "height": height,
+        "op": op,
+        "parentId": input.parent_id,
+    }))
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BasicEditCommandInput {
+    pub image_b64: String,
+    /// 父图（聊天 / 画廊里的原图），用于血统与「派生自」标注
+    #[serde(default)]
+    pub parent_id: Option<i64>,
+    pub ops: Vec<crate::basic_edit::EditOp>,
+}
+
+/// 基础编辑：裁剪 / 旋转 / 翻转 / 调色全在本地完成，输出 PNG 并作为派生图入库。
+/// 原图保留（父记录不动），前端确认后把结果追加到会话。
+#[tauri::command]
+pub async fn apply_edit(
+    app: tauri::AppHandle,
+    input: BasicEditCommandInput,
+) -> Result<serde_json::Value, String> {
+    use base64::Engine;
+    if input.ops.is_empty() {
+        return Err("没有需要应用的编辑".to_string());
+    }
+    let raw = image_store::strip_data_url(&input.image_b64);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .map_err(|e| format!("图片 base64 解码失败: {e}"))?;
+    let img = image::load_from_memory(&bytes).map_err(|e| format!("图片解码失败: {e}"))?;
+    let out = crate::basic_edit::apply_ops(img, &input.ops)?;
+    let (width, height) = (out.width(), out.height());
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    out.write_to(&mut cursor, image::ImageFormat::Png)
+        .map_err(|e| format!("编辑结果编码失败: {e}"))?;
+    let b64 = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(cursor.into_inner())
+    );
+
+    let parent = match input.parent_id {
+        Some(pid) => storage::history_row(pid)?,
+        None => None,
+    };
+    let now = storage::timestamp_millis();
+    let name = image_store::unique_name("edit_", &now, 0);
+    let (path, data_url) = image_store::save_b64_image(&app, &b64, &name)?;
+    image_store::ensure_thumb(std::path::Path::new(&path));
+    let prompt = parent
+        .as_ref()
+        .map(|p| p.prompt.clone())
+        .filter(|p| !p.trim().is_empty())
+        .unwrap_or_else(|| "基础编辑".to_string());
+    let id = storage::add_history(&storage::HistoryRow {
+        id: 0,
+        prompt,
+        negative_prompt: parent
+            .as_ref()
+            .map(|p| p.negative_prompt.clone())
+            .unwrap_or_default(),
+        model: parent.as_ref().map(|p| p.model.clone()).unwrap_or_default(),
+        provider_name: parent
+            .as_ref()
+            .map(|p| p.provider_name.clone())
+            .unwrap_or_else(|| "本地编辑".to_string()),
+        seed: None,
+        width: width as i64,
+        height: height as i64,
+        guidance: 0.0,
+        steps: 0,
+        style: parent.as_ref().map(|p| p.style.clone()).unwrap_or_default(),
+        file_path: path.clone(),
+        favorite: false,
+        created_at: now,
+        parent_id: input.parent_id,
+        op: "basic-edit".to_string(),
+    })?;
+    Ok(serde_json::json!({
+        "historyId": id,
+        "dataUrl": data_url,
+        "filePath": path,
+        "width": width,
+        "height": height,
+        "op": "basic-edit",
+        "parentId": input.parent_id,
+    }))
+}
+
+fn encode_png_data_url(img: &image::DynamicImage) -> Result<String, String> {
+    use base64::Engine;
+    let mut cursor = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut cursor, image::ImageFormat::Png)
+        .map_err(|e| format!("图片编码失败: {e}"))?;
+    Ok(format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(cursor.into_inner())
+    ))
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReplaceBackgroundInput {
+    pub image_b64: String,
+    /// 白色（luma）= 要替换的区域
+    pub mask_b64: String,
+    #[serde(default)]
+    pub parent_id: Option<i64>,
+    /// solid | gradient | ai
+    pub kind: String,
+    #[serde(default)]
+    pub color: String,
+    #[serde(default)]
+    pub color_from: String,
+    #[serde(default)]
+    pub color_to: String,
+    /// horizontal | vertical | diagonal
+    #[serde(default)]
+    pub direction: String,
+    #[serde(default)]
+    pub prompt: String,
+    /// 仅 ai 需要
+    #[serde(default)]
+    pub provider_id: Option<i64>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub negative_prompt: Option<String>,
+}
+
+/// 换背景：纯色 / 渐变本地合成；AI 走服务商编辑接口（蒙版复用局部重绘链路）。
+/// 结果统一入库为 op="background" 的派生图，原图保留。
+#[tauri::command]
+pub async fn replace_background(
+    app: tauri::AppHandle,
+    input: ReplaceBackgroundInput,
+) -> Result<serde_json::Value, String> {
+    use crate::background::{self, BackgroundFill};
+    use base64::Engine;
+
+    let base_raw = image_store::strip_data_url(&input.image_b64);
+    let base_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&base_raw)
+        .map_err(|e| format!("图片 base64 解码失败: {e}"))?;
+    let base = image::load_from_memory(&base_bytes).map_err(|e| format!("图片解码失败: {e}"))?;
+    let mask_raw = image_store::strip_data_url(&input.mask_b64);
+    let mask_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&mask_raw)
+        .map_err(|e| format!("蒙版 base64 解码失败: {e}"))?;
+    let mask_img =
+        image::load_from_memory(&mask_bytes).map_err(|e| format!("蒙版解码失败: {e}"))?;
+    // 本地合成用「白 = 替换」口径；AI 路径沿用 inpainting 的透明孔口径
+    let mask = mask_img.to_luma8();
+    let painted = if input.kind == "ai" {
+        background::alpha_has_region(&mask_img)
+    } else {
+        background::luma_has_region(&mask_img)
+    };
+    if !painted {
+        return Err("请先涂抹要替换的背景区域".to_string());
+    }
+    let (base_w, base_h) = (base.width(), base.height());
+
+    let (b64, provider_name, model, history_prompt) = match input.kind.as_str() {
+        "solid" => {
+            let color = background::parse_hex(&input.color)?;
+            let out = background::composite(
+                &base,
+                &mask,
+                &BackgroundFill::Solid(color),
+                BACKGROUND_FEATHER,
+            );
+            (
+                encode_png_data_url(&out)?,
+                "本地合成".to_string(),
+                String::new(),
+                format!("换背景：纯色 {}", input.color.trim()),
+            )
+        }
+        "gradient" => {
+            let from = background::parse_hex(&input.color_from)?;
+            let to = background::parse_hex(&input.color_to)?;
+            let out = background::composite(
+                &base,
+                &mask,
+                &BackgroundFill::Gradient {
+                    from,
+                    to,
+                    direction: background::parse_direction(&input.direction),
+                },
+                BACKGROUND_FEATHER,
+            );
+            (
+                encode_png_data_url(&out)?,
+                "本地合成".to_string(),
+                String::new(),
+                format!(
+                    "换背景：渐变 {} → {}",
+                    input.color_from.trim(),
+                    input.color_to.trim()
+                ),
+            )
+        }
+        "ai" => {
+            let desc = input.prompt.trim().to_string();
+            if desc.is_empty() {
+                return Err("请输入背景描述".to_string());
+            }
+            let provider_id = input
+                .provider_id
+                .ok_or_else(|| "请先在「设置」中配置服务商".to_string())?;
+            let model = input
+                .model
+                .clone()
+                .filter(|m| !m.trim().is_empty())
+                .ok_or_else(|| "请先在「设置」中选择默认模型".to_string())?;
+            let row =
+                storage::get_provider(provider_id)?.ok_or_else(|| "服务商不存在".to_string())?;
+            let req = EditRequest {
+                prompt: background::background_ai_prompt(&desc),
+                negative_prompt: input.negative_prompt.clone(),
+                model: model.clone(),
+                image_b64: base_raw.to_string(),
+                mask_b64: Some(mask_raw.to_string()),
+                width: base_w,
+                height: base_h,
+            };
+            let b64 = run_edit(provider_id, &req).await?;
+            (b64, row.name.clone(), model, format!("换背景：{desc}"))
+        }
+        other => return Err(format!("未知的背景类型: {other}")),
+    };
+
+    let now = storage::timestamp_millis();
+    let name = image_store::unique_name("bg_", &now, 0);
+    let (path, data_url) = image_store::save_b64_image(&app, &b64, &name)?;
+    image_store::ensure_thumb(std::path::Path::new(&path));
+    let (width, height) = decoded_size(&b64);
+    let id = storage::add_history(&storage::HistoryRow {
+        id: 0,
+        prompt: history_prompt,
+        negative_prompt: input.negative_prompt.clone().unwrap_or_default(),
+        model,
+        provider_name,
+        seed: None,
+        width: width as i64,
+        height: height as i64,
         guidance: 0.0,
         steps: 0,
         style: String::new(),
         file_path: path.clone(),
         favorite: false,
         created_at: now,
+        parent_id: input.parent_id,
+        op: "background".to_string(),
     })?;
     Ok(serde_json::json!({
         "historyId": id,
         "dataUrl": data_url,
         "filePath": path,
+        "width": width,
+        "height": height,
+        "op": "background",
+        "parentId": input.parent_id,
     }))
+}
+
+/// 同族图片（根 + 直接派生）：画布与画廊用它展示「派生自」关系
+#[tauri::command]
+pub async fn list_derived(history_id: i64) -> Result<serde_json::Value, String> {
+    let items = storage::list_derived(history_id)?;
+    Ok(serde_json::json!({ "items": items }))
 }
 
 #[tauri::command]
@@ -493,12 +938,14 @@ pub async fn list_history(
     offset: Option<i64>,
     model: Option<String>,
     style: Option<String>,
+    favorite_only: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let rows = storage::list_history(
         limit.unwrap_or(200),
         offset.unwrap_or(0),
         &model.unwrap_or_default(),
         &style.unwrap_or_default(),
+        favorite_only.unwrap_or(false),
     )?;
     let mut items = Vec::new();
     for r in rows {
@@ -527,6 +974,12 @@ pub async fn get_history_image(id: i64) -> Result<serde_json::Value, String> {
         "dataUrl": data_url,
         "filePath": path,
     }))
+}
+
+/// 按 id 取记录元信息：画布节点复用参数 / 编辑浮层需要提示词与尺寸
+#[tauri::command]
+pub async fn get_history_item(id: i64) -> Result<Option<storage::HistoryRow>, String> {
+    Ok(storage::history_row(id)?)
 }
 
 #[tauri::command]
@@ -644,6 +1097,36 @@ mod tests {
         assert!(lock_cancel_map(&registry.0).contains_key("job-2"));
         drop(guard);
         assert!(!lock_cancel_map(&registry.0).contains_key("job-2"));
+    }
+
+    /// 参考图角色 / 强度：基础提示词（含风格）之后追加逐图说明，顺序与图片一致
+    #[test]
+    fn build_prompt_appends_reference_guidance_after_style() {
+        use crate::reference::{ReferenceRole, ReferenceSpec};
+        let input = GenerateCommandInput {
+            provider_id: 1,
+            prompt: "a cat".into(),
+            negative_prompt: None,
+            model: "m".into(),
+            width: 512,
+            height: 512,
+            guidance: None,
+            steps: None,
+            seed: None,
+            style: "oil painting".into(),
+            count: 1,
+            images: None,
+            references: None,
+            job_id: None,
+        };
+        let refs = vec![ReferenceSpec {
+            role: ReferenceRole::Style,
+            strength: Some(90),
+        }];
+        let prompt = build_prompt(&input, &refs);
+        assert!(prompt.starts_with("a cat, oil painting\nReference 1 (style, strong)"));
+        // 没有参考图时不追加任何内容（简单模式行为不变）
+        assert_eq!(build_prompt(&input, &[]), "a cat, oil painting");
     }
 
     /// 聊天内逐张进度：payload 形状固定；无 jobId（队列路径）不发事件

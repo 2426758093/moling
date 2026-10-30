@@ -1,5 +1,5 @@
 use crate::error::{AppError, AppResult};
-use crate::paths::ensure_data_dir;
+use crate::paths::media_root;
 use base64::Engine;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -224,8 +224,23 @@ pub fn save_b64_image(
     b64: &str,
     name: &str,
 ) -> AppResult<(String, String)> {
-    let data_dir = ensure_data_dir(app)?;
-    let images = data_dir.join("images");
+    save_b64_into(app, "images", b64, name)
+}
+
+/// 队列参考图目录：与画廊图分开放，清理画廊不会误删排队任务的参考图
+pub fn refs_dir(app: &tauri::AppHandle) -> AppResult<PathBuf> {
+    let dir = media_root(app)?.join("refs");
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+fn save_b64_into(
+    app: &tauri::AppHandle,
+    subdir: &str,
+    b64: &str,
+    name: &str,
+) -> AppResult<(String, String)> {
+    let images = media_root(app)?.join(subdir);
     std::fs::create_dir_all(&images)?;
     // RC-19：先按原始输入判定 SVG data URL，再谈解码/嗅探
     if let Some((payload, is_base64)) = parse_svg_data_url(b64) {
@@ -259,6 +274,40 @@ pub fn save_b64_image(
         base64::engine::general_purpose::STANDARD.encode(&bytes)
     );
     Ok((path.to_string_lossy().to_string(), url))
+}
+
+/// 队列参考图落盘（写 refs/），返回文件路径
+pub fn save_ref_image(app: &tauri::AppHandle, b64: &str, name: &str) -> AppResult<String> {
+    let (path, _) = save_b64_into(app, "refs", b64, name)?;
+    Ok(path)
+}
+
+/// 读取 refs/ 下的参考图为 data URL。
+///
+/// 路径来自前端队列条目，必须做目录约束：canonicalize 后必须仍在 refs/ 内，
+/// 否则这条「按路径读文件」的命令就成了任意文件读取（并且会经 IPC 回传内容）。
+pub fn read_ref_image(app: &tauri::AppHandle, path: &str) -> AppResult<String> {
+    let root = std::fs::canonicalize(refs_dir(app)?)?;
+    let target = resolve_within(&root, path)?;
+    path_to_data_url(&target.to_string_lossy())
+        .ok_or_else(|| AppError::Other(format!("参考图读取失败: {}", target.display())))
+}
+
+/// 校验路径位于 refs/ 内（预设保存 / 导出前用，防止把任意文件路径写进资产表）
+pub fn ensure_ref_path(app: &tauri::AppHandle, path: &str) -> AppResult<()> {
+    let root = std::fs::canonicalize(refs_dir(app)?)?;
+    resolve_within(&root, path)?;
+    Ok(())
+}
+
+/// 解析真实路径并确认仍在 `root`（已 canonicalize）内
+fn resolve_within(root: &Path, path: &str) -> AppResult<PathBuf> {
+    let target =
+        std::fs::canonicalize(path).map_err(|e| AppError::Other(format!("参考图不存在: {e}")))?;
+    if !target.starts_with(root) {
+        return Err(AppError::Other("参考图路径不在 refs 目录内".into()));
+    }
+    Ok(target)
 }
 
 /// 把 images_json 中含 dataUrl 的条目写盘，替换为 { path } 形式（入库前调用）
@@ -479,6 +528,28 @@ mod tests {
         // 重复删除保持静默
         remove_thumb(source.to_str().unwrap());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// 参考图路径约束：refs 目录内可通过，目录外 / 不存在的路径必须拒绝
+    #[test]
+    fn resolve_within_rejects_paths_outside_root() {
+        let base = std::env::temp_dir().join(unique_name(
+            "moling_refs_",
+            &crate::storage::timestamp_millis(),
+            0,
+        ));
+        let root = base.join("refs");
+        std::fs::create_dir_all(&root).unwrap();
+        let inside = root.join("a.png");
+        std::fs::write(&inside, b"png").unwrap();
+        let outside = base.join("outside.png");
+        std::fs::write(&outside, b"png").unwrap();
+
+        let root = std::fs::canonicalize(&root).unwrap();
+        assert!(resolve_within(&root, inside.to_str().unwrap()).is_ok());
+        assert!(resolve_within(&root, outside.to_str().unwrap()).is_err());
+        assert!(resolve_within(&root, base.join("missing.png").to_str().unwrap()).is_err());
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// write_new 独占创建：同 stem 连续两次必须得到两个路径、两份内容

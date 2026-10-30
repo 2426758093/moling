@@ -1,19 +1,27 @@
+pub mod canvas;
 pub mod chat;
 pub mod diagnostics;
 pub mod image;
+pub mod model_caps;
 pub mod network;
+pub mod prompt_assets;
 pub mod providers;
 pub mod queue;
 pub mod settings;
+pub mod storage;
 pub mod thinking;
 pub mod update;
 
+pub use canvas::*;
 pub use chat::*;
 pub use diagnostics::*;
 pub use image::*;
+pub use model_caps::*;
 pub use network::*;
+pub use prompt_assets::*;
 pub use providers::*;
 pub use queue::*;
 pub use settings::*;
+pub use storage::*;
 pub use thinking::*;
 pub use update::*;
