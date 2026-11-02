@@ -1,0 +1,12 @@
+# 统一行尾为 LF。
+# 原因：Windows 上 core.autocrlf 默认 true，checkout 会把源码转成 CRLF；
+# 而 prettier 默认 endOfLine=lf，CI 因此在 format:check 阶段失败，本地却看不出来。
+# 显式钉死 LF 后，本地与 CI 的文件字节一致，门禁结果可复现。
+* text=auto eol=lf
+
+# 二进制资源不参与行尾转换
+*.png binary
+*.ico binary
+*.icns binary
+*.woff binary
+*.woff2 binary
