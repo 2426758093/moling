@@ -22,7 +22,9 @@ concurrency:
 jobs:
   release:
     runs-on: windows-latest
-    timeout-minutes: 60
+    # fat LTO + codegen-units=1 在 2 核免费 runner 上首次构建可达 80 分钟以上，
+    # 60 分钟会被截断；配合下方 Rust 缓存，二次构建通常 8-15 分钟。
+    timeout-minutes: 120
     defaults:
       run:
         shell: bash
@@ -43,6 +45,14 @@ jobs:
           build-warnings: ""
 
       - run: pnpm install --frozen-lockfile
+
+      # Rust 依赖与 target 缓存：项目开了 lto=true + codegen-units=1，
+      # 无缓存首次构建可能超过一小时；缓存命中后仅重编应用自身，通常 8-15 分钟。
+      - name: Rust 构建缓存
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: tauri-release
 
       # 发布前再跑一遍门禁：ci.yml 只在 main 上触发，tag 可能打在未过检的提交上
       - name: 质量门禁
