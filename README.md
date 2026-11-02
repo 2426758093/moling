@@ -65,6 +65,32 @@ pnpm tauri build --bundles nsis --config src-tauri/tauri.updater-test.conf.json
 
 测试配置把更新端点指向 `http://127.0.0.1:8787/latest.json`。完整验收步骤（生成密钥对、本地清单服务、篡改包必须被拒）见[开发规范](墨灵_开发规范.md)「七、测试与质量门禁 → 更新链路本地验收」。
 
+### 正式发布（GitHub Releases）
+
+更新源为 GitHub Releases，客户端读取固定别名
+`https://github.com/<owner>/<repo>/releases/latest/download/latest.json`。
+
+**打 tag 即触发发布**（`.github/workflows/release.yml`）：
+
+```bash
+git tag -a v1.0.1 -m "更新说明"
+git push origin v1.0.1
+```
+
+流水线依次执行：质量门禁 → 校验 tag 与版本号一致 → 生成发布配置 → 带签名构建 NSIS → 生成 `latest.json` → 建 Release → 上传安装包与 `.sig` → **最后**上传 `latest.json`（顺序保证中途失败时存量客户端不会 404）。
+
+前置条件：仓库 Secrets 需配置 `TAURI_SIGNING_PRIVATE_KEY` 与 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`；发版前同步 `src-tauri/tauri.conf.json` 与 `package.json` 的版本号。
+
+本地等价命令：
+
+```bash
+pnpm release:config        # 按 git remote origin 生成端点与 createUpdaterArtifacts
+pnpm tauri build --config src-tauri/tauri.release.conf.json --bundles nsis
+pnpm release:manifest --notes "更新说明"
+```
+
+端点在构建期生成、不硬编码，换 fork 或改仓库名只需重新跑 `release:config`。**公钥编译进二进制后不可更换**：私钥或口令丢失将导致存量用户永久无法更新，保管要求见[开发规范](墨灵_开发规范.md)「正式发布」。
+
 ## 技术栈
 
 Tauri 2（Rust）· React 19 · TypeScript · Vite 8 · Tailwind CSS 4 · Zustand · SQLite（rusqlite）· framer-motion

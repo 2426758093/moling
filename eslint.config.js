@@ -20,4 +20,17 @@ export default tseslint.config(
       "react-refresh/only-export-components": "warn",
     },
   },
+  {
+    // 发布脚本跑在 Node 里，需要显式声明全局；浏览器端配置不适用
+    files: ["scripts/**/*.mjs"],
+    languageOptions: {
+      ecmaVersion: "latest",
+      sourceType: "module",
+      globals: {
+        console: "readonly",
+        process: "readonly",
+        Buffer: "readonly",
+      },
+    },
+  },
 );

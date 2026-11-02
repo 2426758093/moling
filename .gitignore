@@ -12,6 +12,8 @@ dist
 dist-ssr
 src-tauri/target
 src-tauri/gen
+# 发布配置由 scripts/release-config.mjs 按仓库地址生成，不入库
+src-tauri/tauri.release.conf.json
 *.local
 
 # Editor directories and files

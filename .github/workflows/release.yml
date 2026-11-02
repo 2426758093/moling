@@ -1,0 +1,120 @@
+name: Release
+
+# 打 tag（v1.0.1 形式）触发；也可手动指定已存在的 tag 重跑。
+# 发布顺序：先建空 Release → 传安装包与签名 → 最后传 latest.json。
+# 反过来会出现「清单指向 404」，所有客户端检查更新立即报错。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 已存在的 tag（形如 v1.0.1）
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          build-warnings: ""
+
+      - run: pnpm install --frozen-lockfile
+
+      # 发布前再跑一遍门禁：ci.yml 只在 main 上触发，tag 可能打在未过检的提交上
+      - name: 质量门禁
+        run: |
+          pnpm lint
+          pnpm format:check
+          pnpm test
+
+      - name: 校验 tag 与版本号一致
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          VERSION=$(node -e "console.log(JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json','utf8')).version)")
+          echo "tag=$TAG version=$VERSION"
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::tag $TAG 与版本号 v$VERSION 不一致，请先同步 tauri.conf.json 与 package.json"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: 生成发布配置
+        env:
+          MOLING_UPDATE_REPO: ${{ github.repository }}
+        run: pnpm release:config
+
+      # 私钥不入库：TAURI_SIGNING_PRIVATE_KEY 存 Secret；口令同理。
+      # 缺失时构建会直接失败，而不是产出一个装不上更新的包。
+      - name: 构建带签名的更新制品
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: pnpm tauri build --config src-tauri/tauri.release.conf.json --bundles nsis
+
+      - name: 生成更新清单
+        run: |
+          NOTES=$(git tag -l --format='%(contents)' "${{ github.event.inputs.tag || github.ref_name }}" | sed '/^$/d')
+          if [ -z "$NOTES" ]; then NOTES="墨灵 $VERSION"; fi
+          node scripts/make-latest-json.mjs --notes "$NOTES"
+
+      - name: 建立 Release（空）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，直接追加资产"
+          else
+            gh release create "$TAG" --title "墨灵 $VERSION" --notes "版本 $VERSION"
+          fi
+
+      - name: 上传安装包与签名
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          cd src-tauri/target/release/bundle/nsis
+          # Tauri 对 NSIS 的更新包可能是 *.nsis.zip，也可能是直接签名的 *-setup.exe，两种都传
+          shopt -s nullglob
+          files=( *.nsis.zip *.nsis.zip.sig *-setup.exe *-setup.exe.sig )
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::目录中没有可上传的安装包或签名"
+            exit 1
+          fi
+          printf '待上传: %s\n' "${files[@]}"
+          gh release upload "$TAG" "${files[@]}" --clobber
+
+      # 清单最后上传：此前即使中断，存量客户端仍只看到上一版，不会 404
+      - name: 发布更新清单（最后一步）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          gh release upload "$TAG" src-tauri/target/release/bundle/nsis/latest.json --clobber
+          echo "已发布 $TAG，清单地址："
+          echo "https://github.com/${{ github.repository }}/releases/latest/download/latest.json"
