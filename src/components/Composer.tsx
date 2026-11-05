@@ -13,16 +13,22 @@ import { useQueueStore } from "../stores/queueStore";
 import {
   RATIO_OPTIONS,
   STYLE_PRESETS,
+  QUALITY_OPTIONS,
+  qualityLabel,
   REFERENCE_ROLES,
   DEFAULT_REFERENCE_STRENGTH,
   ReferenceRole,
+  ImageQuality,
 } from "../lib/types";
 import { api } from "../lib/api";
 import { validateImageFile } from "../lib/file";
 import { toast } from "../lib/notify";
+import { FOCUS_COMPOSER_EVENT, OPEN_ASSIST_EVENT } from "../lib/commands";
 import { maxReferenceImages, useModelCaps } from "../lib/useModelCaps";
+import { useMotionTokens } from "../lib/useMotion";
 import { DUR } from "../lib/motion";
 import SafeImg from "./SafeImg";
+import { cn } from "./ui/cn";
 import { IconButton } from "./ui/IconButton";
 import { Button } from "./ui/Button";
 import { Popover } from "./ui/Popover";
@@ -51,6 +57,10 @@ const ROLE_ITEMS = REFERENCE_ROLES.map((r) => ({
   value: r.id,
   label: r.label,
 }));
+
+/// 输入坞参数行胶囊：24px，文本 11px，只在 hover 时升一档底色
+const CHIP =
+  "pressable flex h-6 items-center gap-1 rounded-chip px-2 text-caption text-secondary transition-colors hover:bg-hover hover:text-primary";
 
 /// 自定义尺寸行：`Popover` 关闭即卸载，每次打开都从当前 prefs 初始化
 function CustomSizeRow({
@@ -124,6 +134,7 @@ export default function Composer() {
     () => useChatStore.getState().draftPrompt ?? "",
   );
   const [assistOpen, setAssistOpen] = useState(false);
+  const [inputFocused, setInputFocused] = useState(false);
   const [enqueuing, setEnqueuing] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -143,6 +154,7 @@ export default function Composer() {
   const [negOpen, setNegOpen] = useState(false);
   const draftPrompt = useChatStore((s) => s.draftPrompt);
   const setDraftPrompt = useChatStore((s) => s.setDraftPrompt);
+  const motionTokens = useMotionTokens();
 
   const autoGrow = useCallback(() => {
     const el = textareaRef.current;
@@ -169,6 +181,21 @@ export default function Composer() {
     }
   }, []);
 
+  // 命令面板 / 全局快捷键：聚焦输入框、打开提示词助手
+  useEffect(() => {
+    const focus = () => textareaRef.current?.focus();
+    const assist = () => {
+      setAssistOpen(true);
+      textareaRef.current?.focus();
+    };
+    window.addEventListener(FOCUS_COMPOSER_EVENT, focus);
+    window.addEventListener(OPEN_ASSIST_EVENT, assist);
+    return () => {
+      window.removeEventListener(FOCUS_COMPOSER_EVENT, focus);
+      window.removeEventListener(OPEN_ASSIST_EVENT, assist);
+    };
+  }, []);
+
   // text 变化后同步撑高输入框（草稿注入与清空都经此路径）
   useLayoutEffect(() => {
     autoGrow();
@@ -190,7 +217,16 @@ export default function Composer() {
     }
   };
 
-  const onKeyDown = (e: React.KeyboardEvent) => {
+  const onKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // 中文输入法组合期 Enter 是"上屏"而不是"发送"：必须同时看 isComposing 与
+    // keyCode 229（部分 Windows IME 在 compositionend 之前不设 isComposing）。
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return;
+    // 空输入时 `/` 直接打开提示词助手（Linear/Notion 的斜杠习惯）
+    if (e.key === "/" && !text.trim()) {
+      e.preventDefault();
+      setAssistOpen(true);
+      return;
+    }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       doSend();
@@ -223,6 +259,7 @@ export default function Composer() {
         width: prefs.width,
         height: prefs.height,
         count: prefs.count,
+        quality: prefs.quality === "auto" ? null : prefs.quality,
         referencePaths,
         references:
           mode === "expert" && atts.length > 0
@@ -241,6 +278,44 @@ export default function Composer() {
     } finally {
       setEnqueuing(false);
     }
+  };
+
+  /// 直接拖到输入框：只认文件类型，事件不冒泡到 App 的全局拖放，
+  /// 避免同一次投放被添加两遍（全局拖放仍负责窗口其他区域）
+  const dragDepth = useRef(0);
+  const [dropActive, setDropActive] = useState(false);
+  const isFileDrag = (e: React.DragEvent) =>
+    e.dataTransfer.types.includes("Files");
+
+  const onComposerDragEnter = (e: React.DragEvent) => {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragDepth.current += 1;
+    setDropActive(true);
+  };
+
+  const onComposerDragOver = (e: React.DragEvent) => {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = "copy";
+  };
+
+  const onComposerDragLeave = (e: React.DragEvent) => {
+    if (!isFileDrag(e)) return;
+    e.stopPropagation();
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDropActive(false);
+  };
+
+  const onComposerDrop = (e: React.DragEvent) => {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    dragDepth.current = 0;
+    setDropActive(false);
+    void onPickFiles(e.dataTransfer.files);
   };
 
   const onPickFiles = async (files: FileList | null) => {
@@ -266,217 +341,311 @@ export default function Composer() {
   };
 
   return (
-    <div className="glass shrink-0 px-4 pb-4 pt-3">
-      <div className="relative mx-auto max-w-2xl">
+    <div className="shrink-0 px-3 pb-3 pt-1.5">
+      <div className="relative mx-auto max-w-chat wide:max-w-chat-wide">
         <AnimatePresence>
           {assistOpen && (
             <PromptAssist draft={text} onClose={() => setAssistOpen(false)} />
           )}
         </AnimatePresence>
-        <AnimatePresence>
-          {attachments.length > 0 && (
-            <motion.div
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 8 }}
-              transition={{ duration: DUR.base }}
-              className="mb-2 flex flex-wrap gap-2"
-            >
-              {attachments.map((a) => (
-                <motion.div
-                  key={a.id}
-                  layout
-                  initial={{ scale: 0.85, opacity: 0 }}
-                  animate={{ scale: 1, opacity: 1 }}
-                  transition={{ duration: DUR.base }}
-                  className="group relative"
-                >
-                  {/* 专家模式：角色 + 强度（提示词级近似）；简单模式只展示缩略图 */}
-                  <div
-                    className={
-                      mode === "expert"
-                        ? "w-32 rounded-card border border-line bg-elevated p-1.5 shadow-card"
-                        : undefined
-                    }
-                  >
-                    <div className="relative">
-                      <SafeImg
-                        src={a.dataUrl}
-                        alt={a.name}
-                        className={
-                          mode === "expert"
-                            ? "h-14 w-full rounded-btn border border-line object-cover"
-                            : "h-14 w-14 rounded-xl border border-line object-cover shadow-card"
-                        }
-                      />
-                      {a.compressed && (
-                        <span className="pointer-events-none absolute bottom-0 left-0 rounded-bl-btn rounded-tr-chip border-r border-t border-line bg-elevated px-1 py-px text-caption leading-none text-tertiary">
-                          已压缩
-                        </span>
-                      )}
-                      <button
-                        onClick={() => removeAttachment(a.id)}
-                        aria-label={`移除附件 ${a.name}`}
-                        className="pressable absolute -right-1.5 -top-1.5 flex h-6 w-6 items-center justify-center rounded-pill border border-line bg-elevated text-secondary opacity-0 shadow-card transition-opacity hover:text-danger focus-visible:opacity-100 group-hover:opacity-100"
-                      >
-                        <IconClose size={12} />
-                      </button>
-                    </div>
-                    {mode === "expert" && (
-                      <>
-                        <Select
-                          value={a.role ?? "composition"}
-                          onValueChange={(v) =>
-                            updateAttachment(a.id, {
-                              role: v as ReferenceRole,
-                            })
-                          }
-                          options={ROLE_ITEMS}
-                          label={`${a.name} 的参考角色`}
-                          variant="bare"
-                          widthClass="w-full"
-                          className="mt-0.5"
-                        />
-                        <div className="flex items-center gap-1 px-0.5">
-                          <Slider
-                            value={a.strength ?? DEFAULT_REFERENCE_STRENGTH}
-                            onValueChange={(v) =>
-                              updateAttachment(a.id, { strength: v })
-                            }
-                            label="参考强度"
-                            className="flex-1"
-                          />
-                          <span className="w-5 shrink-0 text-right text-caption tabular-nums text-tertiary">
-                            {a.strength ?? DEFAULT_REFERENCE_STRENGTH}
-                          </span>
-                        </div>
-                      </>
-                    )}
-                  </div>
-                </motion.div>
-              ))}
-            </motion.div>
-          )}
-        </AnimatePresence>
 
-        {mode === "expert" && caps.negative && (
-          <div className="mb-1.5">
-            <button
-              onClick={() => setNegOpen((v) => !v)}
-              aria-expanded={negOpen}
-              className="pressable flex items-center gap-0.5 text-footnote text-tertiary transition-colors hover:text-secondary focus-visible:text-secondary"
+        {/* 浮动输入坞：玻璃浮在消息流之上，内部控件全部不透明；
+            焦点环画在输入坞上，文本域本身不画——全宽描边会被圆角卡片裁成横条 */}
+        <div
+          data-dropzone="composer"
+          onDragEnter={onComposerDragEnter}
+          onDragOver={onComposerDragOver}
+          onDragLeave={onComposerDragLeave}
+          onDrop={onComposerDrop}
+          className={cn(
+            // 焦点环用 outline：.glass 自己的 box-shadow 会压过 ring-* 工具类
+            "glass relative overflow-hidden rounded-card shadow-pop",
+            dropActive
+              ? "outline-2 outline-dashed outline-accent/50"
+              : inputFocused
+                ? "outline-2 outline-accent/25"
+                : "outline-none",
+          )}
+        >
+          {dropActive && (
+            <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-card bg-scrim/30">
+              <span className="rounded-pill bg-elevated px-3 py-1 text-footnote text-primary shadow-card">
+                松开以添加参考图
+              </span>
+            </div>
+          )}
+          <AnimatePresence initial={false}>
+            {attachments.length > 0 && (
+              <motion.div
+                initial={
+                  motionTokens.reduce
+                    ? { opacity: 1 }
+                    : { opacity: 0, height: 0 }
+                }
+                animate={{ opacity: 1, height: "auto" }}
+                exit={
+                  motionTokens.reduce
+                    ? { opacity: 1 }
+                    : { opacity: 0, height: 0 }
+                }
+                transition={motionTokens.fade(DUR.base)}
+                className="flex gap-2 overflow-x-auto px-2 pt-2"
+              >
+                {attachments.map((a) => (
+                  <motion.div
+                    key={a.id}
+                    layout
+                    initial={
+                      motionTokens.reduce
+                        ? { scale: 1 }
+                        : { scale: 0.85, opacity: 0 }
+                    }
+                    animate={{ scale: 1, opacity: 1 }}
+                    transition={motionTokens.spring("snappy")}
+                    className="group relative shrink-0"
+                  >
+                    {/* 专家模式：角色 + 强度（提示词级近似）；简单模式只展示缩略图 */}
+                    <div
+                      className={
+                        mode === "expert"
+                          ? "w-32 rounded-btn bg-elevated p-1.5 shadow-card ring-1 ring-line"
+                          : undefined
+                      }
+                    >
+                      <div className="relative">
+                        <SafeImg
+                          src={a.dataUrl}
+                          alt={a.name}
+                          className={
+                            mode === "expert"
+                              ? "h-14 w-full rounded-chip object-cover ring-1 ring-line"
+                              : "h-14 w-14 rounded-btn object-cover shadow-card ring-1 ring-line"
+                          }
+                        />
+                        {a.compressed && (
+                          <span className="pointer-events-none absolute bottom-0 left-0 rounded-bl-chip rounded-tr-chip bg-elevated px-1 py-px text-caption leading-none text-tertiary ring-1 ring-line">
+                            已压缩
+                          </span>
+                        )}
+                        <button
+                          onClick={() => removeAttachment(a.id)}
+                          aria-label={`移除附件 ${a.name}`}
+                          className="pressable absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-pill bg-elevated text-secondary opacity-0 shadow-card ring-1 ring-line transition-opacity hover:text-danger focus-visible:opacity-100 group-hover:opacity-100"
+                        >
+                          <IconClose size={10} />
+                        </button>
+                      </div>
+                      {mode === "expert" && (
+                        <>
+                          <Select
+                            value={a.role ?? "composition"}
+                            onValueChange={(v) =>
+                              updateAttachment(a.id, {
+                                role: v as ReferenceRole,
+                              })
+                            }
+                            options={ROLE_ITEMS}
+                            label={`${a.name} 的参考角色`}
+                            variant="bare"
+                            widthClass="w-full"
+                            className="mt-0.5"
+                          />
+                          <div className="flex items-center gap-1 px-0.5">
+                            <Slider
+                              value={a.strength ?? DEFAULT_REFERENCE_STRENGTH}
+                              onValueChange={(v) =>
+                                updateAttachment(a.id, { strength: v })
+                              }
+                              label="参考强度"
+                              className="flex-1"
+                            />
+                            <span className="w-5 shrink-0 text-right text-caption tabular-nums text-tertiary">
+                              {a.strength ?? DEFAULT_REFERENCE_STRENGTH}
+                            </span>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  </motion.div>
+                ))}
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* 参数摘要：模型能力范围内的快捷入口，全部 24px */}
+          <div className="flex flex-wrap items-center gap-1 px-2 pt-2">
+            <Popover
+              side="top"
+              align="start"
+              trigger={
+                <button className={CHIP} aria-label="画面比例与尺寸">
+                  {prefs.ratio === "auto" ? (
+                    "自动"
+                  ) : (
+                    <>
+                      {RATIO_OPTIONS.find((r) => r.id === prefs.ratio)?.label ??
+                        "自定义"}
+                      <span className="text-quaternary">·</span>
+                      <span className="tabular-nums">
+                        {prefs.width}×{prefs.height}
+                      </span>
+                    </>
+                  )}
+                  <IconChevron size={10} direction="down" />
+                </button>
+              }
             >
-              <IconChevron size={10} direction={negOpen ? "down" : "right"} />
-              负向提示词
-              {!negOpen && prefs.negativePrompt.trim() && (
-                <span className="ml-1 text-accent">已填写</span>
-              )}
-            </button>
-            {negOpen && (
-              <div className="mt-1 flex items-center gap-2 rounded-btn border border-line bg-elevated px-2.5 py-1.5">
-                <input
-                  value={prefs.negativePrompt}
-                  onChange={(e) => setPrefs({ negativePrompt: e.target.value })}
-                  placeholder="不希望出现的元素，如：模糊、水印、多余手指"
-                  aria-label="负向提示词"
-                  className="min-w-0 flex-1 bg-transparent text-callout text-primary outline-none placeholder:text-tertiary"
+              <div className="w-60">
+                <div className="mb-2 text-footnote font-medium text-tertiary">
+                  画面比例
+                </div>
+                <button
+                  onClick={() => applyRatio("auto")}
+                  className={`pressable mb-1.5 flex w-full items-center justify-between rounded-btn px-2 py-1.5 text-subhead transition-colors duration-150 ${
+                    prefs.ratio === "auto"
+                      ? "bg-accent-soft font-medium text-accent-text"
+                      : "text-tertiary hover:bg-hover hover:text-secondary"
+                  }`}
+                >
+                  自动
+                  <span className="text-caption font-normal text-tertiary">
+                    由服务商决定
+                  </span>
+                </button>
+                <div className="grid grid-cols-4 gap-1.5">
+                  {RATIO_OPTIONS.filter((r) => r.id !== "auto").map((r) => (
+                    <button
+                      key={r.id}
+                      onClick={() => applyRatio(r.id)}
+                      className={`pressable rounded-btn py-1.5 text-subhead transition-colors duration-150 ${
+                        prefs.ratio === r.id
+                          ? "bg-accent-soft font-medium text-accent-text"
+                          : "text-tertiary hover:bg-hover hover:text-secondary"
+                      }`}
+                    >
+                      {r.label}
+                    </button>
+                  ))}
+                </div>
+                {mode === "expert" && (
+                  <CustomSizeRow
+                    width={prefs.width}
+                    height={prefs.height}
+                    onApply={(w, h) => applyCustomSize(w, h)}
+                  />
+                )}
+              </div>
+            </Popover>
+
+            <Popover
+              side="top"
+              align="start"
+              trigger={
+                <button className={CHIP} aria-label="每次生成张数">
+                  {prefs.count} 张
+                  <IconChevron size={10} direction="down" />
+                </button>
+              }
+            >
+              <div className="w-40">
+                <div className="mb-2 text-footnote font-medium text-tertiary">
+                  每次生成
+                </div>
+                <SegmentedControl
+                  value={String(prefs.count)}
+                  onValueChange={(v) => setPrefs({ count: Number(v) })}
+                  label="每次生成张数"
+                  size="sm"
+                  block
+                  options={[1, 2, 4].map((n) => ({
+                    value: String(n),
+                    label: `${n} 张`,
+                  }))}
                 />
               </div>
+            </Popover>
+
+            <Popover
+              side="top"
+              align="start"
+              trigger={
+                <button className={CHIP} aria-label="图片质量">
+                  质量 · {qualityLabel(prefs.quality)}
+                  <IconChevron size={10} direction="down" />
+                </button>
+              }
+            >
+              <div className="w-56">
+                <div className="mb-2 text-footnote font-medium text-tertiary">
+                  图片质量
+                </div>
+                <SegmentedControl
+                  value={prefs.quality}
+                  onValueChange={(v) =>
+                    setPrefs({ quality: v as ImageQuality })
+                  }
+                  label="图片质量"
+                  size="sm"
+                  block
+                  options={QUALITY_OPTIONS.map((q) => ({
+                    value: q.id,
+                    label: q.label,
+                  }))}
+                />
+                <div className="mt-2 text-caption text-tertiary">
+                  自动不发送质量参数；低 / 中 / 高需要服务商支持
+                </div>
+              </div>
+            </Popover>
+
+            <Select
+              value={prefs.style || NONE_STYLE}
+              onValueChange={(v) =>
+                setPrefs({ style: v === NONE_STYLE ? "" : v })
+              }
+              options={STYLE_ITEMS}
+              label="风格"
+              variant="chip"
+              widthClass="w-24"
+            />
+
+            {mode === "expert" && caps.negative && (
+              <Popover
+                side="top"
+                align="start"
+                trigger={
+                  <button
+                    className={CHIP}
+                    aria-label="负向提示词"
+                    aria-expanded={negOpen}
+                  >
+                    负向
+                    {prefs.negativePrompt.trim() && (
+                      <span className="h-1 w-1 rounded-pill bg-accent-text" />
+                    )}
+                    <IconChevron size={10} direction="down" />
+                  </button>
+                }
+              >
+                <div className="w-64">
+                  <div className="mb-1.5 text-footnote font-medium text-tertiary">
+                    负向提示词
+                  </div>
+                  <Input
+                    value={prefs.negativePrompt}
+                    onChange={(e) => {
+                      setNegOpen(true);
+                      setPrefs({ negativePrompt: e.target.value });
+                    }}
+                    placeholder="不希望出现的元素，如：模糊、水印"
+                    aria-label="负向提示词内容"
+                    compact
+                    widthClass="w-full"
+                  />
+                </div>
+              </Popover>
             )}
           </div>
-        )}
-
-        {/* iMessage 风格输入条：内容层材质，控件是嵌在其中的非玻璃按钮 */}
-        <div className="flex items-end gap-1 rounded-panel border border-line bg-elevated p-1.5 shadow-card transition-shadow duration-200 focus-within:shadow-pop">
-          <input
-            ref={fileRef}
-            type="file"
-            accept="image/*"
-            multiple
-            className="hidden"
-            onChange={(e) => {
-              onPickFiles(e.target.files);
-              e.target.value = "";
-            }}
-          />
-          <IconButton
-            label="提示词助手"
-            icon={<IconSparkle size={19} />}
-            variant={assistOpen ? "secondary" : "ghost"}
-            aria-expanded={assistOpen}
-            onClick={() => setAssistOpen(!assistOpen)}
-          />
-          <IconButton
-            label="参考图"
-            icon={<IconImage size={19} />}
-            onClick={() => fileRef.current?.click()}
-          />
-
-          <Popover
-            side="top"
-            align="start"
-            trigger={
-              <Button variant="ghost" size="md">
-                {RATIO_OPTIONS.find((r) => r.id === prefs.ratio)?.label ??
-                  "自定义"}
-                <IconChevron size={11} direction="down" />
-              </Button>
-            }
-          >
-            <div className="w-60">
-              <div className="mb-2 text-footnote font-medium text-tertiary">
-                画面比例
-              </div>
-              <div className="grid grid-cols-4 gap-1.5">
-                {RATIO_OPTIONS.map((r) => (
-                  <button
-                    key={r.id}
-                    onClick={() => applyRatio(r.id)}
-                    className={`pressable rounded-btn border py-1.5 text-subhead transition-colors duration-150 ${
-                      prefs.ratio === r.id
-                        ? "border-accent bg-accent-soft font-medium text-accent"
-                        : "border-line text-tertiary hover:bg-hover hover:text-secondary"
-                    }`}
-                  >
-                    {r.label}
-                  </button>
-                ))}
-              </div>
-              <div className="mb-1.5 mt-3.5 text-footnote font-medium text-tertiary">
-                每次生成
-              </div>
-              <SegmentedControl
-                value={String(prefs.count)}
-                onValueChange={(v) => setPrefs({ count: Number(v) })}
-                label="每次生成张数"
-                size="sm"
-                block
-                options={[1, 2, 4].map((n) => ({
-                  value: String(n),
-                  label: `${n} 张`,
-                }))}
-              />
-              {mode === "expert" && (
-                <CustomSizeRow
-                  width={prefs.width}
-                  height={prefs.height}
-                  onApply={(w, h) => applyCustomSize(w, h)}
-                />
-              )}
-            </div>
-          </Popover>
-
-          <Select
-            value={prefs.style || NONE_STYLE}
-            onValueChange={(v) =>
-              setPrefs({ style: v === NONE_STYLE ? "" : v })
-            }
-            options={STYLE_ITEMS}
-            label="风格"
-            variant="bare"
-            widthClass="w-32"
-            className="shrink-0"
-          />
 
           <textarea
             ref={textareaRef}
@@ -486,54 +655,80 @@ export default function Composer() {
               autoGrow();
             }}
             onKeyDown={onKeyDown}
+            onFocus={() => setInputFocused(true)}
+            onBlur={() => setInputFocused(false)}
             rows={1}
             placeholder="描述你想要的画面…"
             aria-label="提示词"
-            className="min-w-0 flex-1 resize-none bg-transparent px-1 py-2 text-body leading-snug outline-none placeholder:text-tertiary"
+            className="block max-h-[150px] w-full resize-none bg-transparent px-3 pb-1 pt-2 text-body leading-relaxed text-primary outline-none placeholder:text-tertiary"
           />
 
-          {mode === "expert" && (
+          <div className="flex items-center gap-1 px-1.5 pb-1.5">
             <IconButton
-              label="加入队列"
-              icon={<IconQueue size={18} />}
-              disabled={!text.trim() || sending || enqueuing}
-              onClick={() => void doEnqueue()}
+              label="提示词助手"
+              icon={<IconSparkle size={18} />}
+              variant={assistOpen ? "secondary" : "ghost"}
+              aria-expanded={assistOpen}
+              onClick={() => setAssistOpen(!assistOpen)}
             />
-          )}
-
-          {sending ? (
             <IconButton
-              label="停止"
-              icon={<IconStop size={14} />}
-              variant="danger"
-              shape="pill"
-              onClick={stop}
+              label="参考图"
+              icon={<IconImage size={18} />}
+              onClick={() => fileRef.current?.click()}
             />
-          ) : (
-            <IconButton
-              label="生成"
-              icon={
-                <IconSend
-                  size={15}
-                  className="-translate-x-px translate-y-px"
-                />
-              }
-              variant="primary"
-              shape="pill"
-              disabled={!text.trim()}
-              onClick={() => void doSend()}
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/*"
+              multiple
+              className="hidden"
+              onChange={(e) => {
+                onPickFiles(e.target.files);
+                e.target.value = "";
+              }}
             />
-          )}
+            <span className="flex-1" />
+            {mode === "expert" && (
+              <IconButton
+                label="加入队列"
+                icon={<IconQueue size={18} />}
+                disabled={!text.trim() || sending || enqueuing}
+                onClick={() => void doEnqueue()}
+              />
+            )}
+            {sending ? (
+              <IconButton
+                label="停止"
+                icon={<IconStop size={13} />}
+                variant="danger"
+                shape="pill"
+                onClick={stop}
+              />
+            ) : (
+              <IconButton
+                label="生成"
+                icon={
+                  <IconSend
+                    size={15}
+                    className="-translate-x-px translate-y-px"
+                  />
+                }
+                variant="primary"
+                shape="pill"
+                disabled={!text.trim()}
+                onClick={() => void doSend()}
+              />
+            )}
+          </div>
         </div>
 
-        <div className="mt-1.5 text-center text-footnote text-tertiary">
-          {prefs.width} × {prefs.height}
-          {prefs.style && " · 已选风格"}
-          {mode === "expert" &&
-            caps.negative &&
-            prefs.negativePrompt.trim() &&
-            " · 含负向词"}
-          {attachments.length > 0 && ` · ${attachments.length} 张参考图`}
+        <div className="mt-1.5 flex items-center justify-center gap-2 text-center text-footnote text-quaternary">
+          <span>Enter 发送 · Shift Enter 换行 · / 提示词助手</span>
+          {attachments.length > 0 && (
+            <span className="text-tertiary">
+              · {attachments.length} 张参考图
+            </span>
+          )}
         </div>
       </div>
     </div>

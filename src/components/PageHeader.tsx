@@ -1,10 +1,10 @@
 import { ReactNode } from "react";
 import { cn } from "./ui/cn";
 
-/// 各页统一栏头：功能层玻璃，下方无分割线（内容滚过时由边缘遮罩收口）。
+/// ViewBar：内容面顶部的 44px 视图栏。
 ///
-/// 画廊这类带筛选条的页面把筛选条放进同一个玻璃栈（`footer`），
-/// 避免出现"两条玻璃叠在一起"的分层错误。
+/// 它不再是玻璃 —— 玻璃只负责"浮在内容之上"，而它属于内容面本身。
+/// 副标题与标题同一行（Linear 式），带筛选条的页面把筛选放进 `footer`。
 export default function PageHeader({
   title,
   subtitle,
@@ -19,21 +19,26 @@ export default function PageHeader({
   className?: string;
 }) {
   return (
-    <header className={cn("relative z-10 shrink-0 glass", className)}>
-      <div className="flex min-h-12 items-center gap-3 px-6 py-2">
-        <div className="flex min-w-0 flex-col">
-          <h1 className="truncate text-title3 text-primary">{title}</h1>
-          {subtitle && (
-            <p className="truncate text-footnote text-tertiary">{subtitle}</p>
-          )}
-        </div>
+    <header
+      className={cn(
+        "relative z-10 shrink-0 border-b border-separator",
+        className,
+      )}
+    >
+      <div className="flex h-11 items-center gap-3 px-5">
+        <h1 className="shrink-0 truncate text-title1 text-primary">{title}</h1>
+        {subtitle && (
+          <p className="min-w-0 truncate text-footnote text-tertiary">
+            {subtitle}
+          </p>
+        )}
         {actions && (
           <div className="ml-auto flex shrink-0 items-center gap-1.5">
             {actions}
           </div>
         )}
       </div>
-      {footer && <div className="px-6 pb-2.5">{footer}</div>}
+      {footer && <div className="px-4 pb-2">{footer}</div>}
     </header>
   );
 }

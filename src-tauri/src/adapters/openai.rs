@@ -21,9 +21,36 @@ struct GenerationBody {
     model: String,
     prompt: String,
     n: u32,
-    size: String,
+    /// None = 自动尺寸：让服务商自己决定，不发 size 字段
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<String>,
+    /// None = auto：不发 quality 字段，保持与服务商默认一致
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quality: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<String>,
+}
+
+/// 自动尺寸的约定：宽高同时为 0 表示交给服务商（OpenAI 的 size=auto 等价于省略）。
+pub(crate) fn is_auto_size(width: u32, height: u32) -> bool {
+    width == 0 && height == 0
+}
+
+/// 质量档位映射：DALL·E 3 只认 standard / hd，其余 gpt-image 兼容档位原样发送。
+/// auto 与不支持 quality 的 DALL·E 2 一律不发字段，避免严格网关 400。
+pub(crate) fn map_quality(model: &str, quality: Option<&str>) -> Option<String> {
+    let quality = quality?.trim();
+    if quality.is_empty() || quality == "auto" {
+        return None;
+    }
+    let model = model.to_ascii_lowercase();
+    if model.contains("dall-e-3") {
+        return Some(if quality == "high" { "hd" } else { "standard" }.into());
+    }
+    if model.contains("dall-e") {
+        return None;
+    }
+    Some(quality.to_string())
 }
 
 /// gpt-image / dall-e 系列只支持这几种尺寸，按宽高比吸附到最近档位
@@ -262,7 +289,12 @@ impl ImageAdapter for OpenAiAdapter {
                 prompt: prompt_with_negative(&req.prompt, req.negative_prompt.as_deref()),
                 // count 映射为 OpenAI n 参数；多图返回在下方按 data 数组逐项解析
                 n: req.count.max(1),
-                size: snap_size(req.width, req.height),
+                size: if is_auto_size(req.width, req.height) {
+                    None
+                } else {
+                    Some(snap_size(req.width, req.height))
+                },
+                quality: map_quality(&req.model, req.quality.as_deref()),
                 response_format: Some("b64_json".into()),
             })
             .map_err(|e| AdapterError::Other {

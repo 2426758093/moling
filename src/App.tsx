@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   AnimatePresence,
   MotionConfig,
@@ -18,6 +18,13 @@ import TransformDialog from "./components/TransformDialog";
 import BasicEditView from "./components/BasicEditView";
 import BackgroundView from "./components/BackgroundView";
 import { TooltipProvider } from "./components/ui/Tooltip";
+import { CommandPalette } from "./components/ui/CommandPalette";
+import TitleBar from "./components/shell/TitleBar";
+import ResizeHandles from "./components/shell/ResizeHandles";
+import ShortcutsSheet from "./components/shell/ShortcutsSheet";
+import DropOverlay from "./components/shell/DropOverlay";
+import { useWindowState } from "./hooks/useWindowState";
+import { useGlobalShortcuts } from "./hooks/useGlobalShortcuts";
 import { useAppStore } from "./stores/appStore";
 import { useChatStore } from "./stores/chatStore";
 import { useProviderStore } from "./stores/providerStore";
@@ -48,6 +55,7 @@ function useApplyAppearance() {
 
 function AppShell() {
   useApplyAppearance();
+  useGlobalShortcuts();
   const view = useAppStore((s) => s.view);
   const editTarget = useAppStore((s) => s.editTarget);
   const outpaintTarget = useAppStore((s) => s.outpaintTarget);
@@ -56,6 +64,9 @@ function AppShell() {
   const addFileAttachment = useChatStore((s) => s.addFileAttachment);
   const setView = useAppStore((s) => s.setView);
   const reduce = useReducedMotion();
+  const { isMaximized, platform } = useWindowState();
+  const [dragging, setDragging] = useState(false);
+  const dragDepth = useRef(0);
 
   // 减少动态：位移与淡入都必须停 —— framer-motion 的 reducedMotion="user" 只关
   // 位移不关透明度，所以这里显式分支，实际效果才和"减少动态"的承诺一致。
@@ -123,11 +134,24 @@ function AppShell() {
 
   return (
     <div
-      className="flex h-full bg-base text-primary"
+      className="window-plane flex h-full flex-col text-primary"
       onDragOver={(e) => {
         if (e.dataTransfer.types.includes("Files")) e.preventDefault();
       }}
+      onDragEnter={(e) => {
+        if (!e.dataTransfer.types.includes("Files")) return;
+        e.preventDefault();
+        dragDepth.current += 1;
+        setDragging(true);
+      }}
+      onDragLeave={(e) => {
+        if (!e.dataTransfer.types.includes("Files")) return;
+        dragDepth.current = Math.max(0, dragDepth.current - 1);
+        if (dragDepth.current === 0) setDragging(false);
+      }}
       onDrop={(e) => {
+        dragDepth.current = 0;
+        setDragging(false);
         const files = Array.from(e.dataTransfer.files ?? []).filter((f) =>
           f.type.startsWith("image/"),
         );
@@ -155,33 +179,46 @@ function AppShell() {
         })();
       }}
     >
-      <Sidebar />
-      <main className="relative flex min-w-0 flex-1 flex-col">
-        <AnimatePresence mode="wait">
-          <motion.div
-            key={view}
-            variants={viewVariants}
-            initial="initial"
-            animate="animate"
-            exit="exit"
-            transition={{ duration: reduce ? 0 : DUR.slow, ease: EASE.ios }}
-            className="flex min-h-0 flex-1 flex-col"
-          >
-            {view === "chat" ? (
-              <ChatView />
-            ) : view === "gallery" ? (
-              <GalleryView />
-            ) : view === "canvas" ? (
-              <CanvasView />
-            ) : view === "queue" ? (
-              <QueueView />
-            ) : (
-              <SettingsView />
-            )}
-          </motion.div>
-        </AnimatePresence>
-      </main>
-      <SettingsRail />
+      <div className="ambient" aria-hidden />
+      <TitleBar isMaximized={isMaximized} platform={platform} />
+
+      <div className="relative z-10 flex min-h-0 flex-1 pt-12">
+        <Sidebar />
+        <main className="flex min-w-0 flex-1 flex-col p-2">
+          <div className="content-sheet relative flex min-h-0 flex-1 flex-col">
+            {/* 新旧视图叠放交叉淡入：wait 模式会先退场再入场，切页中间有 300ms 空屏 */}
+            <AnimatePresence>
+              <motion.div
+                key={view}
+                variants={viewVariants}
+                initial="initial"
+                animate="animate"
+                exit="exit"
+                transition={{ duration: reduce ? 0 : DUR.base, ease: EASE.ios }}
+                className="absolute inset-0 flex min-h-0 flex-col"
+              >
+                {view === "chat" ? (
+                  <ChatView />
+                ) : view === "gallery" ? (
+                  <GalleryView />
+                ) : view === "canvas" ? (
+                  <CanvasView />
+                ) : view === "queue" ? (
+                  <QueueView />
+                ) : (
+                  <SettingsView />
+                )}
+              </motion.div>
+            </AnimatePresence>
+          </div>
+        </main>
+        {view === "chat" && <SettingsRail />}
+      </div>
+
+      <ResizeHandles isMaximized={isMaximized} />
+      {dragging && <DropOverlay />}
+      <CommandPalette />
+      <ShortcutsSheet />
       <AnimatePresence>{editTarget && <EditorView />}</AnimatePresence>
       <AnimatePresence>{outpaintTarget && <OutpaintView />}</AnimatePresence>
       <AnimatePresence>{basicEditTarget && <BasicEditView />}</AnimatePresence>

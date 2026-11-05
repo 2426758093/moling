@@ -6,11 +6,13 @@ import { useAppStore } from "../stores/appStore";
 import { useProviderStore } from "../stores/providerStore";
 import { api } from "../lib/api";
 import { extOf } from "../lib/image";
+import { extFromDataUrl, saveDataUrl, saveHistoryImage } from "../lib/save";
 import { useModelCaps } from "../lib/useModelCaps";
 import { DUR, EASE } from "../lib/motion";
 import { toast } from "../lib/notify";
 import ImageViewer, { ViewerImage } from "./ImageViewer";
 import { ContextMenu, DropdownMenu, MenuItem } from "./ui/Menu";
+import { Tooltip } from "./ui/Tooltip";
 import SafeImg from "./SafeImg";
 import {
   IconDownload,
@@ -21,7 +23,7 @@ import {
   IconExpand,
   IconSparkle,
   IconTrash,
-  IconChevron,
+  IconMore,
   IconCrop,
   IconPalette,
 } from "./Icons";
@@ -78,12 +80,17 @@ export default function ImageCard({
     [],
   );
 
+  // WebView2 没有下载处理器，必须走系统保存对话框 + Rust 写盘
   const download = () => {
-    const a = document.createElement("a");
-    a.href = image.dataUrl;
-    // 用真实扩展名：mock/模板服务商可能出 SVG，固定 .png 会导致双击打不开
-    a.download = `moling_${image.historyId}.${extOf(image.path ?? "")}`;
-    a.click();
+    const fail = () => toast("下载失败", "error");
+    if (image.historyId > 0) {
+      // 用真实扩展名：mock/模板服务商可能出 SVG，固定 .png 会导致双击打不开
+      const name = `moling_${image.historyId}.${extOf(image.path ?? "")}`;
+      void saveHistoryImage(image.historyId, name).catch(fail);
+    } else {
+      const name = `moling_image.${extFromDataUrl(image.dataUrl)}`;
+      void saveDataUrl(image.dataUrl, name).catch(fail);
+    }
   };
 
   const copyPrompt = async () => {
@@ -224,6 +231,7 @@ export default function ImageCard({
   const viewerImages: ViewerImage[] = siblings.map((i) => ({
     dataUrl: i.dataUrl,
     title: prompt,
+    prompt,
   }));
 
   const openViewer = () =>
@@ -257,26 +265,59 @@ export default function ImageCard({
               派生自 #{image.derivedFrom}
             </span>
           )}
-          <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center justify-between gap-2 p-2 opacity-0 transition-opacity duration-200 group-focus-within:opacity-100 group-hover:opacity-100">
+          <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center justify-end gap-1 p-2 opacity-0 transition-opacity duration-200 group-focus-within:opacity-100 group-hover:opacity-100">
+            {/* 媒体玻璃操作条：图片上的浮标，5 个 28px 圆形按钮 */}
             <div className="glass-media pointer-events-auto flex items-center gap-0.5 rounded-pill p-0.5">
-              <button
-                type="button"
-                onClick={download}
-                className="pressable flex items-center gap-1 rounded-pill px-2.5 py-1 text-footnote text-on-accent transition-colors hover:bg-on-accent/15"
-              >
-                <IconDownload size={12} />
-                下载
-              </button>
+              <Tooltip label="查看原图" side="top">
+                <button
+                  type="button"
+                  onClick={openViewer}
+                  aria-label="查看原图"
+                  className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent transition-colors hover:bg-on-accent/15"
+                >
+                  <IconExpand size={13} />
+                </button>
+              </Tooltip>
+              <Tooltip label={copied ? "已复制" : "复制提示词"} side="top">
+                <button
+                  type="button"
+                  onClick={() => void copyPrompt()}
+                  aria-label="复制提示词"
+                  className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent transition-colors hover:bg-on-accent/15"
+                >
+                  <IconCopy size={13} />
+                </button>
+              </Tooltip>
+              <Tooltip label="引用为参考图" side="top">
+                <button
+                  type="button"
+                  onClick={reference}
+                  aria-label="引用为参考图"
+                  className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent transition-colors hover:bg-on-accent/15"
+                >
+                  <IconQuote size={13} />
+                </button>
+              </Tooltip>
+              <Tooltip label="下载" side="top">
+                <button
+                  type="button"
+                  onClick={download}
+                  aria-label="下载"
+                  className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent transition-colors hover:bg-on-accent/15"
+                >
+                  <IconDownload size={13} />
+                </button>
+              </Tooltip>
+              <DropdownMenu items={menuItems} align="end">
+                <button
+                  type="button"
+                  aria-label="更多操作"
+                  className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent transition-colors hover:bg-on-accent/15"
+                >
+                  <IconMore size={13} />
+                </button>
+              </DropdownMenu>
             </div>
-            <DropdownMenu items={menuItems} align="end">
-              <button
-                type="button"
-                aria-label="更多操作"
-                className="glass-media pressable pointer-events-auto flex h-7 w-7 items-center justify-center rounded-pill text-on-accent hover:bg-on-accent/15"
-              >
-                <IconChevron direction="down" size={13} />
-              </button>
-            </DropdownMenu>
           </div>
         </motion.div>
       </ContextMenu>

@@ -1,4 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { api } from "../lib/api";
+import { toast } from "../lib/notify";
+import { useAppStore } from "../stores/appStore";
 import {
   CanvasNode,
   clampZoom,
@@ -9,7 +12,7 @@ import {
 import CanvasNodeCard from "./CanvasNode";
 import { IconButton } from "./ui/IconButton";
 import { Button } from "./ui/Button";
-import { IconCanvas, IconMinus, IconPlus } from "./Icons";
+import { IconCanvas, IconGrid, IconImage, IconMinus, IconPlus } from "./Icons";
 import { cn } from "./ui/cn";
 
 const ZOOM_STEP = 1.25;
@@ -22,13 +25,10 @@ function nodeCenter(node: CanvasNode) {
 export default function CanvasBoard({
   wireMode,
   onWireModeChange,
-  fitSignal,
   onAddImage,
 }: {
   wireMode: boolean;
   onWireModeChange: (on: boolean) => void;
-  /** 每次递增触发一次「适应视图」 */
-  fitSignal: number;
   onAddImage: () => void;
 }) {
   const nodes = useCanvasStore((s) => s.nodes);
@@ -92,10 +92,6 @@ export default function CanvasBoard({
     });
   }, [setViewport]);
 
-  useEffect(() => {
-    if (fitSignal > 0) fit();
-  }, [fitSignal, fit]);
-
   // 滚轮以光标为锚缩放：先算光标下的世界坐标，缩放后让它仍停在同一屏幕位置
   useEffect(() => {
     const el = containerRef.current;
@@ -120,6 +116,22 @@ export default function CanvasBoard({
     return () => el.removeEventListener("wheel", onWheel);
   }, [setViewport]);
 
+  const zoomBy = useCallback(
+    (factor: number) => {
+      const el = containerRef.current;
+      if (!el) return;
+      const vp = useCanvasStore.getState().viewport;
+      const next = clampZoom(vp.zoom * factor);
+      if (next === vp.zoom) return;
+      const px = el.clientWidth / 2;
+      const py = el.clientHeight / 2;
+      const worldX = (px - vp.x) / vp.zoom;
+      const worldY = (py - vp.y) / vp.zoom;
+      setViewport({ x: px - worldX * next, y: py - worldY * next, zoom: next });
+    },
+    [setViewport],
+  );
+
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
@@ -129,6 +141,27 @@ export default function CanvasBoard({
           target.tagName === "TEXTAREA" ||
           target.isContentEditable)
       ) {
+        return;
+      }
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && (e.key === "=" || e.key === "+")) {
+        e.preventDefault();
+        zoomBy(ZOOM_STEP);
+        return;
+      }
+      if (mod && e.key === "-") {
+        e.preventDefault();
+        zoomBy(1 / ZOOM_STEP);
+        return;
+      }
+      if (mod && e.key === "0") {
+        e.preventDefault();
+        fit();
+        return;
+      }
+      if (mod && e.key.toLowerCase() === "s") {
+        e.preventDefault();
+        void useCanvasStore.getState().flush();
         return;
       }
       if (e.key === "Escape") {
@@ -153,6 +186,8 @@ export default function CanvasBoard({
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [
+    fit,
+    zoomBy,
     selectedNode,
     selectedEdge,
     wireMode,
@@ -160,6 +195,73 @@ export default function CanvasBoard({
     removeNode,
     removeEdge,
   ]);
+
+  const importPasted = useCallback(async (dataUrl: string) => {
+    try {
+      const { historyId } = await api.importImage(dataUrl);
+      const id = await useCanvasStore.getState().addHistoryNode(historyId);
+      if (id) {
+        setSelectedNode(id);
+        toast("已粘贴图片到画布");
+      }
+    } catch {
+      toast("粘贴失败：图片无法读取", "error");
+    }
+  }, []);
+
+  // 粘贴剪贴板图片：先入库拿到 historyId，再落到当前视口左上角
+  useEffect(() => {
+    const readImage = (file: File) =>
+      new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+      });
+
+    const onPaste = (e: ClipboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      const item = Array.from(e.clipboardData?.items ?? []).find((entry) =>
+        entry.type.startsWith("image/"),
+      );
+      const file = item?.getAsFile();
+      if (!file) return;
+      e.preventDefault();
+      void readImage(file).then(importPasted);
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [importPasted]);
+
+  const pasteFromClipboard = async () => {
+    try {
+      const items = await navigator.clipboard.read();
+      for (const item of items) {
+        const type = item.types.find((t) => t.startsWith("image/"));
+        if (!type) continue;
+        const blob = await item.getType(type);
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result));
+          reader.onerror = () => reject(reader.error);
+          reader.readAsDataURL(blob);
+        });
+        await importPasted(dataUrl);
+        return;
+      }
+      toast("剪贴板里没有图片", "error");
+    } catch {
+      toast("无法读取剪贴板，可先复制图片再按 Ctrl V", "error");
+    }
+  };
 
   // 离开画布前落盘：防抖窗口内的最后一次改动不能丢
   useEffect(() => () => void useCanvasStore.getState().flush(), []);
@@ -197,19 +299,6 @@ export default function CanvasBoard({
     if (e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId);
     }
-  };
-
-  const zoomBy = (factor: number) => {
-    const el = containerRef.current;
-    if (!el) return;
-    const vp = useCanvasStore.getState().viewport;
-    const next = clampZoom(vp.zoom * factor);
-    if (next === vp.zoom) return;
-    const px = el.clientWidth / 2;
-    const py = el.clientHeight / 2;
-    const worldX = (px - vp.x) / vp.zoom;
-    const worldY = (py - vp.y) / vp.zoom;
-    setViewport({ x: px - worldX * next, y: py - worldY * next, zoom: next });
   };
 
   const selectNode = useCallback((id: string) => {
@@ -325,24 +414,44 @@ export default function CanvasBoard({
       </div>
 
       {nodes.length === 0 && (
-        <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
+        <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-4 px-6 text-center">
           <span className="flex h-12 w-12 items-center justify-center rounded-panel bg-fill text-tertiary">
             <IconCanvas size={22} strokeWidth={1.4} />
           </span>
-          <div className="text-body text-tertiary">画布还是空的</div>
-          <p className="max-w-72 text-footnote text-quaternary">
-            从画廊挑几张作品放进来，拖动排布、滚轮缩放，再从节点进入编辑。
-          </p>
-          <Button
-            size="sm"
-            variant="primary"
-            icon={<IconPlus size={14} />}
-            className="pointer-events-auto"
+          <div>
+            <div className="text-title3 text-primary">画布还是空的</div>
+            <p className="mt-1 max-w-72 text-footnote text-quaternary">
+              从画廊挑几张作品放进来，拖动排布、滚轮缩放，再从节点进入编辑。
+            </p>
+          </div>
+          <div
+            className="pointer-events-auto grid w-full max-w-sm grid-cols-3 gap-2"
             onPointerDown={(e) => e.stopPropagation()}
-            onClick={onAddImage}
           >
-            添加图片
-          </Button>
+            <Button
+              size="sm"
+              variant="primary"
+              icon={<IconPlus size={14} />}
+              onClick={onAddImage}
+            >
+              添加图片
+            </Button>
+            <Button
+              size="sm"
+              icon={<IconImage size={14} />}
+              onClick={() => void pasteFromClipboard()}
+            >
+              粘贴图片
+            </Button>
+            <Button
+              size="sm"
+              variant="ghost"
+              icon={<IconGrid size={14} />}
+              onClick={() => useAppStore.getState().setView("gallery")}
+            >
+              去画廊
+            </Button>
+          </div>
         </div>
       )}
 
@@ -361,9 +470,37 @@ export default function CanvasBoard({
       )}
 
       <div
-        className="glass absolute bottom-4 right-4 flex items-center gap-0.5 rounded-pill p-0.5"
+        className="glass absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-0.5 rounded-pill p-1 shadow-pop"
         onPointerDown={(e) => e.stopPropagation()}
       >
+        <div className="flex items-center gap-0.5">
+          <button
+            type="button"
+            aria-pressed={!wireMode}
+            onClick={() => onWireModeChange(false)}
+            className={`pressable h-7 rounded-pill px-2.5 text-footnote transition-colors ${
+              wireMode
+                ? "text-secondary hover:bg-hover"
+                : "bg-elevated text-primary shadow-card"
+            }`}
+          >
+            浏览
+          </button>
+          <button
+            type="button"
+            aria-pressed={wireMode}
+            disabled={nodes.length < 2}
+            onClick={() => onWireModeChange(true)}
+            className={`pressable h-7 rounded-pill px-2.5 text-footnote transition-colors disabled:cursor-not-allowed disabled:opacity-40 ${
+              wireMode
+                ? "bg-elevated text-primary shadow-card"
+                : "text-secondary hover:bg-hover"
+            }`}
+          >
+            连线
+          </button>
+        </div>
+        <span className="mx-0.5 h-4 w-px bg-separator" />
         <IconButton
           label="缩小"
           size="sm"
@@ -374,7 +511,7 @@ export default function CanvasBoard({
         />
         <span
           aria-label={`缩放 ${Math.round(viewport.zoom * 100)}%`}
-          className="min-w-12 text-center text-footnote text-secondary"
+          className="tabular min-w-12 text-center text-footnote text-secondary"
         >
           {Math.round(viewport.zoom * 100)}%
         </span>

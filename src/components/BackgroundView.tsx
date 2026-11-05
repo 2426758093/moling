@@ -153,7 +153,7 @@ function BackgroundBody({
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       transition={{ duration: reduce ? 0 : DUR.base, ease: EASE.ios }}
-      className="fixed inset-0 z-40 flex flex-col bg-base"
+      className="fixed inset-x-0 bottom-0 top-12 z-30 flex flex-col bg-base"
     >
       <header className="relative z-10 shrink-0 glass">
         <div className="flex min-h-12 items-center gap-3 px-6 py-2">

@@ -1,6 +1,7 @@
 pub mod canvas;
 pub mod chat;
 pub mod diagnostics;
+pub mod files;
 pub mod image;
 pub mod model_caps;
 pub mod network;
@@ -15,6 +16,7 @@ pub mod update;
 pub use canvas::*;
 pub use chat::*;
 pub use diagnostics::*;
+pub use files::*;
 pub use image::*;
 pub use model_caps::*;
 pub use network::*;

@@ -1,11 +1,22 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import SafeImg from "./SafeImg";
-import { IconClose, IconExpand, IconChevron } from "./Icons";
+import { extFromDataUrl, saveDataUrl } from "../lib/save";
+import { DUR, EASE } from "../lib/motion";
+import { toast } from "../lib/notify";
+import {
+  IconClose,
+  IconExpand,
+  IconChevron,
+  IconCopy,
+  IconDownload,
+} from "./Icons";
 
 export interface ViewerImage {
   dataUrl: string;
   title?: string;
+  /// 生成这张图用的提示词（有则可复制）
+  prompt?: string;
 }
 
 /// 浮在图片之上的工具栏：clear 玻璃 + 压暗层，保证任何画面上都读得清。
@@ -69,12 +80,12 @@ export default function ImageViewer({
       initial={{ opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
-      transition={{ duration: 0.2 }}
+      transition={{ duration: DUR.base, ease: EASE.ios }}
       ref={containerRef}
       role="dialog"
       aria-modal="true"
       aria-label="图片查看器"
-      className="fixed inset-0 z-50 flex flex-col bg-black"
+      className="fixed inset-0 z-50 flex flex-col bg-stage"
       onClick={onClose}
     >
       <div
@@ -85,7 +96,35 @@ export default function ImageViewer({
           {index + 1} / {images.length}
           {scale !== 1 && ` · ${Math.round(scale * 100)}%`}
         </span>
-        <div className="flex gap-1">
+        <div className="flex items-center gap-1">
+          {current.prompt && (
+            <button
+              type="button"
+              onClick={() => {
+                void navigator.clipboard
+                  .writeText(current.prompt ?? "")
+                  .then(() => toast("已复制提示词"))
+                  .catch(() => toast("复制失败", "error"));
+              }}
+              aria-label="复制提示词"
+              className={BAR_BTN}
+            >
+              <IconCopy size={15} />
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() =>
+              void saveDataUrl(
+                current.dataUrl,
+                `moling-${index + 1}.${extFromDataUrl(current.dataUrl)}`,
+              ).catch(() => toast("下载失败", "error"))
+            }
+            aria-label="下载图片"
+            className={BAR_BTN}
+          >
+            <IconDownload size={15} />
+          </button>
           <button
             type="button"
             onClick={() => {
@@ -170,6 +209,33 @@ export default function ImageViewer({
           </button>
         )}
       </div>
+      {images.length > 1 && (
+        <div
+          className="glass-media flex shrink-0 items-center justify-center gap-1.5 overflow-x-auto px-4 py-2"
+          onClick={(e) => e.stopPropagation()}
+        >
+          {images.map((image, i) => (
+            <button
+              key={`${image.dataUrl.slice(-12)}-${i}`}
+              type="button"
+              onClick={() => onIndexChange(i)}
+              aria-label={`查看第 ${i + 1} 张`}
+              aria-current={i === index ? "true" : undefined}
+              className={
+                i === index
+                  ? "size-10 shrink-0 overflow-hidden rounded-chip ring-2 ring-on-accent"
+                  : "size-10 shrink-0 overflow-hidden rounded-chip opacity-55 transition-opacity hover:opacity-100"
+              }
+            >
+              <SafeImg
+                src={image.dataUrl}
+                alt=""
+                className="h-full w-full object-cover"
+              />
+            </button>
+          ))}
+        </div>
+      )}
     </motion.div>
   );
 }

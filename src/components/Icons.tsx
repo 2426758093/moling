@@ -4,14 +4,16 @@ interface IconProps {
   strokeWidth?: number;
 }
 
-function base({ size = 18, className = "", strokeWidth = 1.6 }: IconProps) {
+/// 描边按光学尺寸取：大图标细一档（1.6），小图标粗一档（2.0），
+/// 让 14/16px 的图标在中文界面里不糊成一团。默认值由 size 推导。
+function base({ size = 18, className = "", strokeWidth }: IconProps) {
   return {
     width: size,
     height: size,
     viewBox: "0 0 24 24",
     fill: "none",
     stroke: "currentColor",
-    strokeWidth,
+    strokeWidth: strokeWidth ?? (size >= 24 ? 1.6 : 2),
     strokeLinecap: "round" as const,
     strokeLinejoin: "round" as const,
     className,
@@ -218,5 +220,97 @@ export const IconLink = (p: IconProps) => (
 export const IconMinus = (p: IconProps) => (
   <svg {...base(p)}>
     <path d="M5 12h14" />
+  </svg>
+);
+
+export const IconSearch = (p: IconProps) => (
+  <svg {...base(p)}>
+    <circle cx="11" cy="11" r="7" />
+    <path d="m16.5 16.5 4 4" />
+  </svg>
+);
+
+export const IconCommand = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M9 6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3Z" />
+  </svg>
+);
+
+export const IconCheck = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="m5 12.5 4.5 4.5L19 7" />
+  </svg>
+);
+
+export const IconMore = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M5 12h.01M12 12h.01M19 12h.01" />
+  </svg>
+);
+
+export const IconKeyboard = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="2.5" y="6" width="19" height="12" rx="2.5" />
+    <path d="M7 10h.01M11 10h.01M15 10h.01M8 14h8" />
+  </svg>
+);
+
+export const IconInfo = (p: IconProps) => (
+  <svg {...base(p)}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M12 11v5M12 8h.01" />
+  </svg>
+);
+
+export const IconAlert = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M12 4.5 2.8 20a1.4 1.4 0 0 0 1.2 2h16a1.4 1.4 0 0 0 1.2-2Z" />
+    <path d="M12 10v4M12 18h.01" />
+  </svg>
+);
+
+export const IconStar = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="m12 3.5 2.6 5.4 5.9.8-4.3 4.1 1 5.9-5.2-2.8-5.2 2.8 1-5.9-4.3-4.1 5.9-.8Z" />
+  </svg>
+);
+
+export const IconEdit = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M12 20h9" />
+    <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4Z" />
+  </svg>
+);
+
+export const IconFilter = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M3 5h18l-7 8v6l-4 2v-8Z" />
+  </svg>
+);
+
+export const IconPanelLeft = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="3" y="4" width="18" height="16" rx="3" />
+    <path d="M9 4v16" />
+  </svg>
+);
+
+/// 窗口控制：10-12px 下只保留最简几何，描边在调用处压到 1.1-1.2。
+export const IconWindowMinimize = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M5 12h14" />
+  </svg>
+);
+
+export const IconWindowMaximize = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="5" y="5" width="14" height="14" rx="2" />
+  </svg>
+);
+
+export const IconWindowRestore = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="4" y="8" width="11" height="11" rx="2" />
+    <path d="M8 8V6a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2" />
   </svg>
 );

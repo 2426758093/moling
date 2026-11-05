@@ -7,10 +7,9 @@ import {
   Conversation,
   ImageProgress,
   parseAdapterError,
-  ThinkingDelta,
 } from "../lib/api";
 import { toast } from "../lib/notify";
-import { maxReferenceImages } from "../lib/useModelCaps";
+import { currentModelCaps, maxReferenceImages } from "../lib/useModelCaps";
 import { DEFAULT_REFERENCE_STRENGTH, ReferenceRole } from "../lib/types";
 import {
   compressDataUrl,
@@ -51,10 +50,8 @@ export interface DisplayMessage {
   attachments: Attachment[];
   images: ChatImage[];
   pendingImages: number;
-  status: "thinking" | "generating" | "done" | "stopped" | "error";
+  status: "generating" | "done" | "stopped" | "error";
   error: AdapterError | null;
-  /// 思考模型的流式增量（仅 status=thinking 期间有值，落定后清空）
-  streamText?: string;
   /// 逐张生成进度（后端 image:progress 事件）；无事件时退回 pendingImages 文案
   progress?: { done: number; total: number };
 }
@@ -119,6 +116,24 @@ function localAssistantId(userMsgId: number): number {
   return -(userMsgId * 10 + 1);
 }
 
+/// 首条消息后台补标题：任何失败（含 IPC 同步抛错）都不影响出图主流程
+function requestConversationTitle(
+  convId: number,
+  prompt: string,
+  apply: (title: string) => void,
+) {
+  try {
+    void api
+      .generateConversationTitle(convId, prompt)
+      .then((res) => {
+        if (res.ok && res.title) apply(res.title);
+      })
+      .catch(() => undefined);
+  } catch {
+    // 忽略：标题只是锦上添花
+  }
+}
+
 function toDisplay(m: ChatMessage): DisplayMessage {
   let attachments: Attachment[] = [];
   let images: ChatImage[] = [];
@@ -150,18 +165,6 @@ let sendSeq = 0;
 let convSeq = 0;
 // 当前在途生成任务 id：stop() 用它请求后端取消（同一时刻只有一路生成）
 let activeJobId: string | null = null;
-// 当前在途思考请求 id：增量事件按它过滤，stop() 用它取消
-let activeRefineId: string | null = null;
-// 思考增量的退订函数（每轮请求重订阅，StrictMode 双订阅无副作用）
-let detachThinking: (() => void) | null = null;
-
-/// 退订思考增量并清空活动 id；不清空已落定的 refined 内容
-function detachThinkingStream(): void {
-  const off = detachThinking;
-  detachThinking = null;
-  activeRefineId = null;
-  off?.();
-}
 
 export const useChatStore = create<ChatState>((set, get) => {
   // 复合序号守卫：sendSeq 防「被新一轮发送/重试取代」，convSeq 防「已切走会话仍回写消息列表」。
@@ -250,68 +253,55 @@ export const useChatStore = create<ChatState>((set, get) => {
       return;
     }
 
-    // 1. 思考模型优化提示词（失败静默降级为原文）
-    const lastAssistant = [...get().messages]
-      .reverse()
-      .find(
-        (m) => m.role === "assistant" && m.refined && m.id !== assistantLocalId,
-      );
-    // 先订阅再发起：增量只写入本轮占位，且停止/过期后不再落任何片段
-    detachThinkingStream();
-    const refineId = crypto.randomUUID();
-    activeRefineId = refineId;
-    const off = await listen<ThinkingDelta>("thinking:delta", (event) => {
-      const { requestId, delta } = event.payload;
-      if (requestId !== refineId || requestId !== activeRefineId) return;
-      if (!isCurrent() || get().stopRequested) return;
-      const current = get().messages.find((m) => m.id === assistantLocalId);
-      if (!current) return;
-      updateAssistant({ streamText: (current.streamText ?? "") + delta });
-    });
-    detachThinking = () => {
-      off();
-      if (activeRefineId === refineId) activeRefineId = null;
-    };
-    try {
-      const result = await api.refinePrompt(
-        userMsg.content,
-        lastAssistant?.refined ?? null,
-        refineId,
-        convId,
-      );
-      if (!isCurrent()) return;
-      // 空优化结果不能覆盖用户原文（F-005）：后端正常时 used 已带 trim 守卫，
-      // 这里再挡一次旧版本/异常响应，避免气泡内容变空。
-      if (result.used && result.refined.trim() !== "" && !get().stopRequested) {
-        updateAssistant({
-          refined: result.refined,
-          thinkingUsed: true,
-          content: result.refined,
-          streamText: undefined,
-        });
-      } else {
-        updateAssistant({ streamText: undefined });
-      }
-    } catch {
-      // 思考失败静默降级为原文
-      updateAssistant({ streamText: undefined });
-    } finally {
-      // 只有本次仍是活动思考请求时才退订，避免误杀下一轮已建好的订阅
-      if (activeRefineId === refineId) detachThinkingStream();
+    // 1. 不做事先改写：把用户原文直接交给绘图模型，让真正决定画面的模型
+    //    自己完成理解与改写，不再由另一个只见过文本的模型代写提示词。
+    updateAssistant({ status: "generating" });
+    const prefs = useAppStore.getState().prefs;
+    const count = prefs.count;
+    updateAssistant({ pendingImages: count });
+
+    // 追问上下文：参考图未占满上限时，把会话里最后一张生成图一并交给模型，
+    // 「把背景换成蓝色」这类追问才有可对齐的画面；占满时优先保留用户显式选择的
+    // 参考图。编辑能力缺失的模型不传，避免把生成推进不支持的 /edits 分支。
+    const caps = currentModelCaps();
+    const previous =
+      caps.edit && atts.length < maxReferenceImages()
+        ? [...get().messages]
+            .reverse()
+            .find(
+              (m) =>
+                m.role === "assistant" &&
+                m.id !== assistantLocalId &&
+                m.images.length > 0,
+            )
+        : undefined;
+    const previousImage = previous?.images[previous.images.length - 1];
+    const inputImages = atts.map((a) => a.dataUrl);
+    // 角色 / 强度只属于专家模式；简单模式保持「纯参考图」的旧行为
+    const inputRefs =
+      useAppStore.getState().mode === "expert" && atts.length > 0
+        ? atts.map((a) => ({
+            role: a.role ?? "composition",
+            strength: a.strength ?? DEFAULT_REFERENCE_STRENGTH,
+          }))
+        : [];
+    if (previousImage?.dataUrl) {
+      inputImages.push(previousImage.dataUrl);
+      // previous 只用于对话上下文，不出现在用户可选的参考图角色里
+      inputRefs.push({
+        role: "previous",
+        strength: DEFAULT_REFERENCE_STRENGTH,
+      });
     }
+
+    // 2. 生成图片：单次 invoke 透传 count=n，响应按序解析、逐张更新进度。
+    //    每次生成分配 jobId，stop() 用它调用后端 cancel_generation 中断在途请求。
     if (!isCurrent()) return;
     if (get().stopRequested) {
       updateAssistant({ status: "stopped", pendingImages: 0 });
       finalize();
       return;
     }
-
-    // 2. 生成图片：单次 invoke 透传 count=n，响应按序解析、逐张更新进度。
-    //    每次生成分配 jobId，stop() 用它调用后端 cancel_generation 中断在途请求。
-    updateAssistant({ status: "generating" });
-    const prefs = useAppStore.getState().prefs;
-    const count = prefs.count;
-    updateAssistant({ pendingImages: count });
     const images: ChatImage[] = [];
     let genError: AdapterError | null = null;
     let cancelled = false;
@@ -334,24 +324,17 @@ export const useChatStore = create<ChatState>((set, get) => {
     try {
       const resp = await api.generateImages({
         providerId: defaultProviderId,
-        prompt:
-          get().messages.find((m) => m.id === assistantLocalId)?.content ??
-          userMsg.content,
+        // 原文直达：用户怎么描述，绘图模型就收到什么，不再经二手改写
+        prompt: userMsg.content,
         negativePrompt: prefs.negativePrompt.trim() || null,
         model,
         width: prefs.width,
         height: prefs.height,
         style: prefs.style,
         count,
-        images: atts.map((a) => a.dataUrl),
-        // 角色 / 强度只属于专家模式；简单模式保持「纯参考图」的旧行为
-        references:
-          useAppStore.getState().mode === "expert" && atts.length > 0
-            ? atts.map((a) => ({
-                role: a.role ?? "composition",
-                strength: a.strength ?? DEFAULT_REFERENCE_STRENGTH,
-              }))
-            : undefined,
+        quality: prefs.quality === "auto" ? null : prefs.quality,
+        images: inputImages,
+        references: inputRefs.length > 0 ? inputRefs : undefined,
         jobId,
       });
       cancelled = Boolean(resp.cancelled);
@@ -447,7 +430,6 @@ export const useChatStore = create<ChatState>((set, get) => {
       try {
         const id = await api.createConversation("新对话");
         convSeq++;
-        detachThinkingStream();
         await get().loadConversations();
         set({
           activeId: id,
@@ -463,7 +445,6 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     selectConversation: async (id) => {
       // 只加载最新一页；更早的消息由 loadOlder() 按需续载
-      detachThinkingStream();
       const myConvSeq = ++convSeq;
       try {
         const { messages, hasMore } = await api.listMessages(id, {
@@ -616,6 +597,16 @@ export const useChatStore = create<ChatState>((set, get) => {
         }
         if (get().stopRequested) return false;
 
+        // 只有空会话的首条消息才补 AI 标题，避免覆盖已有标题
+        const convTitle = get().conversations.find(
+          (c) => c.id === convId,
+        )?.title;
+        const firstMessage =
+          get().messages.length === 0 &&
+          (createdConversation ||
+            convTitle === undefined ||
+            convTitle === "新对话");
+
         // 附件先落盘，拿到 path 再入库（DB 不再存 dataUrl）。
         // F4：任一张失败即提示并中止发送，不静默降级为「无参考图继续生成」。
         let atts: Attachment[];
@@ -685,8 +676,8 @@ export const useChatStore = create<ChatState>((set, get) => {
           thinkingUsed: false,
           attachments: [],
           images: [],
-          pendingImages: 0,
-          status: "thinking",
+          pendingImages: useAppStore.getState().prefs.count,
+          status: "generating",
           error: null,
         };
 
@@ -709,6 +700,16 @@ export const useChatStore = create<ChatState>((set, get) => {
         }
         if (!isMine()) return true;
 
+        if (firstMessage) {
+          requestConversationTitle(convId, trimmed, (title) =>
+            set((s) => ({
+              conversations: s.conversations.map((c) =>
+                c.id === convId ? { ...c, title } : c,
+              ),
+            })),
+          );
+        }
+
         await runGeneration(convId, userMsg, atts, assistantLocalId, mySeq);
         return true;
       } catch (e) {
@@ -726,13 +727,8 @@ export const useChatStore = create<ChatState>((set, get) => {
 
     stop: () => {
       // 停止语义：立即回到空闲 UI，并尽力请求后端中断在途生成。
-      // jobId / 思考 requestId 均由 runGeneration 生成；取消命令为 fire-and-forget，
+      // jobId 由 runGeneration 生成；取消命令为 fire-and-forget，
       // 后端未落地该命令（invoke 拒绝）时静默忽略，不阻塞停止操作。
-      const refineId = activeRefineId;
-      if (refineId) {
-        detachThinkingStream();
-        void api.cancelRefine(refineId).catch(() => undefined);
-      }
       const jobId = activeJobId;
       if (jobId) {
         activeJobId = null;
@@ -744,8 +740,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         // 在途占位立刻标记 stopped：否则停止后马上发新消息时，
         // 旧请求返回会被序号校验丢弃，旧气泡会一直转圈
         messages: s.messages.map((m) =>
-          m.role === "assistant" &&
-          (m.status === "thinking" || m.status === "generating")
+          m.role === "assistant" && m.status === "generating"
             ? { ...m, status: "stopped" as const, pendingImages: 0 }
             : m,
         ),
@@ -800,8 +795,8 @@ export const useChatStore = create<ChatState>((set, get) => {
         thinkingUsed: false,
         attachments: [],
         images: [],
-        pendingImages: 0,
-        status: "thinking",
+        pendingImages: useAppStore.getState().prefs.count,
+        status: "generating",
         error: null,
       };
 

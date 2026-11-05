@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { motion, useReducedMotion } from "framer-motion";
+import { motion } from "framer-motion";
 import {
   adapterErrorTitle,
   api,
@@ -9,22 +9,61 @@ import {
 } from "../lib/api";
 import { useQueueStore } from "../stores/queueStore";
 import { useAppStore } from "../stores/appStore";
+import { sizeLabel } from "../lib/types";
 import { toast } from "../lib/notify";
-import { DUR, EASE } from "../lib/motion";
+import { useMotionTokens } from "../lib/useMotion";
 import { useScrollEdge } from "../hooks/useScrollEdge";
 import PageHeader from "./PageHeader";
 import SafeImg from "./SafeImg";
 import { Button } from "./ui/Button";
 import { Select } from "./ui/Select";
-import { IconQueue } from "./Icons";
+import { IconButton } from "./ui/IconButton";
+import { InsetList } from "./ui/List";
+import { EmptyState } from "./ui/EmptyState";
+import {
+  IconAlert,
+  IconChevron,
+  IconClose,
+  IconCopy,
+  IconQueue,
+  IconRotate,
+} from "./Icons";
+import { cn } from "./ui/cn";
 
-const STATUS_META: Record<QueueStatus, { label: string; cls: string }> = {
-  queued: { label: "排队中", cls: "bg-fill text-secondary" },
-  running: { label: "生成中", cls: "bg-accent-soft text-accent" },
-  done: { label: "已完成", cls: "bg-success/12 text-success" },
-  failed: { label: "失败", cls: "bg-danger/12 text-danger" },
-  canceled: { label: "已取消", cls: "bg-fill text-tertiary" },
-  interrupted: { label: "已中断", cls: "bg-fill text-tertiary" },
+const STATUS_META: Record<
+  QueueStatus,
+  { label: string; cls: string; dot: string }
+> = {
+  queued: {
+    label: "排队中",
+    cls: "bg-fill text-secondary",
+    dot: "bg-tertiary",
+  },
+  running: {
+    label: "生成中",
+    cls: "bg-accent-soft text-accent-text",
+    dot: "bg-accent",
+  },
+  done: {
+    label: "已完成",
+    cls: "bg-success/12 text-success",
+    dot: "bg-success-fill",
+  },
+  failed: {
+    label: "失败",
+    cls: "bg-danger/12 text-danger",
+    dot: "bg-danger",
+  },
+  canceled: {
+    label: "已取消",
+    cls: "bg-fill text-tertiary",
+    dot: "bg-tertiary",
+  },
+  interrupted: {
+    label: "已中断",
+    cls: "bg-fill text-tertiary",
+    dot: "bg-warning-fill",
+  },
 };
 
 const RETRYABLE: QueueStatus[] = ["failed", "canceled", "interrupted"];
@@ -33,6 +72,28 @@ const CONCURRENCY_OPTIONS = [1, 2, 3, 4].map((n) => ({
   value: String(n),
   label: `${n} 个任务`,
 }));
+
+type Filter = "all" | "pending" | "done" | "issue";
+
+const FILTERS: { id: Filter; label: string }[] = [
+  { id: "all", label: "全部" },
+  { id: "pending", label: "待处理" },
+  { id: "done", label: "已完成" },
+  { id: "issue", label: "异常" },
+];
+
+function matchesFilter(job: QueueJob, filter: Filter) {
+  switch (filter) {
+    case "pending":
+      return job.status === "queued" || job.status === "running";
+    case "done":
+      return job.status === "done";
+    case "issue":
+      return RETRYABLE.includes(job.status);
+    default:
+      return true;
+  }
+}
 
 /// 参考图 data URL 缓存：队列条目重渲染时不重复读盘
 const refUrlCache = new Map<string, string>();
@@ -97,86 +158,170 @@ function JobRow({ job }: { job: QueueJob }) {
   const meta = STATUS_META[job.status] ?? STATUS_META.queued;
   const active = job.status === "running";
   const error = job.error ? parseAdapterError(job.error) : null;
-  const reduce = useReducedMotion();
+  const [open, setOpen] = useState(active);
+  const [errorOpen, setErrorOpen] = useState(false);
+  const motionTokens = useMotionTokens();
 
   const run = (action: Promise<void>, fallback: string) =>
     action.catch((e) => toast(`${fallback}：${String(e)}`, "error"));
 
+  const copy = (text: string, label: string) => {
+    void navigator.clipboard
+      .writeText(text)
+      .then(() => toast(label))
+      .catch(() => toast("复制失败", "error"));
+  };
+
   return (
     <motion.li
       layout
-      initial={reduce ? { opacity: 0 } : { opacity: 0, y: 8 }}
+      initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: 1, y: 0 }}
-      transition={{ duration: DUR.base, ease: EASE.ios }}
-      className="rounded-card border border-line bg-elevated p-4 shadow-card"
+      transition={motionTokens.spring("snappy")}
+      className="relative after:absolute after:inset-x-3 after:bottom-0 after:h-px after:bg-separator after:content-[''] last:after:hidden"
     >
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0 flex-1">
-          <div className="flex items-center gap-2">
-            <span
-              className={`rounded-chip px-2 py-0.5 text-caption font-medium ${meta.cls}`}
-            >
-              {meta.label}
-            </span>
-            <span className="truncate text-footnote text-tertiary">
-              #{job.id} · {job.providerName}
-            </span>
-          </div>
-          <p className="mt-2 line-clamp-2 text-body text-primary">
+      <div className="flex h-12 items-center gap-2 py-0 pl-1.5 pr-2">
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          aria-expanded={open}
+          aria-label={`任务 #${job.id} 详情`}
+          className="flex h-8 min-w-0 flex-1 items-center gap-2.5 rounded-btn px-1.5 text-left outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-accent/25"
+        >
+          <span
+            aria-hidden
+            className={cn("size-2 shrink-0 rounded-pill", meta.dot)}
+          />
+          <span
+            className={cn(
+              "shrink-0 rounded-chip px-1.5 py-0.5 text-caption font-medium",
+              meta.cls,
+            )}
+          >
+            {meta.label}
+          </span>
+          <span className="min-w-0 flex-1 truncate text-callout text-primary">
             {job.prompt}
-          </p>
-          <div className="mt-1.5 text-footnote text-tertiary">
-            {job.model} · {job.width} × {job.height} · {job.count} 张
-            {job.style && " · 已选风格"}
-          </div>
-          <ReferenceThumbs inputJson={job.inputJson} />
-        </div>
-        <div className="flex shrink-0 gap-1.5">
-          {(job.status === "queued" || active) && (
-            <Button
-              size="sm"
-              variant="danger"
-              onClick={() => run(cancel(job.id), "取消失败")}
-            >
-              取消
-            </Button>
+          </span>
+          {active && progress && (
+            <span className="tabular hidden shrink-0 text-footnote text-tertiary compact:block">
+              {progress.done}/{progress.total}
+            </span>
           )}
-          {RETRYABLE.includes(job.status) && (
-            <Button size="sm" onClick={() => run(retry(job.id), "重试失败")}>
-              重试
-            </Button>
-          )}
-        </div>
+          <IconChevron
+            direction={open ? "down" : "right"}
+            size={12}
+            className="shrink-0 text-tertiary"
+          />
+        </button>
+
+        {(job.status === "queued" || active) && (
+          <IconButton
+            label="取消任务"
+            size="sm"
+            icon={<IconClose size={13} />}
+            onClick={() => run(cancel(job.id), "取消失败")}
+          />
+        )}
+        {RETRYABLE.includes(job.status) && (
+          <IconButton
+            label="重试任务"
+            size="sm"
+            icon={<IconRotate size={13} />}
+            onClick={() => run(retry(job.id), "重试失败")}
+          />
+        )}
       </div>
 
-      {active && (
-        <div className="mt-3">
-          <div className="h-1 overflow-hidden rounded-pill bg-sunken">
-            <div
-              className="h-full rounded-pill bg-accent-fill transition-[width] duration-300 ease-ios"
-              style={{
-                width: progress
-                  ? `${Math.round((progress.done / Math.max(progress.total, 1)) * 100)}%`
-                  : "8%",
-              }}
-            />
+      {open && (
+        <div className="pb-3 pl-3 pr-3">
+          <p className="break-words whitespace-pre-wrap text-body text-secondary">
+            {job.prompt}
+          </p>
+          <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-footnote text-tertiary">
+            <span className="tabular">#{job.id}</span>
+            <span aria-hidden>·</span>
+            <span>{job.providerName}</span>
+            <span aria-hidden>·</span>
+            <span>{job.model}</span>
+            <span aria-hidden>·</span>
+            <span className="tabular">{sizeLabel(job.width, job.height)}</span>
+            <span aria-hidden>·</span>
+            <span>{job.count} 张</span>
+            {job.style && (
+              <>
+                <span aria-hidden>·</span>
+                <span>{job.style}</span>
+              </>
+            )}
+            <button
+              type="button"
+              onClick={() => copy(job.prompt, "提示词已复制")}
+              className="pressable ml-auto flex h-6 items-center gap-1 rounded-chip px-2 text-caption text-secondary transition-colors hover:bg-hover hover:text-primary"
+            >
+              <IconCopy size={12} />
+              复制提示词
+            </button>
           </div>
-          <div className="mt-1 text-footnote text-tertiary">
-            {progress
-              ? `已落盘 ${progress.done} / ${progress.total} 张`
-              : "正在请求图片…"}
-          </div>
-        </div>
-      )}
+          <ReferenceThumbs inputJson={job.inputJson} />
 
-      {error && job.status === "failed" && (
-        <div className="mt-2.5 rounded-btn border border-danger/25 bg-danger/10 px-3 py-2">
-          <div className="text-footnote font-medium text-danger">
-            {adapterErrorTitle(error)}
-          </div>
-          <div className="mt-0.5 max-h-20 overflow-y-auto break-all text-footnote text-secondary">
-            {error.message}
-          </div>
+          {active && (
+            <div className="mt-2.5">
+              <div className="h-1 overflow-hidden rounded-pill bg-sunken">
+                <div
+                  className="h-full rounded-pill bg-accent-fill transition-[width] duration-300 ease-ios"
+                  style={{
+                    width: progress
+                      ? `${Math.round(
+                          (progress.done / Math.max(progress.total, 1)) * 100,
+                        )}%`
+                      : "8%",
+                  }}
+                />
+              </div>
+              <div className="mt-1 text-footnote text-tertiary">
+                {progress
+                  ? `已落盘 ${progress.done} / ${progress.total} 张`
+                  : "正在请求图片…"}
+              </div>
+            </div>
+          )}
+
+          {error && job.status === "failed" && (
+            <div className="mt-2.5">
+              <button
+                type="button"
+                onClick={() => setErrorOpen((v) => !v)}
+                aria-expanded={errorOpen}
+                className="pressable flex w-full items-center gap-1.5 rounded-btn px-1 py-0.5 text-left text-footnote text-danger transition-colors hover:bg-danger/8"
+              >
+                <IconAlert size={13} />
+                <span className="truncate font-medium">
+                  {adapterErrorTitle(error)}
+                </span>
+                <IconChevron
+                  direction={errorOpen ? "down" : "right"}
+                  size={11}
+                  className="ml-auto shrink-0"
+                />
+              </button>
+              {errorOpen && (
+                <div className="mt-1 rounded-btn bg-danger/8 px-2.5 py-2">
+                  <div className="max-h-24 overflow-y-auto break-all text-footnote text-secondary">
+                    {error.message}
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => copy(error.message, "错误详情已复制")}
+                    className="pressable mt-1 flex h-6 items-center gap-1 rounded-chip px-1.5 text-caption text-secondary transition-colors hover:bg-hover hover:text-primary"
+                  >
+                    <IconCopy size={12} />
+                    复制错误
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
     </motion.li>
@@ -185,7 +330,6 @@ function JobRow({ job }: { job: QueueJob }) {
 
 export default function QueueView() {
   const jobs = useQueueStore((s) => s.jobs);
-  const counts = useQueueStore((s) => s.counts);
   const paused = useQueueStore((s) => s.paused);
   const concurrency = useQueueStore((s) => s.concurrency);
   const loaded = useQueueStore((s) => s.loaded);
@@ -195,32 +339,38 @@ export default function QueueView() {
   const clearFinished = useQueueStore((s) => s.clearFinished);
   const setView = useAppStore((s) => s.setView);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const [filter, setFilter] = useState<Filter>("all");
   useScrollEdge(scrollRef);
 
   useEffect(() => {
     load().catch((e) => toast(`加载队列失败：${String(e)}`, "error"));
   }, [load]);
 
-  const finished =
-    (counts.done ?? 0) +
-    (counts.failed ?? 0) +
-    (counts.canceled ?? 0) +
-    (counts.interrupted ?? 0);
-  const pending = (counts.queued ?? 0) + (counts.running ?? 0);
+  const counts = useMemo(() => {
+    const result: Record<Filter, number> = {
+      all: jobs.length,
+      pending: 0,
+      done: 0,
+      issue: 0,
+    };
+    for (const job of jobs) {
+      if (matchesFilter(job, "pending")) result.pending += 1;
+      if (matchesFilter(job, "done")) result.done += 1;
+      if (matchesFilter(job, "issue")) result.issue += 1;
+    }
+    return result;
+  }, [jobs]);
+
+  const finished = counts.done + counts.issue;
+  const visible = useMemo(
+    () => jobs.filter((job) => matchesFilter(job, filter)),
+    [jobs, filter],
+  );
 
   return (
-    <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-base">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <PageHeader
-        title={
-          <>
-            队列
-            {pending > 0 && (
-              <span className="ml-2 rounded-chip bg-accent-soft px-2 py-0.5 align-middle text-caption font-medium text-accent">
-                {pending}
-              </span>
-            )}
-          </>
-        }
+        title="队列"
         subtitle="生成任务按顺序执行，可随时暂停或重试"
         actions={
           <>
@@ -263,16 +413,45 @@ export default function QueueView() {
             )}
           </>
         }
+        footer={
+          <div className="flex flex-wrap items-center gap-1.5">
+            {FILTERS.map((item) => {
+              const selected = filter === item.id;
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  aria-pressed={selected}
+                  onClick={() => setFilter(selected ? "all" : item.id)}
+                  className={cn(
+                    "pressable flex h-7 items-center gap-1.5 rounded-pill px-3 text-callout transition-colors",
+                    selected
+                      ? "bg-accent-soft text-accent-text"
+                      : "bg-fill text-secondary hover:bg-hover hover:text-primary",
+                  )}
+                >
+                  {item.label}
+                  <span className="tabular text-footnote opacity-70">
+                    {counts[item.id]}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        }
       />
 
       <div
         ref={scrollRef}
         className="scroll-edge min-h-0 flex-1 overflow-y-auto"
       >
-        <div className="mx-auto max-w-3xl space-y-3 p-6">
-          {paused && pending > 0 && (
-            <div className="rounded-card border border-accent/25 bg-accent-soft px-4 py-3 text-callout leading-relaxed text-secondary">
-              队列已暂停：启动应用后不会自动执行，避免重启即产生费用。点击右上角「开始队列」继续。
+        <div className="mx-auto max-w-3xl space-y-3 px-4 py-4">
+          {paused && counts.pending > 0 && (
+            <div className="flex items-start gap-2 rounded-card bg-accent-soft px-3 py-2.5 text-callout leading-relaxed text-secondary">
+              <IconAlert size={14} className="mt-0.5 shrink-0 text-warning" />
+              <span>
+                队列已暂停：启动应用后不会自动执行，避免重启即产生费用。点击右上角「开始队列」继续。
+              </span>
             </div>
           )}
           {!loaded ? (
@@ -280,23 +459,27 @@ export default function QueueView() {
               加载中…
             </div>
           ) : jobs.length === 0 ? (
-            <div className="flex flex-col items-center gap-3 rounded-card border border-dashed border-line-strong p-14 text-center">
-              <span className="flex size-12 items-center justify-center rounded-pill bg-fill text-tertiary">
-                <IconQueue size={22} />
-              </span>
-              <div className="text-body text-tertiary">
-                队列还是空的：在聊天页输入提示词后点「加入队列」，可附带参考图并按需调整并发数。
-              </div>
+            <EmptyState
+              icon={<IconQueue size={22} strokeWidth={1.6} />}
+              title="队列还是空的"
+              description="在聊天页输入提示词后点「加入队列」，可附带参考图并按需调整并发数。"
+            >
               <Button size="sm" onClick={() => setView("chat")}>
                 去聊天页
               </Button>
+            </EmptyState>
+          ) : visible.length === 0 ? (
+            <div className="py-12 text-center text-footnote text-tertiary">
+              没有符合条件的任务
             </div>
           ) : (
-            <ul className="space-y-3">
-              {jobs.map((job) => (
-                <JobRow key={job.id} job={job} />
-              ))}
-            </ul>
+            <InsetList>
+              <ul>
+                {visible.map((job) => (
+                  <JobRow key={job.id} job={job} />
+                ))}
+              </ul>
+            </InsetList>
           )}
         </div>
       </div>

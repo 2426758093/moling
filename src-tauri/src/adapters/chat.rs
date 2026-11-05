@@ -341,6 +341,67 @@ pub const REVERSE_SYSTEM_PROMPT: &str = "\
 2. 输出一段高质量的英文文生图提示词（80 词以内），能高度还原这张图；
 3. 只输出提示词文本本身，不要任何解释、引号或 Markdown。";
 
+/// 会话标题：短、具象、不带引号，便于侧栏扫读
+pub const TITLE_SYSTEM_PROMPT: &str = "\
+你是一名会话标题编辑。用户会给出一段绘画请求，请为这段对话起一个简短标题：
+1. 6–14 个汉字（英文则 3–6 个单词），点明画面主体或意图；
+2. 不要引号、书名号、句号、冒号等标点，不要「标题：」前缀；
+3. 只输出标题本身，不要解释。";
+
+/// 提示词优化：补全视觉细节但保留用户原意与语言
+pub const OPTIMIZE_SYSTEM_PROMPT: &str = "\
+你是一名 AI 绘画提示词编辑。用户会给出一段绘画描述，请把它改写得更容易被文生图模型理解：
+1. 保留用户的主体、意图与语言（中文输入输出中文，可保留必要的英文风格词）；
+2. 补全缺失的场景、构图、光线、风格与质感细节，删掉互相矛盾的描述；
+3. 不要添加用户没有暗示的主体，不要写负向提示词；
+4. 只输出改写后的提示词，不要解释、引号或 Markdown，控制在 120 字以内。";
+
+/// 标题清洗：取首个非空行，去掉包裹引号与常见前缀，限长 24 字。
+pub fn sanitize_title(raw: &str) -> String {
+    let line = raw
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    let mut text = line.to_string();
+    for prefix in ["标题：", "标题:", "Title:", "title:"] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            text = rest.trim().to_string();
+        }
+    }
+    let trimmed = text.trim_matches(|c: char| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '"' | '\'' | '“' | '”' | '‘' | '’' | '《' | '》' | '「' | '」' | '。' | '.'
+            )
+    });
+    trimmed
+        .chars()
+        .take(24)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+pub async fn generate_title(
+    config: &ProviderConfig,
+    model: &str,
+    first_prompt: &str,
+) -> Result<String, AdapterError> {
+    let out = chat_complete_at(config, model, TITLE_SYSTEM_PROMPT, first_prompt, 0.3).await?;
+    Ok(sanitize_title(&out))
+}
+
+pub async fn optimize_prompt(
+    config: &ProviderConfig,
+    model: &str,
+    text: &str,
+) -> Result<String, AdapterError> {
+    let out = chat_complete_at(config, model, OPTIMIZE_SYSTEM_PROMPT, text, 0.5).await?;
+    Ok(out.trim().to_string())
+}
+
 pub const TRANSLATE_SYSTEM_PROMPT: &str = "\
 你是一名 AI 绘画提示词翻译。用户会给出中文或英文提示词，请把它翻译成目标语言：
 - 保留原有的风格词、英文关键词、权重标记与逗号分隔结构；
@@ -545,6 +606,20 @@ mod tests {
             decoder.feed(b"data: {\"error\":\"stream boom\"}\n\n"),
             vec![SseItem::Error("stream boom".into())]
         );
+    }
+
+    #[test]
+    fn sanitize_title_strips_wrapping_and_prefix() {
+        assert_eq!(sanitize_title("「橘猫宇航员」"), "橘猫宇航员");
+        assert_eq!(sanitize_title("标题：雨夜霓虹街头。"), "雨夜霓虹街头");
+        assert_eq!(
+            sanitize_title("\n\n  雪山金顶古寺  \n第二行"),
+            "雪山金顶古寺"
+        );
+        assert_eq!(sanitize_title("\"a cat in space\""), "a cat in space");
+        assert_eq!(sanitize_title("   "), "");
+        let long = "一".repeat(40);
+        assert_eq!(sanitize_title(&long).chars().count(), 24);
     }
 
     /// F-005：先产出增量再报错时，两类帧按顺序返回

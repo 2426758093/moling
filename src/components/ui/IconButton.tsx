@@ -18,16 +18,18 @@ interface IconButtonProps extends Omit<
   side?: "top" | "bottom" | "left" | "right";
 }
 
+// 28 / 32 —— 图标按钮比带字按钮略小一档，视觉重量才对得上
 const SIZE = {
-  sm: "h-8 w-8",
-  md: "h-9 w-9",
+  sm: "h-7 w-7",
+  md: "h-8 w-8",
 } as const;
 
 const VARIANT = {
   ghost: "text-secondary hover:bg-hover hover:text-primary",
   secondary:
-    "bg-fill text-secondary hover:bg-hover hover:text-primary border border-line",
-  primary: "bg-accent-fill text-on-accent hover:bg-accent-fill-hover",
+    "bg-elevated text-secondary shadow-card hover:bg-grouped hover:text-primary",
+  primary:
+    "bg-accent-fill text-on-accent inset-shadow-highlight hover:bg-accent-fill-hover",
   danger: "bg-danger text-on-accent hover:opacity-90",
 } as const;
 

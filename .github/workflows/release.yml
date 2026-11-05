@@ -61,12 +61,30 @@ jobs:
           pnpm format:check
           pnpm test
 
+      # 与 ci.yml 的 rust 任务保持一致；安装包失败要等 80 分钟才暴露，代价太高
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.22.2
+
+      - name: Rust 质量门禁
+        working-directory: src-tauri
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+          cargo test --locked
+          cargo audit
+
       - name: 校验 tag 与版本号一致
         env:
           TAG: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           VERSION=$(node -e "console.log(JSON.parse(require('fs').readFileSync('src-tauri/tauri.conf.json','utf8')).version)")
-          echo "tag=$TAG version=$VERSION"
+          PKG_VERSION=$(node -e "console.log(JSON.parse(require('fs').readFileSync('package.json','utf8')).version)")
+          echo "tag=$TAG version=$VERSION package.json=$PKG_VERSION"
+          if [ "$VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::tauri.conf.json ($VERSION) 与 package.json ($PKG_VERSION) 版本号不一致"
+            exit 1
+          fi
           if [ "$TAG" != "v$VERSION" ]; then
             echo "::error::tag $TAG 与版本号 v$VERSION 不一致，请先同步 tauri.conf.json 与 package.json"
             exit 1
@@ -85,6 +103,43 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: pnpm tauri build --config src-tauri/tauri.release.conf.json --bundles nsis
+
+      # GitHub 会悄悄剔除非 ASCII 资产名（墨灵_1.0.0_x64-setup.exe 被存成 _1.0.0_x64-setup.exe），
+      # 而 latest.json 记录的是本地文件名，导致客户端更新下载 404。清单生成前统一改为 ASCII。
+      - name: 规范化更新包文件名
+        run: |
+          cd src-tauri/target/release/bundle/nsis
+          shopt -s nullglob
+          # 只认含当前版本号的产物，防止旧构建残留被当成本次更新包
+          zips=( *"${VERSION}"*.nsis.zip )
+          exes=( *"${VERSION}"*-setup.exe )
+          if [ ${#zips[@]} -gt 0 ]; then
+            if [ ${#zips[@]} -gt 1 ]; then
+              echo "::error::发现多个更新包（${zips[*]}），请清理 bundle 目录后重试"
+              exit 1
+            fi
+            src="${zips[0]}"
+            dst="moling_${VERSION}_x64-setup.nsis.zip"
+          elif [ ${#exes[@]} -gt 0 ]; then
+            if [ ${#exes[@]} -gt 1 ]; then
+              echo "::error::发现多个安装包（${exes[*]}），请清理 bundle 目录后重试"
+              exit 1
+            fi
+            src="${exes[0]}"
+            dst="moling_${VERSION}_x64-setup.exe"
+          else
+            echo "::error::目录中没有含版本 $VERSION 的更新包（*.nsis.zip 或 *-setup.exe）"
+            exit 1
+          fi
+          if [ ! -f "$src.sig" ]; then
+            echo "::error::缺少签名文件 $src.sig"
+            exit 1
+          fi
+          if [ "$src" != "$dst" ]; then
+            mv "$src" "$dst"
+            mv "$src.sig" "$dst.sig"
+            echo "已重命名：$src → $dst"
+          fi
 
       - name: 生成更新清单
         run: |

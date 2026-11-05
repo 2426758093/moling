@@ -31,6 +31,7 @@ fn mock_req(prompt: &str) -> GenerateRequest {
         steps: None,
         seed: Some(42),
         count: 3,
+        quality: None,
         images: vec![],
         references: vec![],
     }
@@ -132,6 +133,28 @@ fn openai_size_snaps_to_supported_presets() {
     assert_eq!(snap_size(1024, 1024), "1024x1024");
     assert_eq!(snap_size(1360, 1024), "1536x1024");
     assert_eq!(snap_size(1024, 768), "1536x1024");
+}
+
+#[test]
+fn openai_auto_size_and_quality_mapping() {
+    use crate::adapters::openai::{is_auto_size, map_quality};
+    assert!(is_auto_size(0, 0));
+    assert!(!is_auto_size(0, 1024));
+    assert!(!is_auto_size(1024, 0));
+    assert_eq!(
+        map_quality("gpt-image-1", Some("high")),
+        Some("high".into())
+    );
+    assert_eq!(map_quality("gpt-image-1", Some("auto")), None);
+    assert_eq!(map_quality("gpt-image-1", None), None);
+    // DALL·E 3 只认 standard / hd
+    assert_eq!(map_quality("dall-e-3", Some("high")), Some("hd".into()));
+    assert_eq!(
+        map_quality("dall-e-3", Some("low")),
+        Some("standard".into())
+    );
+    // DALL·E 2 没有 quality 字段
+    assert_eq!(map_quality("dall-e-2", Some("high")), None);
 }
 
 #[test]

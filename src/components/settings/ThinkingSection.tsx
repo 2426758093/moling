@@ -46,8 +46,8 @@ export default function ThinkingSection() {
 
   return (
     <Section
-      title="思考模型"
-      description="生成前先用大模型理解意图、扩写提示词"
+      title="AI 助手"
+      description="复用文本模型：思考扩写、会话标题与提示词优化"
     >
       <Row label="启用思考模型">
         <Switch
@@ -165,6 +165,37 @@ export default function ThinkingSection() {
           </Row>
         </>
       )}
+
+      {/* 两个能力开关独立于思考模型展示，避免关掉思考后用户找不到入口 */}
+      <Row
+        label="自动生成会话标题"
+        hint={
+          config.enabled
+            ? "首条消息后由 AI 命名，不打断出图"
+            : "需先启用 AI 助手"
+        }
+      >
+        <Switch
+          checked={config.titleEnabled ?? true}
+          disabled={!config.enabled}
+          onCheckedChange={(v) => void save({ titleEnabled: v })}
+          label="自动生成会话标题"
+        />
+      </Row>
+
+      <Row
+        label="提示词优化助手"
+        hint={
+          config.enabled ? "在输入框的提示词助手里改写草稿" : "需先启用 AI 助手"
+        }
+      >
+        <Switch
+          checked={config.optimizeEnabled ?? true}
+          disabled={!config.enabled}
+          onCheckedChange={(v) => void save({ optimizeEnabled: v })}
+          label="提示词优化助手"
+        />
+      </Row>
     </Section>
   );
 }

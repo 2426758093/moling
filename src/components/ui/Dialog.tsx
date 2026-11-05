@@ -20,8 +20,8 @@ interface DialogProps {
 
 const SIZE = {
   sm: "max-w-[min(400px,100vw-48px)]",
-  md: "max-w-[min(520px,100vw-48px)]",
-  lg: "max-w-[min(720px,100vw-48px)]",
+  md: "max-w-[min(480px,100vw-48px)]",
+  lg: "max-w-[min(640px,100vw-48px)]",
 } as const;
 
 /// 浮层一律 portal 到 body：在 `relative` 容器内渲染遮罩会被父级 overflow 裁掉
@@ -39,18 +39,18 @@ export function Dialog({
   return (
     <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
       <DialogPrimitive.Portal>
-        <DialogPrimitive.Overlay className="anim-overlay fixed inset-0 z-40 bg-black/35" />
+        <DialogPrimitive.Overlay className="anim-overlay fixed inset-0 z-50 bg-scrim" />
         <DialogPrimitive.Content
           className={cn(
-            "anim-sheet fixed left-1/2 top-1/2 z-50 flex w-full -translate-x-1/2 -translate-y-1/2 flex-col",
-            "max-h-[calc(100vh-64px)] rounded-sheet border border-line bg-elevated shadow-sheet",
+            "anim-sheet fixed left-1/2 top-1/2 z-[51] flex w-full -translate-x-1/2 -translate-y-1/2 flex-col",
+            "max-h-[calc(100vh-64px)] rounded-sheet bg-elevated shadow-sheet",
             SIZE[size],
             className,
           )}
         >
           <header className="flex items-start justify-between gap-4 px-5 pt-4 pb-2">
             <div className="flex min-w-0 flex-col gap-1">
-              <DialogPrimitive.Title className="text-title3 text-primary">
+              <DialogPrimitive.Title className="text-title2 text-primary">
                 {title}
               </DialogPrimitive.Title>
               {description && (

@@ -11,7 +11,6 @@
 import { writeFileSync } from "node:fs";
 import {
   RELEASE_CONF,
-  assetUrl,
   resolveRepo,
   readVersion,
   releaseTag,
@@ -42,6 +41,6 @@ console.log(`  仓库   ${repo}`);
 console.log(`  版本   ${version}（tag ${releaseTag(version)}）`);
 console.log(`  端点   ${config.plugins.updater.endpoints[0]}`);
 console.log(
-  `  制品   ${assetUrl(repo, version, "墨灵_" + version + "_x64-setup.nsis.zip")}`,
+  `  制品   更新包文件名需为 ASCII（如 moling_${version}_x64-setup.exe），GitHub 会丢弃中文`,
 );
 console.log(`  输出   ${RELEASE_CONF}`);

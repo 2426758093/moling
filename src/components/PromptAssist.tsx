@@ -8,7 +8,9 @@ import {
   PresetRef,
   WorkflowPreset,
 } from "../lib/api";
-import { downloadBlob, readFileAsDataUrl, readFileAsText } from "../lib/file";
+import { readFileAsDataUrl, readFileAsText } from "../lib/file";
+import { saveTextFile } from "../lib/save";
+import { qualityLabel } from "../lib/presets";
 import { DUR, EASE } from "../lib/motion";
 import { toast } from "../lib/notify";
 import { useChatStore } from "../stores/chatStore";
@@ -73,6 +75,7 @@ const LIGHTS = [
 const pick = (arr: string[]) => arr[Math.floor(Math.random() * arr.length)];
 
 const TABS = [
+  { id: "optimize", label: "优化" },
   { id: "templates", label: "模板" },
   { id: "inspire", label: "灵感" },
   { id: "reverse", label: "反推" },
@@ -100,11 +103,12 @@ function parseTagInput(raw: string): string[] {
     .slice(0, 8);
 }
 
-function downloadJson(filename: string, data: unknown) {
-  const blob = new Blob([JSON.stringify(data, null, 2)], {
-    type: "application/json",
-  });
-  downloadBlob(blob, filename);
+async function downloadJson(filename: string, data: unknown): Promise<void> {
+  try {
+    await saveTextFile(JSON.stringify(data, null, 2), filename);
+  } catch {
+    toast("导出失败", "error");
+  }
 }
 
 function presetRefSummary(p: WorkflowPreset): string {
@@ -112,9 +116,18 @@ function presetRefSummary(p: WorkflowPreset): string {
     const v = JSON.parse(p.paramsJson);
     const parts: string[] = [];
     if (typeof v?.ratio === "string")
-      parts.push(v.ratio === "custom" ? "自定义" : v.ratio);
-    if (typeof v?.width === "number" && typeof v?.height === "number") {
+      parts.push(
+        v.ratio === "custom" ? "自定义" : v.ratio === "auto" ? "自动" : v.ratio,
+      );
+    if (
+      typeof v?.width === "number" &&
+      typeof v?.height === "number" &&
+      (v.width > 0 || v.height > 0)
+    ) {
       parts.push(`${v.width}×${v.height}`);
+    }
+    if (typeof v?.quality === "string" && v.quality !== "auto") {
+      parts.push(`质量 ${qualityLabel(v.quality)}`);
     }
     if (p.refs.length > 0) parts.push(`${p.refs.length} 参考图`);
     return parts.join(" · ");
@@ -171,6 +184,11 @@ export default function PromptAssist({
   const [presetName, setPresetName] = useState("");
   const [presetBusy, setPresetBusy] = useState(false);
   const presetFileRef = useRef<HTMLInputElement>(null);
+
+  // 优化
+  const [optimizeBusy, setOptimizeBusy] = useState(false);
+  const [optimizeError, setOptimizeError] = useState<AdapterError | null>(null);
+  const [optimizeResult, setOptimizeResult] = useState("");
 
   // 翻译
   const [translateBusy, setTranslateBusy] = useState(false);
@@ -258,7 +276,7 @@ export default function PromptAssist({
       toast("还没有可导出的收藏", "error");
       return;
     }
-    downloadJson(`moling_favorites_${Date.now()}.json`, {
+    void downloadJson(`moling_favorites_${Date.now()}.json`, {
       version: 1,
       type: "moling-favorites",
       favorites: favorites.map((f) => ({
@@ -319,6 +337,7 @@ export default function PromptAssist({
           ratio: prefs.ratio,
           width: prefs.width,
           height: prefs.height,
+          quality: prefs.quality,
           style: prefs.style,
           count: prefs.count,
         },
@@ -374,7 +393,7 @@ export default function PromptAssist({
         updatedAt: p.updatedAt,
       });
     }
-    downloadJson(`moling_presets_${Date.now()}.json`, {
+    void downloadJson(`moling_presets_${Date.now()}.json`, {
       version: 1,
       type: "moling-presets",
       presets: out,
@@ -448,6 +467,26 @@ export default function PromptAssist({
     }
   };
 
+  const doOptimize = async () => {
+    const text = draft.trim();
+    if (!text) return;
+    setOptimizeBusy(true);
+    setOptimizeError(null);
+    setOptimizeResult("");
+    try {
+      const r = await api.optimizePrompt(text);
+      if (r.ok && r.optimized) {
+        setOptimizeResult(r.optimized);
+      } else if (r.error) {
+        setOptimizeError(r.error);
+      }
+    } catch (e) {
+      setOptimizeError({ type: "other", message: String(e) });
+    } finally {
+      setOptimizeBusy(false);
+    }
+  };
+
   const doTranslate = async () => {
     const text = draft.trim();
     if (!text) return;
@@ -501,6 +540,55 @@ export default function PromptAssist({
       </div>
 
       <div className="max-h-72 overflow-y-auto p-3">
+        {tab === "optimize" && (
+          <div className="space-y-2.5">
+            <div className="rounded-btn bg-fill px-3 py-2 text-footnote leading-snug text-secondary">
+              {draft.trim() || "先在输入框写好提示词，再回来优化"}
+            </div>
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-caption text-tertiary">
+                补全场景、构图、光线与质感，保留原意
+                {!draft.trim() && "（需要先输入内容）"}
+              </span>
+              <Button
+                size="sm"
+                icon={<IconSparkle size={13} />}
+                disabled={!draft.trim() || optimizeBusy}
+                onClick={() => void doOptimize()}
+              >
+                {optimizeBusy ? "优化中…" : "优化"}
+              </Button>
+            </div>
+            {optimizeError && (
+              <div className="text-footnote leading-snug text-danger">
+                {adapterErrorTitle(optimizeError)}
+                <div className="mt-0.5 break-all text-caption text-tertiary">
+                  {optimizeError.message}
+                </div>
+              </div>
+            )}
+            {optimizeResult && !optimizeBusy && (
+              <>
+                <Textarea
+                  value={optimizeResult}
+                  onChange={(e) => setOptimizeResult(e.target.value)}
+                  rows={3}
+                  compact
+                  aria-label="优化结果"
+                />
+                <Button
+                  size="sm"
+                  variant="primary"
+                  block
+                  onClick={() => applyText(optimizeResult)}
+                >
+                  填入输入框
+                </Button>
+              </>
+            )}
+          </div>
+        )}
+
         {tab === "templates" && (
           <div className="space-y-3">
             <div className="grid grid-cols-2 gap-1.5">
@@ -698,7 +786,7 @@ export default function PromptAssist({
                   onClick={() => setFavTagFilter("")}
                   className={`pressable rounded-pill px-2 py-0.5 text-caption transition-colors ${
                     favTagFilter === ""
-                      ? "bg-accent-soft text-accent"
+                      ? "bg-accent-soft text-accent-text"
                       : "bg-fill text-tertiary hover:text-secondary"
                   }`}
                 >
@@ -712,7 +800,7 @@ export default function PromptAssist({
                     }
                     className={`pressable rounded-pill px-2 py-0.5 text-caption transition-colors ${
                       favTagFilter === tag
-                        ? "bg-accent-soft text-accent"
+                        ? "bg-accent-soft text-accent-text"
                         : "bg-fill text-tertiary hover:text-secondary"
                     }`}
                   >

@@ -13,7 +13,7 @@ export function Skeleton({
       {Array.from({ length: count }, (_, i) => (
         <div
           key={i}
-          className={cn("shimmer rounded-card bg-sunken", className)}
+          className={cn("skeleton-pulse rounded-card bg-sunken", className)}
         />
       ))}
     </>

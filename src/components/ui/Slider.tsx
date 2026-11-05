@@ -44,8 +44,8 @@ export function Slider({
       {/* 旋钮是内容层里唯一允许的玻璃例外：拖动期间呈现玻璃质感 */}
       <SliderPrimitive.Thumb
         className={cn(
-          "thumb-glass block h-4 w-4 rounded-pill border border-line bg-elevated shadow-card transition-transform",
-          "active:scale-110",
+          "thumb-glass block h-4 w-4 rounded-pill bg-elevated shadow-card ring-1 ring-line transition-transform",
+          "hover:scale-105 active:scale-110",
         )}
       />
     </SliderPrimitive.Root>

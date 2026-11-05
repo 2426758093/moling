@@ -14,6 +14,16 @@ pub struct ThinkingConfig {
     /// 密文非空但解密失败（密钥损坏/主密钥变化），前端据此提示重新填写
     #[serde(default)]
     pub key_error: bool,
+    /// 首条消息后自动生成会话标题（复用同一文本模型）
+    #[serde(default = "default_true")]
+    pub title_enabled: bool,
+    /// 输入框提示词优化助手
+    #[serde(default = "default_true")]
+    pub optimize_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 const THINKING_CONFIG_KEY: &str = "thinkingConfig";
@@ -49,6 +59,8 @@ fn read_thinking_config() -> Result<(ThinkingConfig, String), String> {
             model: value["model"].as_str().unwrap_or_default().to_string(),
             api_key_masked: masked,
             key_error,
+            title_enabled: value["titleEnabled"].as_bool().unwrap_or(true),
+            optimize_enabled: value["optimizeEnabled"].as_bool().unwrap_or(true),
         },
         api_key_enc,
     ))
@@ -69,6 +81,8 @@ pub(crate) fn backup_value() -> serde_json::Value {
             "providerId": cfg.provider_id,
             "baseUrl": cfg.base_url,
             "model": cfg.model,
+            "titleEnabled": cfg.title_enabled,
+            "optimizeEnabled": cfg.optimize_enabled,
         }),
         Err(e) => {
             tracing::warn!("导出：思考模型配置读取失败，按未配置导出: {}", e);
@@ -78,6 +92,8 @@ pub(crate) fn backup_value() -> serde_json::Value {
                 "providerId": null,
                 "baseUrl": "",
                 "model": "",
+                "titleEnabled": true,
+                "optimizeEnabled": true,
             })
         }
     }
@@ -100,6 +116,8 @@ pub async fn save_thinking_config(
         "baseUrl": config.base_url,
         "apiKeyEnc": api_key_enc,
         "model": config.model,
+        "titleEnabled": config.title_enabled,
+        "optimizeEnabled": config.optimize_enabled,
     });
     storage::set_setting(THINKING_CONFIG_KEY, &value.to_string())?;
     // 脱敏后返回
@@ -459,6 +477,89 @@ pub async fn reverse_prompt(image_b64: String) -> Result<serde_json::Value, Stri
     };
     match result {
         Ok(text) => Ok(serde_json::json!({ "ok": true, "prompt": text })),
+        Err(e) => Ok(serde_json::json!({
+            "ok": false,
+            "error": e,
+        })),
+    }
+}
+
+/// 首条消息后异步生成会话标题。未启用 / 未配置时静默跳过，
+/// 不弹错——标题只是锦上添花，不能打断出图主流程。
+#[tauri::command]
+pub async fn generate_conversation_title(
+    conversation_id: i64,
+    prompt: String,
+) -> Result<serde_json::Value, String> {
+    let first = prompt.trim();
+    if first.is_empty() {
+        return Ok(serde_json::json!({ "ok": false, "skipped": true }));
+    }
+    let (cfg, _) = read_thinking_config()?;
+    if !cfg.enabled || !cfg.title_enabled {
+        return Ok(serde_json::json!({ "ok": false, "skipped": true }));
+    }
+    let Some((config, model)) = resolve_thinking_provider()? else {
+        return Ok(serde_json::json!({ "ok": false, "skipped": true }));
+    };
+    let result = if config.kind == adapters::KIND_MOCK {
+        Ok(first.chars().take(12).collect::<String>())
+    } else {
+        adapters::chat::generate_title(&config, &model, first).await
+    };
+    match result {
+        Ok(title) if !title.is_empty() => {
+            let updated = storage::update_conversation_title(conversation_id, &title)?;
+            Ok(serde_json::json!({ "ok": true, "title": title, "updated": updated }))
+        }
+        Ok(_) => Ok(serde_json::json!({ "ok": false, "skipped": true })),
+        Err(e) => {
+            tracing::warn!("生成会话标题失败: {}", e);
+            Ok(serde_json::json!({ "ok": false, "error": e }))
+        }
+    }
+}
+
+/// 提示词优化：把当前草稿改写成更易被模型理解的提示词。
+#[tauri::command]
+pub async fn optimize_prompt(text: String) -> Result<serde_json::Value, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": { "type": "other", "message": "请先输入要优化的提示词" },
+        }));
+    }
+    let (cfg, _) = read_thinking_config()?;
+    if !cfg.enabled || !cfg.optimize_enabled {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": { "type": "other", "message": "提示词优化助手未启用，请在「设置 → 生成 → AI 助手」中开启" },
+        }));
+    }
+    let Some((config, model)) = resolve_thinking_provider()? else {
+        return Ok(serde_json::json!({
+            "ok": false,
+            "error": { "type": "other", "message": "请先在「设置 → 生成 → AI 助手」中启用并配置模型" },
+        }));
+    };
+    let result = if config.kind == adapters::KIND_MOCK {
+        Ok(format!(
+            "(mock 优化) {}，柔和光线，精细构图，高质量细节",
+            trimmed
+        ))
+    } else {
+        adapters::chat::optimize_prompt(&config, &model, trimmed).await
+    };
+    match result {
+        Ok(optimized) if !optimized.trim().is_empty() => Ok(serde_json::json!({
+            "ok": true,
+            "optimized": optimized.trim(),
+        })),
+        Ok(_) => Ok(serde_json::json!({
+            "ok": false,
+            "error": { "type": "other", "message": "模型返回空内容，请重试" },
+        })),
         Err(e) => Ok(serde_json::json!({
             "ok": false,
             "error": e,

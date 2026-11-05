@@ -104,7 +104,7 @@ pub struct HistoryRow {
     /// 派生图的父记录（放大 / 风格 / 编辑 / 画布导出）；原创为 None
     #[serde(default)]
     pub parent_id: Option<i64>,
-    /// generate | edit | erase | outpaint | upscale | style | background | basic-edit | canvas
+    /// generate | edit | erase | outpaint | upscale | style | background | basic-edit | canvas | paste
     #[serde(default = "default_op")]
     pub op: String,
 }
@@ -2723,6 +2723,16 @@ pub fn create_conversation(title: &str) -> AppResult<i64> {
         params![title, timestamp_millis()],
     )?;
     Ok(c.last_insert_rowid())
+}
+
+/// 会话标题回写（AI 自动命名）。会话不存在时返回 false，不当作错误。
+pub fn update_conversation_title(id: i64, title: &str) -> AppResult<bool> {
+    let c = conn()?;
+    let affected = c.execute(
+        "UPDATE conversations SET title = ?1 WHERE id = ?2",
+        params![title, id],
+    )?;
+    Ok(affected > 0)
 }
 
 pub fn list_conversations() -> AppResult<Vec<ConversationRow>> {

@@ -20,8 +20,8 @@ export function Section({
     <section className={cn("flex flex-col gap-3", className)}>
       {(title || action) && (
         <header className="flex items-end justify-between gap-3">
-          <div className="flex flex-col gap-1">
-            {title && <h2 className="text-title2 text-primary">{title}</h2>}
+          <div className="flex flex-col gap-0.5">
+            {title && <h2 className="text-headline text-primary">{title}</h2>}
             {description && (
               <p className="text-subhead text-tertiary">{description}</p>
             )}
@@ -29,10 +29,30 @@ export function Section({
           {action}
         </header>
       )}
-      <div className="overflow-hidden rounded-panel border border-line bg-elevated">
+      <div className="overflow-hidden rounded-card bg-elevated shadow-card">
         {children}
       </div>
     </section>
+  );
+}
+
+/// 紧凑合并卡：多条短记录（队列、历史）共用一张内容面，行间由分隔线区隔。
+export function InsetList({
+  children,
+  className,
+}: {
+  children: ReactNode;
+  className?: string;
+}) {
+  return (
+    <div
+      className={cn(
+        "overflow-hidden rounded-card bg-elevated shadow-card",
+        className,
+      )}
+    >
+      {children}
+    </div>
   );
 }
 
@@ -53,8 +73,9 @@ export function Row({
   return (
     <div
       className={cn(
-        "flex min-h-14 items-center justify-between gap-4 px-4 py-2",
-        "border-b border-separator last:border-b-0",
+        "relative flex min-h-11 items-center justify-between gap-4 px-3 py-2",
+        // 分隔线内缩 12px：卡片边缘保持干净，只看得到行与行之间的细线
+        "after:pointer-events-none after:absolute after:inset-x-3 after:bottom-0 after:h-px after:bg-separator last:after:hidden",
         className,
       )}
     >

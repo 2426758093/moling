@@ -14,6 +14,26 @@ beforeEach(() => {
   });
 });
 
+describe("Composer 输入坞焦点环", () => {
+  it("聚焦输入框时输入坞出现焦点环，失焦后移除", () => {
+    render(
+      <TooltipProvider>
+        <Composer />
+      </TooltipProvider>,
+    );
+    const textarea = screen.getByLabelText("提示词") as HTMLTextAreaElement;
+    const dock = textarea.parentElement as HTMLElement;
+    expect(dock.className).toContain("outline-none");
+
+    fireEvent.focusIn(textarea);
+    expect(dock.className).toContain("outline-2");
+    expect(dock.className).not.toContain("outline-none");
+
+    fireEvent.focusOut(textarea);
+    expect(dock.className).toContain("outline-none");
+  });
+});
+
 describe("Composer 发送未受理时回填草稿（F-008）", () => {
   it("send 返回 false 时输入框恢复原文", async () => {
     const send = vi.fn(async () => false);

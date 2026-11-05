@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useCanvasStore } from "../stores/canvasStore";
-import { SegmentedControl } from "./ui/SegmentedControl";
 import { Select } from "./ui/Select";
+import { Badge } from "./ui/Badge";
 import { Button } from "./ui/Button";
 import { IconButton } from "./ui/IconButton";
 import { Dialog, ConfirmDialog } from "./ui/Dialog";
@@ -10,7 +10,7 @@ import { DropdownMenu, MenuItem } from "./ui/Menu";
 import PageHeader from "./PageHeader";
 import CanvasBoard from "./CanvasBoard";
 import CanvasAddDialog from "./CanvasAddDialog";
-import { IconBrush, IconChevron, IconLink, IconPlus, IconTrash } from "./Icons";
+import { IconBrush, IconChevron, IconPlus, IconTrash } from "./Icons";
 
 function NameDialog({
   title,
@@ -84,7 +84,6 @@ export default function CanvasView() {
   const activeId = useCanvasStore((s) => s.activeId);
   const activeName = useCanvasStore((s) => s.activeName);
   const nodeCount = useCanvasStore((s) => s.nodes.length);
-  const zoom = useCanvasStore((s) => s.viewport.zoom);
   const dirty = useCanvasStore((s) => s.dirty);
   const saving = useCanvasStore((s) => s.saving);
   const createBoard = useCanvasStore((s) => s.createBoard);
@@ -97,7 +96,6 @@ export default function CanvasView() {
   const [renameOpen, setRenameOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [wireMode, setWireMode] = useState(false);
-  const [fitSignal, setFitSignal] = useState(0);
 
   useEffect(() => {
     void ensureLoaded();
@@ -131,13 +129,26 @@ export default function CanvasView() {
   ];
 
   return (
-    <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-base">
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <PageHeader
         title="画布"
         subtitle={
-          activeId != null
-            ? `${activeName} · ${nodeCount} 个节点${status ? ` · ${status}` : ""}`
-            : "把作品放到一张无限画布上，再从节点进入编辑"
+          activeId != null ? (
+            <span className="flex items-center gap-2">
+              <span className="truncate">
+                {activeName} · {nodeCount} 个节点
+              </span>
+              {status && (
+                <Badge
+                  tone={saving ? "neutral" : dirty ? "warning" : "success"}
+                >
+                  {status}
+                </Badge>
+              )}
+            </span>
+          ) : (
+            "把作品放到一张无限画布上，再从节点进入编辑"
+          )
         }
         actions={
           <>
@@ -152,17 +163,16 @@ export default function CanvasView() {
                   label: b.name,
                 }))}
                 label="切换画布"
-                variant="bare"
-                widthClass="w-40"
+                variant="chip"
+                widthClass="w-32"
               />
             )}
-            <Button
+            <IconButton
+              label="新建画布"
               size="sm"
               icon={<IconPlus size={14} />}
               onClick={() => setCreateOpen(true)}
-            >
-              新建
-            </Button>
+            />
             {activeId != null && (
               <DropdownMenu items={moreItems} align="end">
                 <IconButton
@@ -183,40 +193,11 @@ export default function CanvasView() {
             </Button>
           </>
         }
-        footer={
-          <div className="flex flex-wrap items-center gap-2">
-            <SegmentedControl
-              value={wireActive ? "wire" : "move"}
-              onValueChange={(v) => setWireMode(v === "wire")}
-              label="画布模式"
-              size="sm"
-              options={[
-                { value: "move", label: "浏览" },
-                {
-                  value: "wire",
-                  label: "连线",
-                  icon: <IconLink size={13} />,
-                  disabled: nodeCount < 2,
-                },
-              ]}
-            />
-            <Button size="sm" onClick={() => setFitSignal((n) => n + 1)}>
-              适应视图
-            </Button>
-            <span className="text-footnote text-tertiary">
-              缩放 {Math.round(zoom * 100)}%
-            </span>
-            <span className="ml-auto hidden text-footnote text-quaternary compact:block">
-              拖动空白处平移 · 滚轮缩放 · 选中连线后 Delete 删除
-            </span>
-          </div>
-        }
       />
 
       <CanvasBoard
         wireMode={wireActive}
         onWireModeChange={(on) => setWireMode(on)}
-        fitSignal={fitSignal}
         onAddImage={() => setAddOpen(true)}
       />
 

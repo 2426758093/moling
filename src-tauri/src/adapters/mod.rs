@@ -29,6 +29,9 @@ pub struct GenerateRequest {
     pub steps: Option<u32>,
     pub seed: Option<u64>,
     pub count: u32,
+    /// 质量档位（low / medium / high）；None = auto，不发送该字段
+    #[serde(default)]
+    pub quality: Option<String>,
     /// 参考图（base64，无 data-url 前缀），随 multipart 上送
     pub images: Vec<String>,
     /// 与 `images` 按位置对应的角色 / 强度；只用于提示词级说明与模板变量

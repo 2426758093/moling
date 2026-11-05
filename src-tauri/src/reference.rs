@@ -14,6 +14,8 @@ pub enum ReferenceRole {
     Style,
     Face,
     Element,
+    /// 对话上下文：上一轮生成结果，仅由聊天追问自动带入
+    Previous,
 }
 
 impl ReferenceRole {
@@ -23,6 +25,7 @@ impl ReferenceRole {
             Self::Style => "style",
             Self::Face => "face",
             Self::Element => "element",
+            Self::Previous => "previous",
         }
     }
 
@@ -32,6 +35,7 @@ impl ReferenceRole {
             Self::Style => "match this image's visual style and palette",
             Self::Face => "preserve the face identity from this image",
             Self::Element => "include the key elements from this image",
+            Self::Previous => "use this image as the current result to continue from",
         }
     }
 }
@@ -128,6 +132,18 @@ mod tests {
     #[test]
     fn guidance_is_a_noop_without_references() {
         assert_eq!(append_reference_guidance("a cat", &[]), "a cat");
+    }
+
+    /// 对话追问自动带入的上一轮画面：独立角色，措辞明确是「继续修改当前结果」
+    #[test]
+    fn previous_role_is_serializable_and_carries_continuation_guidance() {
+        let spec: ReferenceSpec =
+            serde_json::from_str(r#"{"role":"previous","strength":60}"#).unwrap();
+        assert_eq!(spec.role, ReferenceRole::Previous);
+
+        let out = append_reference_guidance("把背景换成蓝色", &[spec]);
+        assert!(out.contains("Reference 1 (previous, moderate)"));
+        assert!(out.contains("current result to continue from"));
     }
 
     #[test]

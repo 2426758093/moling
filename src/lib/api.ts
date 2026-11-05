@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ReferenceRole } from "./types";
+import type { ImageQuality, ReferenceRole } from "./types";
 
 export interface ProviderInput {
   id?: number | null;
@@ -220,6 +220,8 @@ export interface EnqueueJobInput {
   steps?: number | null;
   seed?: number | null;
   count: number;
+  /** 图片质量快照；auto/省略 = 不发送 quality 字段 */
+  quality?: ImageQuality | null;
   /** 已落盘（refs/）的参考图路径，按位置与 references 对齐 */
   referencePaths?: string[];
   references?: { role: ReferenceRole; strength: number }[];
@@ -229,6 +231,7 @@ export interface EnqueueJobInput {
 export interface QueueJobExtras {
   referencePaths?: string[];
   references?: { role: ReferenceRole; strength: number }[];
+  quality?: ImageQuality | null;
 }
 
 export interface AvailableUpdate {
@@ -369,6 +372,8 @@ export const api = {
     seed?: number | null;
     style: string;
     count: number;
+    /** 图片质量；auto/省略 = 不发送 quality 字段 */
+    quality?: ImageQuality | null;
     images?: string[];
     /// 与 images 按位置对应；只在专家模式下发（省略即不追加角色说明）
     references?: { role: ReferenceRole; strength: number }[];
@@ -496,9 +501,28 @@ export const api = {
       "get_history_image",
       { id },
     ),
+  /** 原图另存为；paramsText 非空时在同目录写同名 .txt 参数清单 */
+  saveHistoryImage: (id: number, dest: string, paramsText?: string | null) =>
+    invoke<void>("save_history_image", { id, dest, paramsText }),
+  /** 打包导出：Rust 侧 zip，避免把整包 base64 走一遍 IPC */
+  exportHistoryZip: (
+    entries: { historyId: number; params: Record<string, unknown> }[],
+    dest: string,
+  ) =>
+    invoke<{ saved: number; skipped: number }>("export_history_zip", {
+      entries,
+      dest,
+    }),
+  writeTextFile: (dest: string, content: string) =>
+    invoke<void>("write_text_file", { dest, content }),
+  writeFileBase64: (dest: string, data: string) =>
+    invoke<void>("write_file_base64", { dest, data }),
   /** 画廊记录元信息（画布节点复用参数 / 编辑浮层提示词） */
   getHistoryItem: (id: number) =>
     invoke<HistoryItem["history"] | null>("get_history_item", { id }),
+  /** 画布粘贴：把剪贴板图片入库并返回新的 historyId */
+  importImage: (dataUrl: string) =>
+    invoke<{ historyId: number; dataUrl: string }>("import_image", { dataUrl }),
   setFavorite: (id: number, favorite: boolean) =>
     invoke<void>("set_favorite", { id, favorite }),
   deleteHistory: (id: number) => invoke<void>("delete_history", { id }),
@@ -610,6 +634,21 @@ export const api = {
       direction?: "zh2en" | "en2zh";
       error?: AdapterError;
     }>("translate_prompt", { text }),
+  /** 首条消息后生成会话标题；未启用时 ok=false + skipped=true */
+  generateConversationTitle: (conversationId: number, prompt: string) =>
+    invoke<{
+      ok: boolean;
+      title?: string;
+      updated?: boolean;
+      skipped?: boolean;
+      error?: AdapterError;
+    }>("generate_conversation_title", { conversationId, prompt }),
+  /** 提示词优化：在保留原意的前提下补全视觉细节 */
+  optimizePrompt: (text: string) =>
+    invoke<{ ok: boolean; optimized?: string; error?: AdapterError }>(
+      "optimize_prompt",
+      { text },
+    ),
   listFavorites: () => invoke<PromptFavorite[]>("list_favorites"),
   upsertFavorite: (text: string, tags: string[]) =>
     invoke<PromptFavorite>("upsert_favorite", { text, tags }),
@@ -645,6 +684,10 @@ export interface ThinkingConfig {
   baseUrl: string;
   model: string;
   apiKeyMasked?: string | null;
+  /** 首条消息后自动生成会话标题 */
+  titleEnabled?: boolean;
+  /** 输入框提示词优化助手 */
+  optimizeEnabled?: boolean;
 }
 
 export interface Conversation {

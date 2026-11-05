@@ -15,17 +15,19 @@ interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 /// primary 是实心强调色底 —— 同一屏只允许出现一个，且文字必须用 text-on-accent
 /// （白色压在 --accent 上只有 3.4:1，所以底色走更深的 --accent-fill）。
 const VARIANT: Record<ButtonVariant, string> = {
+  // 顶部高光让填充色有实体感；hover 只提亮一档，不做位移动画
   primary:
-    "bg-accent-fill text-on-accent hover:bg-accent-fill-hover active:bg-accent-fill-hover",
-  secondary: "bg-fill text-primary hover:bg-hover border border-line",
+    "bg-accent-fill text-on-accent inset-shadow-highlight hover:bg-accent-fill-hover",
+  secondary: "bg-elevated text-primary shadow-card hover:bg-grouped",
   ghost: "text-secondary hover:bg-hover hover:text-primary",
-  danger: "bg-danger/12 text-danger border border-danger/25 hover:bg-danger/18",
+  danger: "bg-danger/12 text-danger ring-1 ring-danger/25 hover:bg-danger/18",
 };
 
+// 28 / 32 / 36，默认 32（h-8）承载 13px UI 文字
 const SIZE: Record<ButtonSize, string> = {
-  sm: "h-8 px-3 text-subhead",
-  md: "h-9 px-4 text-callout",
-  lg: "h-10 px-4 text-body",
+  sm: "h-7 px-2.5 text-subhead",
+  md: "h-8 px-3 text-callout",
+  lg: "h-9 px-3.5 text-callout",
 };
 
 export const Button = forwardRef<HTMLButtonElement, ButtonProps>(

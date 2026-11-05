@@ -3,10 +3,18 @@ import {
   GlassAppearance,
   ThemeMode,
   UiMode,
+  ImageQuality,
   RATIO_OPTIONS,
 } from "../lib/types";
 import { api } from "../lib/api";
 import { toast } from "../lib/notify";
+import {
+  applyReduceTransparency,
+  readAppearanceMirror,
+  writeGlassMirror,
+  writeThemeMirror,
+  writeTransparencyMirror,
+} from "../lib/theme";
 
 export type AppView = "chat" | "gallery" | "canvas" | "queue" | "settings";
 
@@ -16,6 +24,8 @@ export interface GenPrefs {
   height: number;
   style: string;
   count: number;
+  /** 图片质量；auto = 不发送 quality 字段 */
+  quality: ImageQuality;
   negativePrompt: string;
 }
 
@@ -60,8 +70,11 @@ interface AppState {
   view: AppView;
   theme: ThemeMode;
   glass: GlassAppearance;
+  reduceTransparency: boolean;
   mode: UiMode;
   sidebarCollapsed: boolean;
+  paletteOpen: boolean;
+  shortcutsOpen: boolean;
   prefs: GenPrefs;
   editTarget: EditTarget | null;
   outpaintTarget: OutpaintTarget | null;
@@ -71,8 +84,11 @@ interface AppState {
   setView: (view: AppView) => void;
   setTheme: (theme: ThemeMode) => void;
   setGlass: (glass: GlassAppearance) => void;
+  setReduceTransparency: (on: boolean) => void;
   setMode: (mode: UiMode) => void;
   toggleSidebar: () => void;
+  setPaletteOpen: (open: boolean) => void;
+  setShortcutsOpen: (open: boolean) => void;
   setPrefs: (patch: Partial<GenPrefs>) => void;
   applyRatio: (ratioId: string) => void;
   applyCustomSize: (width: number, height: number) => void;
@@ -109,14 +125,18 @@ export const useAppStore = create<AppState>((set) => ({
   view: "chat",
   theme: "system",
   glass: "standard",
+  reduceTransparency: readAppearanceMirror().transparency ?? false,
   mode: "expert",
   sidebarCollapsed: false,
+  paletteOpen: false,
+  shortcutsOpen: false,
   prefs: {
     ratio: "1:1",
     width: BASE,
     height: BASE,
     style: "",
     count: 1,
+    quality: "auto",
     negativePrompt: "",
   },
   editTarget: null,
@@ -127,6 +147,8 @@ export const useAppStore = create<AppState>((set) => ({
   setView: (view) => set({ view }),
   setTheme: (theme) => {
     set({ theme });
+    // 镜像先写：下一帧的首屏靠 localStorage，不等 SQLite
+    writeThemeMirror(theme);
     // 主题是纯本机偏好：先切 UI 再落库，写失败只提示不阻断（下次启动回退 system）
     void api
       .setSetting("theme", theme)
@@ -134,9 +156,16 @@ export const useAppStore = create<AppState>((set) => ({
   },
   setGlass: (glass) => {
     set({ glass });
+    writeGlassMirror(glass);
     void api
       .setSetting("glassAppearance", glass)
       .catch((e) => toast(`保存玻璃质感失败：${String(e)}`, "error"));
+  },
+  setReduceTransparency: (on) => {
+    // 只落 localStorage —— 纯显示偏好，不进 Rust 设置白名单
+    set({ reduceTransparency: on });
+    writeTransparencyMirror(on);
+    applyReduceTransparency(on);
   },
   setMode: (mode) => {
     set({ mode });
@@ -145,11 +174,19 @@ export const useAppStore = create<AppState>((set) => ({
       .catch((e) => toast(`保存界面模式失败：${String(e)}`, "error"));
   },
   toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
+  setPaletteOpen: (paletteOpen) => set({ paletteOpen }),
+  setShortcutsOpen: (shortcutsOpen) => set({ shortcutsOpen }),
   setPrefs: (patch) => set((s) => ({ prefs: { ...s.prefs, ...patch } })),
   applyRatio: (ratioId) =>
     set((s) => {
       const r = RATIO_OPTIONS.find((o) => o.id === ratioId);
       if (!r) return s;
+      // 自动尺寸用 0×0 表示：后端据此省略 size 字段
+      if (r.w === 0 || r.h === 0) {
+        return {
+          prefs: { ...s.prefs, ratio: ratioId, width: 0, height: 0 },
+        };
+      }
       const scale = BASE / Math.max(r.w, r.h);
       return {
         prefs: {

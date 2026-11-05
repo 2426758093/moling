@@ -44,7 +44,7 @@ export default function ProviderCard({
               {KIND_OPTIONS.find((k) => k.id === p.kind)?.label ?? p.kind}
             </span>
             {isDefault && (
-              <span className="rounded-chip bg-accent-soft px-1.5 py-0.5 text-caption text-accent">
+              <span className="rounded-chip bg-accent-soft px-1.5 py-0.5 text-caption text-accent-text">
                 默认
               </span>
             )}

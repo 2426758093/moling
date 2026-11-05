@@ -27,16 +27,16 @@ export function Switch({
       disabled={disabled}
       aria-label={label}
       className={cn(
-        "relative h-6 w-10 shrink-0 rounded-pill border border-transparent transition-colors",
-        checked ? "bg-success" : "bg-fill",
+        "relative h-5 w-9 shrink-0 rounded-pill transition-colors",
+        checked ? "bg-success-fill" : "bg-fill",
         disabled && "cursor-not-allowed opacity-40",
         className,
       )}
     >
       <SwitchPrimitive.Thumb
         className={cn(
-          "block h-5 w-5 rounded-pill bg-elevated shadow-card transition-transform",
-          checked ? "translate-x-[18px]" : "translate-x-0.5",
+          "my-0.5 block h-4 w-4 rounded-pill bg-elevated shadow-card transition-transform",
+          "data-[state=checked]:translate-x-4 data-[state=unchecked]:translate-x-0.5",
         )}
       />
     </SwitchPrimitive.Root>

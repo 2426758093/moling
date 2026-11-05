@@ -152,8 +152,13 @@ impl ImageAdapter for MockAdapter {
                     Some(neg) => format!("{label} [负向] {neg}"),
                     None => label,
                 };
-                let svg =
-                    placeholder_svg(&label, req.width, req.height, seed.wrapping_add(hue_shift));
+                // 自动尺寸（0×0）在 Mock 里回退到 1024，保证占位 SVG 有合法宽高
+                let (w, h) = if super::openai::is_auto_size(req.width, req.height) {
+                    (1024, 1024)
+                } else {
+                    (req.width, req.height)
+                };
+                let svg = placeholder_svg(&label, w, h, seed.wrapping_add(hue_shift));
                 let b64 = base64::engine::general_purpose::STANDARD.encode(svg.as_bytes());
                 out.push(format!("data:image/svg+xml;base64,{}", b64));
             }

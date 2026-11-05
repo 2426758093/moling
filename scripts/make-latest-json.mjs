@@ -77,6 +77,14 @@ const artifactName = candidates[0];
 const artifactPath = path.join(bundleDir, artifactName);
 const sigPath = `${artifactPath}.sig`;
 
+// GitHub 会静默剔除非 ASCII 字符，资产名被改写后清单里的下载地址就是 404
+if (/[^\x20-\x7e]/.test(artifactName)) {
+  fail(
+    `更新包文件名含非 ASCII 字符：${artifactName}\n` +
+      "  GitHub 会改写这类资产名，请先重命名为 ASCII（如 moling_<version>_x64-setup.exe）再生成清单。",
+  );
+}
+
 if (!existsSync(sigPath)) {
   fail(
     `缺少签名文件：${sigPath}\n  构建时需提供 TAURI_SIGNING_PRIVATE_KEY 与口令`,

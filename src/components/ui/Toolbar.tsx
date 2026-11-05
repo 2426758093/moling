@@ -34,3 +34,28 @@ export function ToolbarGroup({ children }: { children: ReactNode }) {
 export function ToolbarSeparator() {
   return <span aria-hidden className="mx-1 h-5 w-px bg-line" />;
 }
+
+/// 浮动工具条：画布、画廊底部居中悬浮的玻璃胶囊。
+/// 它浮在内容之上，所以用玻璃；不要把它塞进内容面里。
+export function ToolbarFloating({
+  children,
+  label,
+  className,
+}: {
+  children: ReactNode;
+  label: string;
+  className?: string;
+}) {
+  return (
+    <div
+      role="toolbar"
+      aria-label={label}
+      className={cn(
+        "glass pointer-events-auto flex items-center gap-0.5 rounded-pill px-1.5 py-1 shadow-pop",
+        className,
+      )}
+    >
+      {children}
+    </div>
+  );
+}

@@ -175,15 +175,44 @@ impl TemplateAdapter {
         config: &'a ProviderConfig,
         req: &'a GenerateRequest,
     ) -> Vec<(&'static str, String)> {
+        let auto = super::openai::is_auto_size(req.width, req.height);
         vec![
             ("prompt", req.prompt.clone()),
             (
                 "negative_prompt",
                 req.negative_prompt.clone().unwrap_or_default(),
             ),
-            ("size", format!("{}x{}", req.width, req.height)),
-            ("width", req.width.to_string()),
-            ("height", req.height.to_string()),
+            (
+                "size",
+                if auto {
+                    "auto".to_string()
+                } else {
+                    format!("{}x{}", req.width, req.height)
+                },
+            ),
+            (
+                "width",
+                if auto {
+                    "auto".into()
+                } else {
+                    req.width.to_string()
+                },
+            ),
+            (
+                "height",
+                if auto {
+                    "auto".into()
+                } else {
+                    req.height.to_string()
+                },
+            ),
+            (
+                "quality",
+                req.quality
+                    .clone()
+                    .filter(|q| !q.trim().is_empty() && q != "auto")
+                    .unwrap_or_else(|| "auto".to_string()),
+            ),
             ("model", req.model.clone()),
             ("seed", req.seed.map(|s| s.to_string()).unwrap_or_default()),
             ("count", req.count.to_string()),
@@ -651,6 +680,7 @@ mod tests {
             steps: None,
             seed: None,
             count: 2,
+            quality: None,
             images: vec!["AAA".into(), "BBB".into()],
             references: vec![
                 crate::reference::ReferenceSpec {
@@ -672,6 +702,18 @@ mod tests {
         assert!(roles.contains(r#""role":"composition""#));
         assert!(roles.contains(r#""index":2"#));
         assert!(roles.contains(r#""strength":60"#));
+
+        let auto = GenerateRequest {
+            width: 0,
+            height: 0,
+            quality: None,
+            ..req.clone()
+        };
+        let pairs = TemplateAdapter::vars(&config, &auto);
+        let pairs = vars_as_strs(&pairs);
+        assert_eq!(render_template("{{size}}", &pairs), "auto");
+        assert_eq!(render_template("{{width}}x{{height}}", &pairs), "autoxauto");
+        assert_eq!(render_template("{{quality}}", &pairs), "auto");
 
         let empty = GenerateRequest {
             images: vec![],

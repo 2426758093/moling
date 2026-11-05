@@ -328,7 +328,7 @@ export default function ProviderDialog({
             className={cn(
               "rounded-pill px-2.5 py-1 text-footnote",
               i === step
-                ? "bg-accent-soft font-medium text-accent"
+                ? "bg-accent-soft font-medium text-accent-text"
                 : "bg-fill text-tertiary",
             )}
           >

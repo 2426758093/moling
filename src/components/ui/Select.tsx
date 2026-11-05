@@ -1,5 +1,5 @@
 import * as SelectPrimitive from "@radix-ui/react-select";
-import { IconChevron } from "../Icons";
+import { IconCheck, IconChevron } from "../Icons";
 import { cn } from "./cn";
 
 export interface SelectOption {
@@ -23,7 +23,8 @@ interface SelectProps {
   label?: string;
   id?: string;
   /// bare：无边框无底色，用于工具栏内联（触发器仍保留焦点环与最小点击区）
-  variant?: "default" | "bare";
+  /// chip：24px 摘要胶囊，用于输入坞参数行
+  variant?: "default" | "bare" | "chip";
   /// 宽度工具类（如 "w-48"）。不要用 className 覆盖：w-full 会因生成顺序压过它
   widthClass?: string;
   className?: string;
@@ -51,12 +52,16 @@ export function Select({
         id={id}
         aria-label={label}
         className={cn(
-          "pressable flex h-9 items-center justify-between gap-2 rounded-btn px-3",
-          "text-left text-body text-primary transition-colors",
+          "pressable flex items-center justify-between gap-2",
+          variant === "chip"
+            ? "h-6 rounded-chip px-2 text-caption text-secondary hover:bg-hover hover:text-primary"
+            : "h-8 rounded-btn px-2.5 text-left text-callout text-primary transition-colors",
           widthClass ?? "w-full",
-          variant === "default"
-            ? "border border-line bg-fill hover:border-line-strong data-[placeholder]:text-tertiary"
-            : "border border-transparent bg-transparent hover:bg-hover",
+          variant === "default" &&
+            "bg-elevated shadow-card hover:bg-grouped data-[placeholder]:text-tertiary",
+          variant === "bare" &&
+            "border border-transparent bg-transparent transition-colors hover:bg-hover",
+          variant === "chip" && "transition-colors",
           disabled && "cursor-not-allowed opacity-40",
           className,
         )}
@@ -70,20 +75,23 @@ export function Select({
         <SelectPrimitive.Content
           position="popper"
           sideOffset={6}
-          className="anim-pop z-50 max-h-72 overflow-hidden rounded-pop border border-line glass shadow-sheet"
+          className="anim-pop z-50 max-h-72 overflow-hidden rounded-pop glass shadow-pop"
         >
-          <SelectPrimitive.Viewport className="max-h-72 overflow-y-auto p-1">
+          <SelectPrimitive.Viewport className="max-h-72 overflow-y-auto p-1.5">
             {options.map((opt) => (
               <SelectPrimitive.Item
                 key={opt.value}
                 value={toRadix(opt.value)}
                 disabled={opt.disabled}
                 className={cn(
-                  "relative flex h-8 cursor-pointer select-none items-center rounded-btn px-2 text-callout text-primary outline-none",
+                  "relative flex h-7 cursor-pointer select-none items-center rounded-chip pl-2 pr-7 text-callout text-primary outline-none",
                   "data-[highlighted]:bg-hover data-[disabled]:cursor-not-allowed data-[disabled]:text-quaternary",
                 )}
               >
                 <SelectPrimitive.ItemText>{opt.label}</SelectPrimitive.ItemText>
+                <SelectPrimitive.ItemIndicator className="absolute right-2 flex h-4 w-4 items-center justify-center text-accent">
+                  <IconCheck size={14} />
+                </SelectPrimitive.ItemIndicator>
               </SelectPrimitive.Item>
             ))}
           </SelectPrimitive.Viewport>

@@ -13,14 +13,15 @@ export interface MenuItem {
   /// 在这一项之前画一条分隔线
   separatorBefore?: boolean;
   onSelect: () => void;
+  /// 右侧快捷键提示（例如 "Ctrl N"）。只做展示，绑定在 lib/shortcuts.ts
+  shortcut?: string;
 }
 
-const CONTENT =
-  "anim-pop z-50 min-w-48 rounded-pop border border-line glass p-1 shadow-sheet";
+const CONTENT = "anim-pop z-[55] min-w-48 rounded-pop glass p-1.5 shadow-pop";
 
 function itemClass(danger?: boolean) {
   return cn(
-    "flex h-8 cursor-pointer select-none items-center gap-2 rounded-btn px-2 text-callout",
+    "flex h-7 cursor-pointer select-none items-center gap-2 rounded-chip px-2 text-callout",
     "data-[highlighted]:bg-hover data-[disabled]:cursor-not-allowed data-[disabled]:text-quaternary",
     danger ? "text-danger" : "text-primary",
   );
@@ -56,7 +57,12 @@ export function ContextMenu({
                 <span className="flex h-4 w-4 shrink-0 items-center justify-center [&>svg]:h-4 [&>svg]:w-4">
                   {item.icon}
                 </span>
-                {item.label}
+                <span className="flex-1">{item.label}</span>
+                {item.shortcut && (
+                  <span className="text-caption text-quaternary">
+                    {item.shortcut}
+                  </span>
+                )}
               </ContextMenuPrimitive.Item>
             </Fragment>
           ))}
@@ -100,7 +106,12 @@ export function DropdownMenu({
                 <span className="flex h-4 w-4 shrink-0 items-center justify-center [&>svg]:h-4 [&>svg]:w-4">
                   {item.icon}
                 </span>
-                {item.label}
+                <span className="flex-1">{item.label}</span>
+                {item.shortcut && (
+                  <span className="text-caption text-quaternary">
+                    {item.shortcut}
+                  </span>
+                )}
               </DropdownMenuPrimitive.Item>
             </Fragment>
           ))}

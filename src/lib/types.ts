@@ -10,10 +10,20 @@ export function isUiMode(value: unknown): value is UiMode {
   return value === "simple" || value === "expert";
 }
 
-export { RATIO_OPTIONS, STYLE_PRESETS } from "./presets";
+export {
+  RATIO_OPTIONS,
+  STYLE_PRESETS,
+  QUALITY_OPTIONS,
+  isAutoSize,
+  sizeLabel,
+  qualityLabel,
+} from "./presets";
+export type { ImageQuality } from "./presets";
 
-/// 参考图角色：提示词级近似（主流接口没有逐图权重参数）
-export type ReferenceRole = "composition" | "style" | "face" | "element";
+/// 参考图角色：提示词级近似（主流接口没有逐图权重参数）。
+/// previous 是对话上下文专用（上一轮画面），不出现在用户可选的 REFERENCE_ROLES 里。
+export type ReferenceRole =
+  "composition" | "style" | "face" | "element" | "previous";
 
 export const REFERENCE_ROLES: { id: ReferenceRole; label: string }[] = [
   { id: "composition", label: "构图参考" },

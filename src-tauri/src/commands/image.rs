@@ -140,9 +140,23 @@ pub(crate) fn normalize_count(n: u32) -> u32 {
     n.clamp(1, COUNT_MAX)
 }
 
+/// 质量档位白名单：auto/未知值一律视为「不发送」，防止任意字符串透传给服务商。
+pub(crate) fn normalize_quality(q: Option<&str>) -> Option<String> {
+    match q.map(str::trim) {
+        Some("low") => Some("low".into()),
+        Some("medium") => Some("medium".into()),
+        Some("high") => Some("high".into()),
+        _ => None,
+    }
+}
+
 /// 生成参数统一归一化：命令层、队列入队与核心流程都走这里，保证「入库的值」
 /// 与「真正发给服务商的值」永远一致（F-016）。
+/// 宽高同时为 0 是「自动尺寸」哨兵：保留 0，由适配器决定是否发送 size。
 pub(crate) fn normalize_generation(width: u32, height: u32, count: u32) -> (u32, u32, u32) {
+    if width == 0 && height == 0 {
+        return (0, 0, normalize_count(count));
+    }
     (
         normalize_size(width),
         normalize_size(height),
@@ -159,6 +173,8 @@ pub struct GenerateCommandInput {
     pub model: String,
     pub width: u32,
     pub height: u32,
+    #[serde(default)]
+    pub quality: Option<String>,
     pub guidance: Option<f32>,
     pub steps: Option<u32>,
     pub seed: Option<u64>,
@@ -296,6 +312,7 @@ where
         model: input.model.clone(),
         width,
         height,
+        quality: normalize_quality(input.quality.as_deref()),
         guidance: input.guidance,
         steps: input.steps,
         seed: input.seed,
@@ -1006,6 +1023,49 @@ pub async fn list_history(
     Ok(serde_json::json!({ "items": items }))
 }
 
+/// 画布粘贴：把剪贴板图片落盘并作为一条无提示词的画廊记录入库，
+/// 让画布节点仍然只引用 historyId，不把 dataUrl 写进画布文件。
+#[tauri::command]
+pub async fn import_image(
+    app: tauri::AppHandle,
+    data_url: String,
+) -> Result<serde_json::Value, String> {
+    use base64::Engine;
+    use image::GenericImageView;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(image_store::strip_data_url(&data_url))
+        .map_err(|e| format!("图片 base64 解码失败: {e}"))?;
+    let (width, height) = image::load_from_memory(&bytes)
+        .map_err(|e| format!("图片解码失败: {e}"))?
+        .dimensions();
+    let now = storage::timestamp_millis();
+    let name = image_store::unique_name("paste_", &now, 0);
+    let (path, data_url) = image_store::save_b64_image(&app, &data_url, &name)?;
+    image_store::ensure_thumb(std::path::Path::new(&path));
+    let id = storage::add_history(&storage::HistoryRow {
+        id: 0,
+        prompt: String::new(),
+        negative_prompt: String::new(),
+        model: String::new(),
+        provider_name: String::new(),
+        seed: None,
+        width: width as i64,
+        height: height as i64,
+        guidance: 0.0,
+        steps: 0,
+        style: String::new(),
+        file_path: path.clone(),
+        favorite: false,
+        created_at: now,
+        parent_id: None,
+        op: "paste".to_string(),
+    })?;
+    Ok(serde_json::json!({
+        "historyId": id,
+        "dataUrl": data_url,
+    }))
+}
+
 /// 按 id 取原图完整 data URL：下载 / 打包导出 / 大图查看用
 #[tauri::command]
 pub async fn get_history_image(id: i64) -> Result<serde_json::Value, String> {
@@ -1155,6 +1215,7 @@ mod tests {
             model: "m".into(),
             width: 512,
             height: 512,
+            quality: None,
             guidance: None,
             steps: None,
             seed: None,
@@ -1172,6 +1233,25 @@ mod tests {
         assert!(prompt.starts_with("a cat, oil painting\nReference 1 (style, strong)"));
         // 没有参考图时不追加任何内容（简单模式行为不变）
         assert_eq!(build_prompt(&input, &[]), "a cat, oil painting");
+    }
+
+    #[test]
+    fn normalize_generation_keeps_auto_size() {
+        // 0×0 是自动尺寸哨兵：不能被钳到 64×64
+        assert_eq!(normalize_generation(0, 0, 0), (0, 0, 1));
+        assert_eq!(normalize_generation(0, 0, 9), (0, 0, 4));
+        // 只有一边为 0 时仍按普通尺寸归一化
+        assert_eq!(normalize_generation(0, 1024, 1), (SIZE_MIN, 1024, 1));
+    }
+
+    #[test]
+    fn normalize_quality_whitelist() {
+        assert_eq!(normalize_quality(Some("low")), Some("low".into()));
+        assert_eq!(normalize_quality(Some("medium")), Some("medium".into()));
+        assert_eq!(normalize_quality(Some("high")), Some("high".into()));
+        assert_eq!(normalize_quality(Some("auto")), None);
+        assert_eq!(normalize_quality(Some("ultra")), None);
+        assert_eq!(normalize_quality(None), None);
     }
 
     /// 聊天内逐张进度：payload 形状固定；无 jobId（队列路径）不发事件

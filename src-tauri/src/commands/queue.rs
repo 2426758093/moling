@@ -8,8 +8,8 @@
 //! - 结果只写 history（画廊可见），不生成聊天消息，避免两套状态互相打架。
 
 use crate::commands::image::{
-    generate_core, normalize_generation, CancelRegistration, GenerateCommandInput,
-    GenerationRegistry, MAX_REFERENCE_IMAGES,
+    generate_core, normalize_generation, normalize_quality, CancelRegistration,
+    GenerateCommandInput, GenerationRegistry, MAX_REFERENCE_IMAGES,
 };
 use crate::image_store;
 use crate::reference::ReferenceSpec;
@@ -195,6 +195,8 @@ async fn force_fail_job(job_id: i64, reason: &str) {
 pub struct JobExtras {
     pub reference_paths: Vec<String>,
     pub references: Vec<ReferenceSpec>,
+    /// 质量档位快照；None = auto（老任务没有该字段，按默认处理）
+    pub quality: Option<String>,
 }
 
 impl JobExtras {
@@ -249,6 +251,7 @@ async fn run_job(app: &tauri::AppHandle, job: &JobRow) -> Result<(), String> {
         model: job.model.clone(),
         width: job.width as u32,
         height: job.height as u32,
+        quality: extras.quality.clone(),
         guidance: job.guidance.map(|g| g as f32),
         steps: job.steps.map(|s| s as u32),
         seed: job.seed.map(|s| s as u64),
@@ -330,6 +333,8 @@ pub struct EnqueueInput {
     pub seed: Option<u64>,
     #[serde(default)]
     pub count: u32,
+    #[serde(default)]
+    pub quality: Option<String>,
     /// 已落盘（refs/）的参考图路径，按位置与 references 对齐
     #[serde(default)]
     pub reference_paths: Vec<String>,
@@ -361,6 +366,7 @@ pub async fn enqueue_job(
             .take(reference_paths.len())
             .collect(),
         reference_paths,
+        quality: normalize_quality(input.quality.as_deref()),
     };
     let input_json = serde_json::to_string(&extras).map_err(|e| e.to_string())?;
     // 尺寸/张数在入队时就归一化（F-016）：任务参数快照与真正执行时一致
@@ -524,6 +530,7 @@ mod tests {
                 role: ReferenceRole::Style,
                 strength: Some(80),
             }],
+            quality: Some("high".into()),
         };
         let json = serde_json::to_string(&extras).unwrap();
         assert_eq!(JobExtras::parse(&json), extras);

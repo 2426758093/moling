@@ -21,6 +21,19 @@ export default tseslint.config(
     },
   },
   {
+    // 首帧脚本跑在浏览器里、由 <script> 直接加载，不经过 TS 编译
+    files: ["public/**/*.js"],
+    languageOptions: {
+      ecmaVersion: "latest",
+      sourceType: "script",
+      globals: {
+        document: "readonly",
+        localStorage: "readonly",
+        window: "readonly",
+      },
+    },
+  },
+  {
     // 发布脚本跑在 Node 里，需要显式声明全局；浏览器端配置不适用
     files: ["scripts/**/*.mjs"],
     languageOptions: {

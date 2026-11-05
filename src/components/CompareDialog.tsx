@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api, HistoryItem } from "../lib/api";
+import { sizeLabel } from "../lib/types";
 import { Dialog } from "./ui/Dialog";
 import { Button } from "./ui/Button";
 import { SegmentedControl } from "./ui/SegmentedControl";
@@ -10,7 +11,7 @@ type Mode = "slide" | "side";
 
 function metaOf(item: HistoryItem) {
   const h = item.history;
-  return `${h.model || "未知模型"} · ${h.width}×${h.height} · #${h.id}`;
+  return `${h.model || "未知模型"} · ${sizeLabel(h.width, h.height)} · #${h.id}`;
 }
 
 /** 对比主体：按两图 id 作 key 挂载，切换组合时位置与加载状态自然重置 */

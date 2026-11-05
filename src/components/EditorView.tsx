@@ -141,7 +141,7 @@ export default function EditorView() {
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       transition={{ duration: reduce ? 0 : DUR.base, ease: EASE.ios }}
-      className="fixed inset-0 z-40 flex flex-col bg-base"
+      className="fixed inset-x-0 bottom-0 top-12 z-30 flex flex-col bg-base"
     >
       {/* 栏头与工具条合并为同一块玻璃：中间不夹第二条分割玻璃 */}
       <header className="relative z-10 shrink-0 glass">

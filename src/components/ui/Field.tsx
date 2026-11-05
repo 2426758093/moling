@@ -7,8 +7,10 @@ import {
 } from "react";
 import { cn } from "./cn";
 
+// 描边即阴影：默认 1px ring-line，聚焦时换成 2px accent 光环（不用 border，
+// 避免聚焦时 1px→2px 把布局顶动）
 const FIELD_BASE =
-  "rounded-btn border bg-fill px-3 text-primary transition-colors placeholder:text-tertiary hover:border-line-strong focus:border-accent disabled:cursor-not-allowed disabled:opacity-50";
+  "rounded-btn bg-elevated px-2.5 text-primary ring-1 ring-line transition-shadow placeholder:text-tertiary hover:ring-line-strong focus:outline-none focus:ring-2 focus:ring-accent/25 disabled:cursor-not-allowed disabled:opacity-50";
 
 interface CommonProps {
   label?: ReactNode;
@@ -63,8 +65,8 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(function Input(
           className={cn(
             FIELD_BASE,
             widthClass ?? "w-full",
-            compact ? "h-8 text-callout" : "h-9 text-body",
-            error && "border-danger",
+            compact ? "h-7 text-callout" : "h-8 text-callout",
+            error && "ring-danger",
             suffix ? "pr-12" : null,
             className,
           )}
@@ -116,9 +118,9 @@ export const Textarea = forwardRef<HTMLTextAreaElement, TextareaProps>(
           className={cn(
             FIELD_BASE,
             widthClass ?? "w-full",
-            "resize-y py-2 text-body leading-relaxed",
+            "resize-y py-2 text-callout leading-relaxed",
             compact ? "min-h-16" : "min-h-24",
-            error && "border-danger",
+            error && "ring-danger",
             className,
           )}
           {...rest}

@@ -6,7 +6,7 @@ interface TooltipProps {
   label: ReactNode;
   children: ReactElement;
   side?: "top" | "bottom" | "left" | "right";
-  /// 默认 500ms：Tooltip 只做补充说明，不能作为元素的唯一标签
+  /// 默认 400ms：Tooltip 只做补充说明，不能作为元素的唯一标签
   delay?: number;
   className?: string;
 }
@@ -15,7 +15,7 @@ export function Tooltip({
   label,
   children,
   side = "bottom",
-  delay = 500,
+  delay = 400,
   className,
 }: TooltipProps) {
   if (!label) return children;
@@ -27,8 +27,8 @@ export function Tooltip({
           side={side}
           sideOffset={6}
           className={cn(
-            "anim-pop z-50 select-none rounded-btn bg-elevated px-2.5 py-1.5",
-            "border border-line text-footnote text-primary shadow-pop",
+            "anim-pop z-[65] select-none rounded-chip bg-elevated px-2 py-1",
+            "text-footnote text-primary shadow-pop",
             className,
           )}
         >

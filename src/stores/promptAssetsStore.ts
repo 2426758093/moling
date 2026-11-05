@@ -20,13 +20,29 @@ export function prefsFromPresetParams(json: string): Partial<GenPrefs> {
   const clampSize = (v: unknown): number | null => {
     const n = Number(v);
     if (!Number.isFinite(n)) return null;
+    if (n === 0) return 0;
     return Math.min(SIZE_MAX, Math.max(SIZE_MIN, Math.round(n / 8) * 8));
   };
-  if (typeof raw.ratio === "string") out.ratio = raw.ratio;
   const width = clampSize(raw.width);
   const height = clampSize(raw.height);
-  if (width !== null) out.width = width;
-  if (height !== null) out.height = height;
+  // 0×0 = 自动尺寸哨兵，必须成对出现才生效；单边 0 视为坏值丢弃
+  if (width === 0 && height === 0) {
+    out.ratio = "auto";
+    out.width = 0;
+    out.height = 0;
+  } else {
+    if (typeof raw.ratio === "string") out.ratio = raw.ratio;
+    if (width) out.width = width;
+    if (height) out.height = height;
+  }
+  if (
+    raw.quality === "auto" ||
+    raw.quality === "low" ||
+    raw.quality === "medium" ||
+    raw.quality === "high"
+  ) {
+    out.quality = raw.quality;
+  }
   if (typeof raw.style === "string") out.style = raw.style;
   if (typeof raw.count === "number" && Number.isFinite(raw.count)) {
     out.count = Math.min(4, Math.max(1, Math.round(raw.count)));

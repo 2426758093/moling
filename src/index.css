@@ -3,21 +3,30 @@
 @custom-variant dark (&:where(.dark, .dark *));
 
 /* ============================================================================
-   Tailwind 令牌层
+   Tailwind 令牌层 v2
    ----------------------------------------------------------------------------
+   三层材质：窗口材质（--bg-window / .window-plane）→ 内容面（bg-base 等 /
+   .content-sheet）→ 功能玻璃（--glass-* / .glass 系列）。玻璃的采样对象是
+   .ambient 环境底纹与滚动内容 —— 不要把玻璃直接铺在纯色平面上，那样只会
+   得到一块灰糊糊的半透明色块。
+
    组件只写语义类名，值全部在这里注册。:root / .dark 覆盖同名 CSS 变量，
-   [data-glass] 覆盖玻璃三档 —— 组件代码对主题与档位零感知。
+   html[data-glass] 覆盖玻璃三档 —— 组件代码对主题与档位零感知。
 
    命名空间约定（Tailwind v4 只认这些前缀）：
      --color-* / --text-* / --radius-* / --blur-* / --shadow-* /
-     --inset-shadow-* / --ease-* / --breakpoint-*
+     --inset-shadow-* / --ease-* / --breakpoint-* / --container-*
 
-   **没有** --z-index-* 与 --duration-* 命名空间：层级固定用 z-10/30/40/50
-   （toast 用 z-[60]），时长只用 150/200/300 三档（见 lib/motion.ts）。
-   **不要改 --spacing**：它是全站乘数，改一个值会让所有内边距与宽高一起缩放。
+   **没有** --z-index-* 与 --duration-* 命名空间：层级用固定表
+   （ViewBar 10 / 浮标 20 / 编辑器 30 / 标题栏 40 / 拖拽 45 / Dialog 50·51 /
+   菜单 55 / Palette 60 / Tooltip 65 / Toast 70），时长只用 150/200/300 三档
+   （见 lib/motion.ts）。**不要改 --spacing**：它是全站乘数。
    ============================================================================ */
 
 @theme {
+  /* 窗口材质 */
+  --color-window: var(--bg-window);
+
   /* 背景与表面 */
   --color-base: var(--bg-base);
   --color-elevated: var(--bg-elevated);
@@ -38,57 +47,71 @@
   --color-tertiary: var(--text-tertiary);
   --color-quaternary: var(--text-quaternary);
 
-  /* 强调与状态 */
+  /* 强调：accent 只给图形，accent-text 才给文字，accent-fill 才给填充 */
   --color-accent: var(--accent);
+  --color-accent-text: var(--accent-text);
   --color-accent-fill: var(--accent-fill);
   --color-accent-fill-hover: var(--accent-fill-hover);
   --color-accent-soft: var(--accent-soft);
   --color-accent-strong: var(--accent-strong);
   --color-on-accent: var(--on-accent);
+
+  /* 状态：*-fill 仅做填充（非文本），文字用 danger/success/warning */
   --color-danger: var(--danger);
   --color-success: var(--success);
+  --color-success-fill: var(--success-fill);
   --color-warning: var(--warning);
+  --color-warning-fill: var(--warning-fill);
 
-  /* 字阶：字号 / 行高 / 字距 / 字重一次给全。中文字距一律为 0（负字距会挤汉字）。 */
-  --text-display: 28px;
-  --text-display--line-height: 34px;
+  /* 遮罩与舞台 */
+  --color-scrim: var(--scrim);
+  --color-stage: var(--stage);
+
+  /* 窗口控制钮 */
+  --color-window-close: var(--window-close);
+  --color-on-window-close: var(--on-window-close);
+
+  /* 字阶（桌面密度）：字号 / 行高 / 字距 / 字重一次给全。
+     中文字距一律 0 —— 负字距会挤汉字；拉丁靠光学字号与字重，不靠负字距。 */
+  --text-display: 26px;
+  --text-display--line-height: 32px;
   --text-display--letter-spacing: 0;
-  --text-display--font-weight: 700;
+  --text-display--font-weight: 600;
 
-  --text-title1: 22px;
-  --text-title1--line-height: 28px;
+  --text-title1: 20px;
+  --text-title1--line-height: 26px;
   --text-title1--letter-spacing: 0;
-  --text-title1--font-weight: 700;
+  --text-title1--font-weight: 600;
 
-  --text-title2: 20px;
-  --text-title2--line-height: 25px;
+  --text-title2: 16px;
+  --text-title2--line-height: 22px;
   --text-title2--letter-spacing: 0;
   --text-title2--font-weight: 600;
 
-  --text-title3: 17px;
-  --text-title3--line-height: 22px;
+  --text-title3: 14px;
+  --text-title3--line-height: 20px;
   --text-title3--letter-spacing: 0;
   --text-title3--font-weight: 600;
 
-  --text-headline: 15px;
-  --text-headline--line-height: 20px;
+  --text-headline: 13px;
+  --text-headline--line-height: 18px;
   --text-headline--letter-spacing: 0;
   --text-headline--font-weight: 600;
 
   --text-body: 15px;
-  --text-body--line-height: 22px;
+  --text-body--line-height: 23px;
   --text-body--letter-spacing: 0;
   --text-body--font-weight: 400;
 
-  --text-callout: 14px;
-  --text-callout--line-height: 19px;
+  --text-callout: 13px;
+  --text-callout--line-height: 18px;
   --text-callout--letter-spacing: 0;
   --text-callout--font-weight: 400;
 
-  --text-subhead: 13px;
-  --text-subhead--line-height: 18px;
+  --text-subhead: 12px;
+  --text-subhead--line-height: 16px;
   --text-subhead--letter-spacing: 0;
-  --text-subhead--font-weight: 400;
+  --text-subhead--font-weight: 500;
 
   --text-footnote: 12px;
   --text-footnote--line-height: 16px;
@@ -96,37 +119,67 @@
   --text-footnote--font-weight: 400;
 
   --text-caption: 11px;
-  --text-caption--line-height: 15px;
+  --text-caption--line-height: 14px;
   --text-caption--letter-spacing: 0;
   --text-caption--font-weight: 500;
 
-  /* 圆角：8px(rounded-lg) / 12px(rounded-xl) 用 Tailwind 自带档位 */
+  /* 圆角：同心表 —— 内容面 20−8=12、卡片 12−4=8、分段 8−2=6 */
   --radius-chip: 6px;
-  --radius-btn: 10px;
-  --radius-card: 14px;
-  --radius-pop: 16px;
-  --radius-sheet: 20px;
-  --radius-panel: 24px;
+  --radius-btn: 8px;
+  --radius-card: 12px;
+  --radius-pop: 14px;
+  --radius-sheet: 16px;
+  --radius-panel: 20px;
   --radius-pill: 9999px;
 
   /* 模糊：只给功能层玻璃用 */
-  --blur-glass: 12px;
-  --blur-glass-lg: 24px;
-  --blur-glass-xl: 36px;
+  --blur-glass: 18px;
+  --blur-glass-lg: 26px;
+  --blur-glass-xl: 32px;
 
-  /* 阴影 */
+  /* 阴影：描边即阴影，三级 */
   --shadow-card: var(--shadow-card-value);
   --shadow-pop: var(--shadow-pop-value);
   --shadow-sheet: var(--shadow-sheet-value);
   --inset-shadow-glass: inset 0 1px 0 var(--glass-highlight);
+  /* 实心按钮顶部的一道高光：让填充色看起来是"压上去的实体"而不是一块色板 */
+  --inset-shadow-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.14);
 
-  /* 缓动 */
+  /* 缓动：颜色/透明度用曲线，形变走 lib/motion.ts 的弹簧 */
   --ease-ios: cubic-bezier(0.32, 0.72, 0, 1);
   --ease-exit: cubic-bezier(0.4, 0, 1, 1);
+  /* CSS 侧的前段弹簧近似：只在纯 CSS 过渡里用，物理弹簧走 framer-motion */
+  --ease-spring-press: linear(
+    0,
+    0.007,
+    0.029 2.2%,
+    0.118 4.7%,
+    0.625 10.8%,
+    0.893 14.3%,
+    1.007 18.6%,
+    1.042,
+    1.046 21.5%,
+    1.033 24.6%,
+    0.996 29.5%,
+    0.984 33.8%,
+    0.998 43.3%,
+    1.001 54.7%,
+    1 68.8%,
+    1
+  );
 
-  /* 断点：1100px 以下侧栏收成图标栏；1500px 以上画廊 4 列 */
+  /* 阅读宽度：长说明与窄列 */
+  --container-reading: 40rem;
+  /* 聊天列 / Composer：宽屏逐档放宽，避免最大化后仍锁在窄栏 */
+  --container-chat: 56rem;
+  --container-chat-wide: 64rem;
+  /* 设置内容列 */
+  --container-settings: 60rem;
+  --container-settings-wide: 72rem;
+
+  /* 断点：1100px 以下侧栏收成图标栏；1400px 以上放宽主内容列 */
   --breakpoint-compact: 1100px;
-  --breakpoint-wide: 1500px;
+  --breakpoint-wide: 1400px;
 }
 
 /* ============================================================================
@@ -136,46 +189,65 @@
 :root {
   color-scheme: light;
 
-  --bg-base: #f2f2f7;
+  /* 窗口材质：比内容面暗一档，让内容面像一张浮起来的纸 */
+  --bg-window: #e8e8ed;
+  --bg-base: #fbfbfd;
   --bg-elevated: #ffffff;
-  --bg-sunken: #e5e5ea;
-  --bg-grouped: #f2f2f7;
-  --bg-hover: rgba(60, 60, 67, 0.06);
-  --bg-active: rgba(60, 60, 67, 0.12);
+  --bg-sunken: #efeff3;
+  --bg-grouped: #f4f4f7;
+  --bg-hover: rgba(60, 60, 67, 0.055);
+  --bg-active: rgba(60, 60, 67, 0.11);
   --fill: rgba(118, 118, 128, 0.12);
 
-  --line: rgba(60, 60, 67, 0.1);
-  --line-strong: rgba(60, 60, 67, 0.18);
-  --separator: rgba(60, 60, 67, 0.08);
+  --line: rgba(0, 0, 0, 0.07);
+  --line-strong: rgba(0, 0, 0, 0.12);
+  --separator: rgba(0, 0, 0, 0.055);
+  --ring-line: rgba(0, 0, 0, 0.06);
 
-  --text-primary: #1c1c1e;
-  --text-secondary: #5b5b60;
-  --text-tertiary: #6c6c70;
-  --text-quaternary: #aeaeb2;
+  --text-primary: #17171a;
+  --text-secondary: #44444d;
+  --text-tertiary: #5c5c66;
+  --text-quaternary: #71717a;
 
-  /* 强调色三档：accent 只做非文本强调（白字压上去只有 3.4:1，不能做按钮底） */
-  --accent: #0088ff;
+  /* 强调色三档：accent 只做图形；accent-text 是唯一允许的强调文字色 */
+  --accent: #0a84ff;
+  --accent-text: #0066cc;
   --accent-fill: #0071e3;
   --accent-fill-hover: #0062c4;
   --accent-strong: #0062c4;
-  --accent-soft: rgba(0, 136, 255, 0.12);
+  --accent-soft: rgba(10, 132, 255, 0.12);
   --on-accent: #ffffff;
 
-  --danger: #ff383c;
-  --success: #34c759;
-  --warning: #ff8d28;
+  --danger: #d70015;
+  --success: #1f7a3d;
+  --success-fill: #34c759;
+  --warning: #9a5b00;
+  --warning-fill: #ff9f0a;
 
-  --shadow-card-value: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --scrim: rgba(0, 0, 0, 0.42);
+  --stage: #0a0a0b;
+  --window-close: #c42b1c;
+  --on-window-close: #ffffff;
+
+  /* 环境底纹：两层单色光斑，不透明度 ≤8.5%。玻璃有东西可采样全靠它。 */
+  --ambient-a: rgba(0, 102, 204, 0.055);
+  --ambient-b: rgba(255, 255, 255, 0.55);
+
+  --shadow-card-value:
+    0 0 0 1px var(--ring-line), 0 1px 2px rgba(0, 0, 0, 0.04),
+    0 4px 12px -6px rgba(0, 0, 0, 0.06);
   --shadow-pop-value:
-    0 12px 32px rgba(0, 0, 0, 0.12), 0 2px 6px rgba(0, 0, 0, 0.06);
+    0 0 0 1px var(--ring-line), 0 10px 28px -10px rgba(0, 0, 0, 0.16),
+    0 2px 6px -2px rgba(0, 0, 0, 0.06);
   --shadow-sheet-value:
-    0 24px 64px rgba(0, 0, 0, 0.18), 0 4px 12px rgba(0, 0, 0, 0.08);
+    0 0 0 1px var(--ring-line), 0 28px 72px -18px rgba(0, 0, 0, 0.28),
+    0 10px 28px -14px rgba(0, 0, 0, 0.14);
 
-  /* 玻璃：默认 standard 档，见下方 [data-glass] */
-  --glass-bg: rgba(250, 250, 252, 0.72);
-  --glass-blur: 24px;
+  /* 玻璃：默认 standard 档，见下方 html[data-glass] */
+  --glass-bg: rgba(252, 252, 254, 0.68);
+  --glass-blur: 18px;
   --glass-saturate: 180%;
-  --glass-line: rgba(60, 60, 67, 0.14);
+  --glass-line: rgba(0, 0, 0, 0.06);
   --glass-highlight: rgba(255, 255, 255, 0.7);
   --glass-media-bg: rgba(18, 18, 20, 0.35);
   --glass-fallback: rgba(250, 250, 252, 0.96);
@@ -184,76 +256,99 @@
 .dark {
   color-scheme: dark;
 
-  --bg-base: #000000;
-  --bg-elevated: #1c1c1e;
-  --bg-sunken: #2c2c2e;
-  --bg-grouped: #1c1c1e;
-  --bg-hover: rgba(120, 120, 128, 0.16);
-  --bg-active: rgba(120, 120, 128, 0.26);
+  --bg-window: #121214;
+  --bg-base: #17171a;
+  --bg-elevated: #202024;
+  --bg-sunken: #0d0d0f;
+  --bg-grouped: #1b1b1f;
+  --bg-hover: rgba(255, 255, 255, 0.06);
+  --bg-active: rgba(255, 255, 255, 0.11);
   --fill: rgba(118, 118, 128, 0.24);
 
-  --line: rgba(84, 84, 88, 0.4);
-  --line-strong: rgba(84, 84, 88, 0.6);
-  --separator: rgba(84, 84, 88, 0.35);
+  --line: rgba(255, 255, 255, 0.08);
+  --line-strong: rgba(255, 255, 255, 0.14);
+  --separator: rgba(255, 255, 255, 0.06);
+  --ring-line: rgba(255, 255, 255, 0.07);
 
-  --text-primary: #ffffff;
-  --text-secondary: rgba(235, 235, 245, 0.78);
-  --text-tertiary: rgba(235, 235, 245, 0.6);
-  --text-quaternary: rgba(235, 235, 245, 0.34);
+  --text-primary: #f2f2f7;
+  --text-secondary: #c9c9d1;
+  --text-tertiary: #a0a0ab;
+  --text-quaternary: #84848f;
 
-  --accent: #0091ff;
-  --accent-fill: #0071e3;
-  --accent-fill-hover: #0062c4;
-  --accent-strong: #62b0ff;
-  --accent-soft: rgba(0, 145, 255, 0.18);
+  --accent: #0a84ff;
+  --accent-text: #7cbdff;
+  --accent-fill: #0b6bd6;
+  --accent-fill-hover: #0a5cba;
+  --accent-strong: #7cbdff;
+  --accent-soft: rgba(10, 132, 255, 0.2);
   --on-accent: #ffffff;
 
-  --danger: #ff4245;
-  --success: #30d158;
-  --warning: #ff9f45;
+  --danger: #ff6b6e;
+  --success: #4ade80;
+  --success-fill: #30d158;
+  --warning: #ffb340;
+  --warning-fill: #ff9f0a;
 
-  --shadow-card-value: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --scrim: rgba(0, 0, 0, 0.58);
+  --stage: #0a0a0b;
+  --window-close: #c42b1c;
+  --on-window-close: #ffffff;
+
+  --ambient-a: rgba(10, 132, 255, 0.085);
+  --ambient-b: rgba(255, 255, 255, 0.035);
+
+  --shadow-card-value:
+    0 0 0 1px var(--ring-line), 0 1px 2px rgba(0, 0, 0, 0.3),
+    0 4px 12px -6px rgba(0, 0, 0, 0.35);
   --shadow-pop-value:
-    0 12px 32px rgba(0, 0, 0, 0.5), 0 2px 6px rgba(0, 0, 0, 0.4);
+    0 0 0 1px var(--ring-line), 0 10px 28px -10px rgba(0, 0, 0, 0.55),
+    0 2px 6px -2px rgba(0, 0, 0, 0.4);
   --shadow-sheet-value:
-    0 24px 64px rgba(0, 0, 0, 0.6), 0 4px 12px rgba(0, 0, 0, 0.45);
+    0 0 0 1px var(--ring-line), 0 28px 72px -18px rgba(0, 0, 0, 0.72),
+    0 10px 28px -14px rgba(0, 0, 0, 0.4);
 
-  --glass-bg: rgba(28, 28, 30, 0.72);
-  --glass-line: rgba(255, 255, 255, 0.12);
+  --glass-bg: rgba(30, 30, 34, 0.68);
+  --glass-line: rgba(255, 255, 255, 0.07);
   --glass-highlight: rgba(255, 255, 255, 0.12);
   --glass-media-bg: rgba(0, 0, 0, 0.45);
-  --glass-fallback: rgba(28, 28, 30, 0.96);
+  --glass-fallback: rgba(24, 24, 27, 0.97);
 }
 
 /* 玻璃三档：只切变量，组件零改动。档位由 theme.ts 写到 <html data-glass>。 */
 html[data-glass="clear"] {
-  --glass-bg: rgba(255, 255, 255, 0.42);
-  --glass-blur: 12px;
-  --glass-saturate: 140%;
+  --glass-bg: rgba(255, 255, 255, 0.4);
+  --glass-blur: 10px;
+  --glass-saturate: 150%;
 }
 
 html[data-glass="standard"] {
-  --glass-bg: rgba(250, 250, 252, 0.72);
-  --glass-blur: 24px;
+  --glass-bg: rgba(252, 252, 254, 0.68);
+  --glass-blur: 18px;
   --glass-saturate: 180%;
 }
 
 html[data-glass="tinted"] {
-  --glass-bg: rgba(248, 248, 250, 0.9);
-  --glass-blur: 36px;
-  --glass-saturate: 210%;
+  --glass-bg: rgba(249, 249, 251, 0.88);
+  --glass-blur: 26px;
+  --glass-saturate: 200%;
 }
 
 html.dark[data-glass="clear"] {
-  --glass-bg: rgba(18, 18, 20, 0.45);
+  --glass-bg: rgba(22, 22, 25, 0.42);
+  --glass-blur: 10px;
+  --glass-saturate: 140%;
 }
 
 html.dark[data-glass="standard"] {
-  --glass-bg: rgba(28, 28, 30, 0.72);
+  --glass-bg: rgba(30, 30, 34, 0.68);
+  --glass-blur: 18px;
+  --glass-saturate: 160%;
 }
 
 html.dark[data-glass="tinted"] {
-  --glass-bg: rgba(24, 24, 26, 0.92);
+  --glass-bg: rgba(26, 26, 29, 0.88);
+  --glass-blur: 26px;
+  --glass-saturate: 180%;
 }
 
 /* ============================================================================
@@ -270,22 +365,70 @@ body,
 
 body {
   font-family:
-    -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
-    "PingFang SC", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+    "SF Pro Text",
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI Variable Text",
+    "Segoe UI",
+    "PingFang SC",
+    "Microsoft YaHei UI",
+    "Microsoft YaHei",
+    system-ui,
+    sans-serif;
+  font-optical-sizing: auto;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   letter-spacing: 0;
+  background-color: var(--bg-window);
+  color: var(--text-primary);
   transition:
     background-color 200ms var(--ease-ios),
     color 200ms var(--ease-ios);
+}
+
+/* 数字对齐：表格、统计、尺寸、时间一律等宽数字 */
+.tabular {
+  font-variant-numeric: tabular-nums;
 }
 
 /* ============================================================================
    手写类（@theme 一个名字只能存一个值，装不下这些多属性配方）
    ============================================================================ */
 
-/* 功能层玻璃：半透明底 + 模糊 + 1px 暗描边 + 顶部高光，四层缺一不可。 */
-.glass {
+/* 窗口材质：不承载文字，只提供氛围底 */
+.window-plane {
+  position: relative;
+  isolation: isolate;
+  background-color: var(--bg-window);
+  color: var(--text-primary);
+}
+
+/* 环境底纹：给玻璃提供可采样的色彩。两层光斑、单色相、不透明度 ≤8.5%，
+   不加噪点、不做动画 —— 它只是让 backdrop-filter 不再是空采样。 */
+.ambient {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background-color: var(--bg-window);
+  background-image:
+    radial-gradient(58% 46% at 14% -6%, var(--ambient-a), transparent 68%),
+    radial-gradient(52% 58% at 102% 108%, var(--ambient-b), transparent 70%);
+}
+
+/* 内容面：不透明大板。禁止在这上面再叠玻璃。 */
+.content-sheet {
+  background-color: var(--bg-base);
+  border-radius: var(--radius-panel);
+  box-shadow: var(--shadow-card-value);
+  overflow: hidden;
+}
+
+/* 功能层玻璃：半透明底 + 模糊 + 1px 描边 + 顶部高光，四层缺一不可。
+   常驻玻璃面 ≤4，且禁止玻璃叠玻璃。 */
+.glass,
+.glass-panel,
+.glass-titlebar {
   background-color: var(--glass-bg);
   -webkit-backdrop-filter: saturate(var(--glass-saturate))
     blur(var(--glass-blur));
@@ -293,6 +436,17 @@ body {
   box-shadow:
     inset 0 0 0 1px var(--glass-line),
     inset 0 1px 0 var(--glass-highlight);
+}
+
+/* 标题栏玻璃：底部只留一条分隔，不要四周描边 */
+.glass-titlebar {
+  box-shadow: inset 0 -1px 0 var(--glass-line);
+}
+
+/* 嵌在玻璃里的凹陷区：填充底 + 内描边，用来放搜索框、分段控件 */
+.glass-inset {
+  background-color: var(--fill);
+  box-shadow: inset 0 0 0 1px var(--ring-line);
 }
 
 /* 浮在图片之上的玻璃：高通透 + 35% 压暗层，保证任何图片上的文字都可读。
@@ -307,12 +461,24 @@ body {
 @supports not (
   (backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))
 ) {
-  .glass {
+  .glass,
+  .glass-panel,
+  .glass-titlebar {
     background-color: var(--glass-fallback);
   }
   .glass-media {
     background-color: rgba(0, 0, 0, 0.6);
   }
+}
+
+/* 减少透明效果：设置里显式开启后，玻璃退化为纯色面。
+   偏好存 localStorage（moling.*），不进 Rust 设置白名单。 */
+html[data-transparency="reduced"] .glass,
+html[data-transparency="reduced"] .glass-panel,
+html[data-transparency="reduced"] .glass-titlebar {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  background-color: var(--glass-fallback);
 }
 
 /* 同心圆角：内圆角 = 外圆角 − 内边距。用 --radius-outer / --inset 传参。 */
@@ -346,12 +512,14 @@ body {
   backdrop-filter: saturate(var(--glass-saturate)) blur(var(--blur-glass));
 }
 
-/* 按压反馈：所有可点击元素统一用它，不要逐个写 active: */
+/* 按压反馈：所有可点击元素统一用它，不要逐个写 active:。
+   形变走弹簧近似曲线，颜色/透明度走 150ms。 */
 .pressable {
   transition:
-    transform 150ms var(--ease-ios),
+    transform 160ms var(--ease-spring-press),
     opacity 150ms var(--ease-ios),
     background-color 150ms var(--ease-ios),
+    border-color 150ms var(--ease-ios),
     filter 150ms var(--ease-ios),
     color 150ms var(--ease-ios);
 }
@@ -365,7 +533,7 @@ body {
 @keyframes pop-in {
   from {
     opacity: 0;
-    transform: translateY(-4px) scale(0.98);
+    transform: translateY(-4px) scale(0.97);
   }
   to {
     opacity: 1;
@@ -418,24 +586,22 @@ body {
   background: transparent;
 }
 
-/* 生成中骨架屏 shimmer */
-@keyframes shimmer {
-  0% {
-    background-position: -400px 0;
-  }
+/* 生成中占位：脉冲而不是流光 —— 渐变扫光会让人误以为在加载资源 */
+@keyframes skeleton-pulse {
+  0%,
   100% {
-    background-position: 400px 0;
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 0.9;
   }
 }
+.skeleton-pulse {
+  animation: skeleton-pulse 1.6s var(--ease-ios) infinite;
+}
+/* 兼容旧类名，P3 迁完后删除 */
 .shimmer {
-  background: linear-gradient(
-    90deg,
-    var(--bg-sunken) 25%,
-    var(--bg-hover) 50%,
-    var(--bg-sunken) 75%
-  );
-  background-size: 800px 100%;
-  animation: shimmer 1.4s infinite linear;
+  animation: skeleton-pulse 1.6s var(--ease-ios) infinite;
 }
 
 /* 思考中的呼吸点 */
@@ -485,9 +651,32 @@ body {
 /* ============================================================================
    无障碍：键盘焦点环与动效降级
    ============================================================================ */
-:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
+/* 必须留在 base 层：无层规则的优先级高于所有 @layer utilities，
+   会让组件上的 outline-none 失效（文本域尤其明显：全宽输入框的左右描边
+   被父级 overflow-hidden 裁掉，只剩上下两条蓝线） */
+@layer base {
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+}
+
+/* 高对比模式：半透明与阴影都不可靠，退回实底 + 实线边框 */
+@media (forced-colors: active) {
+  .glass,
+  .glass-panel,
+  .glass-titlebar,
+  .glass-media {
+    background-color: Canvas;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+    border: 1px solid CanvasText;
+    box-shadow: none;
+  }
+  .content-sheet {
+    border: 1px solid CanvasText;
+    box-shadow: none;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -495,8 +684,14 @@ body {
     animation: none;
     opacity: 1;
   }
+  .skeleton-pulse,
   .shimmer {
     animation: none;
+    opacity: 0.7;
+  }
+  .pressable:active {
+    transform: none;
+    filter: none;
   }
   *,
   *::before,

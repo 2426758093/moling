@@ -291,9 +291,10 @@ function CanvasNodeCard({
         }
       }}
       className={cn(
-        "group absolute select-none rounded-card border bg-elevated shadow-card outline-none",
-        selected ? "border-accent" : "border-line",
-        wireArmed && "border-accent",
+        "group absolute select-none rounded-card border bg-elevated shadow-card outline-none transition-shadow",
+        selected || wireArmed
+          ? "border-transparent ring-2 ring-accent"
+          : "border-line",
         wireMode
           ? "cursor-crosshair"
           : dragging

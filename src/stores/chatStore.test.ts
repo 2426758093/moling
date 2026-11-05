@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api, EMPTY_PROVIDER, type ProviderItem } from "../lib/api";
 import { toast } from "../lib/notify";
+import { useAppStore } from "./appStore";
 import { useChatStore, type DisplayMessage } from "./chatStore";
 import { useProviderStore } from "./providerStore";
 
@@ -62,9 +63,12 @@ beforeEach(() => {
   vi.spyOn(api, "listConversations").mockResolvedValue({ conversations: [] });
   vi.spyOn(api, "createConversation").mockResolvedValue(7);
   vi.spyOn(api, "addMessage").mockResolvedValue({ id: 11, imagesJson: "[]" });
-  vi.spyOn(api, "refinePrompt").mockResolvedValue({ refined: "", used: false });
   vi.spyOn(api, "generateImages").mockResolvedValue({ images: [] });
   vi.spyOn(api, "deleteMessage").mockResolvedValue(true);
+  vi.spyOn(api, "generateConversationTitle").mockResolvedValue({
+    ok: false,
+    skipped: true,
+  });
 });
 
 describe("send 的受理结果（F-008）", () => {
@@ -101,6 +105,158 @@ describe("send 的受理结果（F-008）", () => {
     expect(state.messages.map((m) => m.role)).toEqual(["user", "assistant"]);
     expect(state.messages[1].id).toBe(12);
     expect(addMessage).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("生成前的提示词处理（原文直达）", () => {
+  const generated = (historyId: number, dataUrl: string) => ({
+    historyId,
+    dataUrl,
+    prompt: "上一轮",
+    seed: null,
+  });
+
+  beforeEach(() => {
+    useAppStore.setState({ mode: "expert" });
+  });
+
+  it("跳过的前置改写不再调用思考模型，原文直接交给绘图模型", async () => {
+    const refine = vi.spyOn(api, "refinePrompt");
+
+    await useChatStore.getState().send("画一只橘猫");
+
+    expect(refine).not.toHaveBeenCalled();
+    const input = vi.mocked(api.generateImages).mock.calls[0][0];
+    expect(input.prompt).toBe("画一只橘猫");
+    expect(input.images).toEqual([]);
+  });
+
+  it("没有新参考图时，上一轮画面作为 previous 上下文一起传入", async () => {
+    useChatStore.setState({
+      activeId: 7,
+      messages: [
+        display({ id: 1, role: "user", content: "一只橘猫" }),
+        display({
+          id: 2,
+          role: "assistant",
+          content: "一只橘猫",
+          images: [generated(9, "data:image/png;base64,PREV")],
+        }),
+      ],
+    });
+
+    await useChatStore.getState().send("把背景换成蓝色");
+
+    const input = vi.mocked(api.generateImages).mock.calls[0][0];
+    expect(input.prompt).toBe("把背景换成蓝色");
+    expect(input.images).toEqual(["data:image/png;base64,PREV"]);
+    expect(input.references).toEqual([{ role: "previous", strength: 60 }]);
+  });
+
+  it("带新参考图时同时带上上一轮画面，二者都进入请求", async () => {
+    useChatStore.setState({
+      activeId: 7,
+      attachments: [
+        {
+          id: "a1",
+          dataUrl: "data:image/png;base64,NEW",
+          name: "new.png",
+          path: "/tmp/new.png",
+        },
+      ],
+      messages: [
+        display({
+          id: 2,
+          role: "assistant",
+          content: "一只橘猫",
+          images: [generated(9, "data:image/png;base64,PREV")],
+        }),
+      ],
+    });
+
+    await useChatStore.getState().send("参考这张画一只狗");
+
+    const input = vi.mocked(api.generateImages).mock.calls[0][0];
+    expect(input.images).toEqual([
+      "data:image/png;base64,NEW",
+      "data:image/png;base64,PREV",
+    ]);
+    expect(input.references).toEqual([
+      { role: "composition", strength: 60 },
+      { role: "previous", strength: 60 },
+    ]);
+  });
+
+  it("参考图占满上限时优先保留用户选择的图，不追加上一轮画面", async () => {
+    useChatStore.setState({
+      activeId: 7,
+      attachments: Array.from({ length: 4 }, (_, i) => ({
+        id: `a${i}`,
+        dataUrl: `data:image/png;base64,NEW${i}`,
+        name: `${i}.png`,
+        path: `/tmp/${i}.png`,
+      })),
+      messages: [
+        display({
+          id: 2,
+          role: "assistant",
+          content: "一只橘猫",
+          images: [generated(9, "data:image/png;base64,PREV")],
+        }),
+      ],
+    });
+
+    await useChatStore.getState().send("综合这些参考图");
+
+    const input = vi.mocked(api.generateImages).mock.calls[0][0];
+    expect(input.images).toHaveLength(4);
+    expect(input.images).not.toContain("data:image/png;base64,PREV");
+  });
+});
+
+describe("首条消息后生成会话标题", () => {
+  it("空会话的首条消息触发 AI 标题并回写会话列表", async () => {
+    vi.mocked(api.generateConversationTitle).mockResolvedValue({
+      ok: true,
+      title: "橘猫宇航员",
+    });
+    useChatStore.setState({
+      activeId: 7,
+      conversations: [{ id: 7, title: "新对话", createdAt: "1" }],
+    });
+    // 卡住生成尾声，观察标题回写（结束后 store 会重新拉会话列表）
+    let finish!: (v: { images: [] }) => void;
+    vi.mocked(api.generateImages).mockReturnValueOnce(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+
+    const pending = useChatStore.getState().send("画一只穿宇航服的橘猫");
+
+    await vi.waitFor(() => {
+      expect(api.generateConversationTitle).toHaveBeenCalledWith(
+        7,
+        "画一只穿宇航服的橘猫",
+      );
+      expect(
+        useChatStore.getState().conversations.find((c) => c.id === 7)?.title,
+      ).toBe("橘猫宇航员");
+    });
+    finish({ images: [] });
+    await pending;
+  });
+
+  it("已有标题的会话不再触发标题生成", async () => {
+    useChatStore.setState({
+      activeId: 7,
+      conversations: [{ id: 7, title: "旧标题", createdAt: "1" }],
+      messages: [display({ id: 1, role: "user", content: "上一轮" })],
+    });
+
+    await useChatStore.getState().send("继续画");
+
+    expect(api.generateConversationTitle).not.toHaveBeenCalled();
   });
 });
 
