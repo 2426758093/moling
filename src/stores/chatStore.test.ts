@@ -288,6 +288,160 @@ describe("跨 await 的会话守卫（F-007）", () => {
   });
 });
 
+describe("生成过程中切换会话", () => {
+  it("切到新会话再切回原会话，占位与最终结果都还在", async () => {
+    vi.mocked(api.createConversation).mockResolvedValue(99);
+    vi.spyOn(api, "listMessages").mockResolvedValue({
+      messages: [
+        {
+          id: 11,
+          conversationId: 7,
+          role: "user",
+          content: "画一只猫",
+          refinedContent: "",
+          imagesJson: "[]",
+          paramsJson: "{}",
+          createdAt: "1",
+        },
+      ],
+      hasMore: false,
+    });
+    const addMessage = vi.mocked(api.addMessage);
+    addMessage.mockReset();
+    addMessage.mockResolvedValueOnce({ id: 11, imagesJson: "[]" });
+    addMessage.mockResolvedValueOnce({ id: 12, imagesJson: "[]" });
+
+    let finish!: (v: Awaited<ReturnType<typeof api.generateImages>>) => void;
+    vi.mocked(api.generateImages).mockReturnValueOnce(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+
+    useChatStore.setState({
+      activeId: 7,
+      conversations: [{ id: 7, title: "旧会话", createdAt: "1" }],
+    });
+
+    const pending = useChatStore.getState().send("画一只猫");
+    await vi.waitFor(() => {
+      expect(api.generateImages).toHaveBeenCalled();
+      expect(
+        useChatStore.getState().messages.some((m) => m.status === "generating"),
+      ).toBe(true);
+    });
+
+    await useChatStore.getState().newConversation();
+    expect(useChatStore.getState().activeId).toBe(99);
+    expect(useChatStore.getState().messages).toEqual([]);
+
+    await useChatStore.getState().selectConversation(7);
+    const reattached = useChatStore.getState().messages;
+    expect(reattached.map((m) => m.role)).toEqual(["user", "assistant"]);
+    expect(reattached[1].status).toBe("generating");
+
+    finish({
+      images: [
+        {
+          historyId: 5,
+          dataUrl: "data:image/png;base64,AA",
+          filePath: "/tmp/a.png",
+          prompt: "画一只猫",
+          model: "test-model",
+          seed: null,
+        },
+      ],
+    });
+    await pending;
+
+    const done = useChatStore.getState().messages;
+    expect(done[1].id).toBe(12);
+    expect(done[1].status).toBe("done");
+    expect(done[1].images).toHaveLength(1);
+  });
+
+  it("生成在别的会话里完成后再切回，只显示数据库里的结果、不重复", async () => {
+    const userRow = {
+      id: 11,
+      conversationId: 7,
+      role: "user" as const,
+      content: "画一只猫",
+      refinedContent: "",
+      imagesJson: "[]",
+      paramsJson: "{}",
+      createdAt: "1",
+    };
+    const assistantRow = {
+      id: 12,
+      conversationId: 7,
+      role: "assistant" as const,
+      content: "画一只猫",
+      refinedContent: "",
+      imagesJson: JSON.stringify([
+        {
+          historyId: 5,
+          dataUrl: "data:image/png;base64,AA",
+          path: "/tmp/a.png",
+          prompt: "画一只猫",
+          seed: null,
+        },
+      ]),
+      paramsJson: "{}",
+      createdAt: "2",
+    };
+    vi.mocked(api.createConversation).mockResolvedValue(99);
+    vi.spyOn(api, "listMessages")
+      .mockResolvedValueOnce({ messages: [userRow], hasMore: false })
+      .mockResolvedValueOnce({
+        messages: [userRow, assistantRow],
+        hasMore: false,
+      });
+    const addMessage = vi.mocked(api.addMessage);
+    addMessage.mockReset();
+    addMessage.mockResolvedValueOnce({ id: 11, imagesJson: "[]" });
+    addMessage.mockResolvedValueOnce({ id: 12, imagesJson: "[]" });
+
+    let finish!: (v: Awaited<ReturnType<typeof api.generateImages>>) => void;
+    vi.mocked(api.generateImages).mockReturnValueOnce(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    useChatStore.setState({
+      activeId: 7,
+      conversations: [{ id: 7, title: "旧会话", createdAt: "1" }],
+    });
+
+    const pending = useChatStore.getState().send("画一只猫");
+    await vi.waitFor(() => {
+      expect(api.generateImages).toHaveBeenCalled();
+    });
+    await useChatStore.getState().newConversation();
+    await useChatStore.getState().selectConversation(7);
+    expect(useChatStore.getState().messages[1]?.status).toBe("generating");
+
+    await useChatStore.getState().newConversation();
+    finish({
+      images: [
+        {
+          historyId: 5,
+          dataUrl: "data:image/png;base64,AA",
+          filePath: "/tmp/a.png",
+          prompt: "画一只猫",
+          model: "test-model",
+          seed: null,
+        },
+      ],
+    });
+    await pending;
+
+    await useChatStore.getState().selectConversation(7);
+    const done = useChatStore.getState().messages;
+    expect(done.map((m) => m.id)).toEqual([11, 12]);
+    expect(done[1].images).toHaveLength(1);
+  });
+});
+
 describe("按 id 重试指定回复（F-009）", () => {
   it("重试被点击的最后一条回复，并保留更早的轮次", async () => {
     useChatStore.setState({

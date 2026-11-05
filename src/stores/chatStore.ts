@@ -166,6 +166,15 @@ let convSeq = 0;
 // 当前在途生成任务 id：stop() 用它请求后端取消（同一时刻只有一路生成）
 let activeJobId: string | null = null;
 
+/// 在途生成的快照：切换会话会重建 messages 列表，切回原会话时靠它把
+/// 占位气泡与后续进度/结果接回去（DB 里此时还没有这条 assistant 消息）。
+interface ActiveGeneration {
+  convId: number;
+  assistantLocalId: number;
+  message: DisplayMessage;
+}
+let activeGeneration: ActiveGeneration | null = null;
+
 export const useChatStore = create<ChatState>((set, get) => {
   // 复合序号守卫：sendSeq 防「被新一轮发送/重试取代」，convSeq 防「已切走会话仍回写消息列表」。
   // 两者职责分离：sending 锁只看 sendSeq（切会话后旧流程结束必须解锁），消息写入必须两个都匹配。
@@ -183,12 +192,20 @@ export const useChatStore = create<ChatState>((set, get) => {
     seq: number,
   ): Promise<void> => {
     const isCurrent = () => sendSeq === seq;
-    const updateAssistant = (patch: Partial<DisplayMessage>) =>
+    // 调用方在发起本轮生成前登记的快照对象；按对象身份校验，
+    // 避免「停止后重试同一条消息」时旧流程清掉/写脏新一轮的快照
+    const myGeneration = activeGeneration;
+    const updateAssistant = (patch: Partial<DisplayMessage>) => {
+      // 无论当前在哪个会话，都同步快照，切回时才能看到最新进度
+      if (myGeneration && activeGeneration === myGeneration) {
+        myGeneration.message = { ...myGeneration.message, ...patch };
+      }
       set({
         messages: get().messages.map((m) =>
           m.id === assistantLocalId ? { ...m, ...patch } : m,
         ),
       });
+    };
     const finalize = () => {
       if (isCurrent()) set({ sending: false });
     };
@@ -230,175 +247,187 @@ export const useChatStore = create<ChatState>((set, get) => {
       return true;
     };
 
-    // 停止发生在附件落盘/用户消息入库阶段：不再发起生成，占位直接收尾
-    if (get().stopRequested) {
-      updateAssistant({ status: "stopped", pendingImages: 0 });
-      finalize();
-      return;
-    }
+    const execute = async (): Promise<void> => {
+      // 停止发生在附件落盘/用户消息入库阶段：不再发起生成，占位直接收尾
+      if (get().stopRequested) {
+        updateAssistant({ status: "stopped", pendingImages: 0 });
+        finalize();
+        return;
+      }
 
-    const { providers, defaultProviderId } = useProviderStore.getState();
-    const provider = providers.find((p) => p.provider.id === defaultProviderId);
-    const model = provider?.provider.defaultModel;
-    if (!provider || defaultProviderId == null || !model) {
-      updateAssistant({
-        status: "error",
-        error: {
-          type: "other",
-          message: "请先在「设置」中配置绘图服务商与模型",
-        },
-        pendingImages: 0,
-      });
-      finalize();
-      return;
-    }
-
-    // 1. 不做事先改写：把用户原文直接交给绘图模型，让真正决定画面的模型
-    //    自己完成理解与改写，不再由另一个只见过文本的模型代写提示词。
-    updateAssistant({ status: "generating" });
-    const prefs = useAppStore.getState().prefs;
-    const count = prefs.count;
-    updateAssistant({ pendingImages: count });
-
-    // 追问上下文：参考图未占满上限时，把会话里最后一张生成图一并交给模型，
-    // 「把背景换成蓝色」这类追问才有可对齐的画面；占满时优先保留用户显式选择的
-    // 参考图。编辑能力缺失的模型不传，避免把生成推进不支持的 /edits 分支。
-    const caps = currentModelCaps();
-    const previous =
-      caps.edit && atts.length < maxReferenceImages()
-        ? [...get().messages]
-            .reverse()
-            .find(
-              (m) =>
-                m.role === "assistant" &&
-                m.id !== assistantLocalId &&
-                m.images.length > 0,
-            )
-        : undefined;
-    const previousImage = previous?.images[previous.images.length - 1];
-    const inputImages = atts.map((a) => a.dataUrl);
-    // 角色 / 强度只属于专家模式；简单模式保持「纯参考图」的旧行为
-    const inputRefs =
-      useAppStore.getState().mode === "expert" && atts.length > 0
-        ? atts.map((a) => ({
-            role: a.role ?? "composition",
-            strength: a.strength ?? DEFAULT_REFERENCE_STRENGTH,
-          }))
-        : [];
-    if (previousImage?.dataUrl) {
-      inputImages.push(previousImage.dataUrl);
-      // previous 只用于对话上下文，不出现在用户可选的参考图角色里
-      inputRefs.push({
-        role: "previous",
-        strength: DEFAULT_REFERENCE_STRENGTH,
-      });
-    }
-
-    // 2. 生成图片：单次 invoke 透传 count=n，响应按序解析、逐张更新进度。
-    //    每次生成分配 jobId，stop() 用它调用后端 cancel_generation 中断在途请求。
-    if (!isCurrent()) return;
-    if (get().stopRequested) {
-      updateAssistant({ status: "stopped", pendingImages: 0 });
-      finalize();
-      return;
-    }
-    const images: ChatImage[] = [];
-    let genError: AdapterError | null = null;
-    let cancelled = false;
-    const jobId = crypto.randomUUID();
-    activeJobId = jobId;
-    // 先订阅再发起：后端每落盘一张就发一次 image:progress；
-    // 迟到事件因 activeJobId 已清空（stop/结束）被丢弃
-    const offProgress = await listen<ImageProgress>(
-      "image:progress",
-      (event) => {
-        const { jobId: eventJobId, done, total } = event.payload;
-        if (eventJobId !== jobId || eventJobId !== activeJobId) return;
-        if (!isCurrent() || get().stopRequested) return;
+      const { providers, defaultProviderId } = useProviderStore.getState();
+      const provider = providers.find(
+        (p) => p.provider.id === defaultProviderId,
+      );
+      const model = provider?.provider.defaultModel;
+      if (!provider || defaultProviderId == null || !model) {
         updateAssistant({
-          progress: { done, total },
-          pendingImages: Math.max(0, count - done),
+          status: "error",
+          error: {
+            type: "other",
+            message: "请先在「设置」中配置绘图服务商与模型",
+          },
+          pendingImages: 0,
         });
-      },
-    );
-    try {
-      const resp = await api.generateImages({
-        providerId: defaultProviderId,
-        // 原文直达：用户怎么描述，绘图模型就收到什么，不再经二手改写
-        prompt: userMsg.content,
-        negativePrompt: prefs.negativePrompt.trim() || null,
-        model,
-        width: prefs.width,
-        height: prefs.height,
-        style: prefs.style,
-        count,
-        quality: prefs.quality === "auto" ? null : prefs.quality,
-        images: inputImages,
-        references: inputRefs.length > 0 ? inputRefs : undefined,
-        jobId,
-      });
-      cancelled = Boolean(resp.cancelled);
-      if (!isCurrent()) return;
-      for (const img of resp.images ?? []) {
-        images.push({
-          historyId: img.historyId,
-          dataUrl: img.dataUrl,
-          path: img.filePath,
-          prompt: img.prompt,
-          seed: img.seed,
-        });
-        updateAssistant({
-          images: [...images],
-          pendingImages: Math.max(0, count - images.length),
+        finalize();
+        return;
+      }
+
+      // 1. 不做事先改写：把用户原文直接交给绘图模型，让真正决定画面的模型
+      //    自己完成理解与改写，不再由另一个只见过文本的模型代写提示词。
+      updateAssistant({ status: "generating" });
+      const prefs = useAppStore.getState().prefs;
+      const count = prefs.count;
+      updateAssistant({ pendingImages: count });
+
+      // 追问上下文：参考图未占满上限时，把会话里最后一张生成图一并交给模型，
+      // 「把背景换成蓝色」这类追问才有可对齐的画面；占满时优先保留用户显式选择的
+      // 参考图。编辑能力缺失的模型不传，避免把生成推进不支持的 /edits 分支。
+      const caps = currentModelCaps();
+      const previous =
+        caps.edit && atts.length < maxReferenceImages()
+          ? [...get().messages]
+              .reverse()
+              .find(
+                (m) =>
+                  m.role === "assistant" &&
+                  m.id !== assistantLocalId &&
+                  m.images.length > 0,
+              )
+          : undefined;
+      const previousImage = previous?.images[previous.images.length - 1];
+      const inputImages = atts.map((a) => a.dataUrl);
+      // 角色 / 强度只属于专家模式；简单模式保持「纯参考图」的旧行为
+      const inputRefs =
+        useAppStore.getState().mode === "expert" && atts.length > 0
+          ? atts.map((a) => ({
+              role: a.role ?? "composition",
+              strength: a.strength ?? DEFAULT_REFERENCE_STRENGTH,
+            }))
+          : [];
+      if (previousImage?.dataUrl) {
+        inputImages.push(previousImage.dataUrl);
+        // previous 只用于对话上下文，不出现在用户可选的参考图角色里
+        inputRefs.push({
+          role: "previous",
+          strength: DEFAULT_REFERENCE_STRENGTH,
         });
       }
-    } catch (e) {
+
+      // 2. 生成图片：单次 invoke 透传 count=n，响应按序解析、逐张更新进度。
+      //    每次生成分配 jobId，stop() 用它调用后端 cancel_generation 中断在途请求。
       if (!isCurrent()) return;
-      genError = parseAdapterError(String(e));
+      if (get().stopRequested) {
+        updateAssistant({ status: "stopped", pendingImages: 0 });
+        finalize();
+        return;
+      }
+      const images: ChatImage[] = [];
+      let genError: AdapterError | null = null;
+      let cancelled = false;
+      const jobId = crypto.randomUUID();
+      activeJobId = jobId;
+      // 先订阅再发起：后端每落盘一张就发一次 image:progress；
+      // 迟到事件因 activeJobId 已清空（stop/结束）被丢弃
+      const offProgress = await listen<ImageProgress>(
+        "image:progress",
+        (event) => {
+          const { jobId: eventJobId, done, total } = event.payload;
+          if (eventJobId !== jobId || eventJobId !== activeJobId) return;
+          if (!isCurrent() || get().stopRequested) return;
+          updateAssistant({
+            progress: { done, total },
+            pendingImages: Math.max(0, count - done),
+          });
+        },
+      );
+      try {
+        const resp = await api.generateImages({
+          providerId: defaultProviderId,
+          // 原文直达：用户怎么描述，绘图模型就收到什么，不再经二手改写
+          prompt: userMsg.content,
+          negativePrompt: prefs.negativePrompt.trim() || null,
+          model,
+          width: prefs.width,
+          height: prefs.height,
+          style: prefs.style,
+          count,
+          quality: prefs.quality === "auto" ? null : prefs.quality,
+          images: inputImages,
+          references: inputRefs.length > 0 ? inputRefs : undefined,
+          jobId,
+        });
+        cancelled = Boolean(resp.cancelled);
+        if (!isCurrent()) return;
+        for (const img of resp.images ?? []) {
+          images.push({
+            historyId: img.historyId,
+            dataUrl: img.dataUrl,
+            path: img.filePath,
+            prompt: img.prompt,
+            seed: img.seed,
+          });
+          updateAssistant({
+            images: [...images],
+            pendingImages: Math.max(0, count - images.length),
+          });
+        }
+      } catch (e) {
+        if (!isCurrent()) return;
+        genError = parseAdapterError(String(e));
+      } finally {
+        offProgress();
+        // 任务已结束：清理活动任务 id（仅当仍是本次任务，避免误清新任务）
+        if (activeJobId === jobId) activeJobId = null;
+      }
+      if (!isCurrent()) return;
+      // 终态清算占位：服务商可能少于请求数量（模板接口常见只返回单图），
+      // 差额不能留成永久骨架。
+      updateAssistant({
+        images: [...images],
+        pendingImages: 0,
+        progress: undefined,
+      });
+      if (
+        !cancelled &&
+        !get().stopRequested &&
+        !genError &&
+        images.length < count
+      ) {
+        toast(`服务商仅返回 ${images.length} 张（请求 ${count} 张）`);
+      }
+
+      // 3. 停止/取消语义：已生成的图片保留并照常持久化，assistant 消息标记 stopped
+      if (cancelled || get().stopRequested) {
+        updateAssistant({ status: "stopped", error: null, pendingImages: 0 });
+        if (images.length > 0) await persistAssistant(images, false);
+        finalize();
+        return;
+      }
+
+      if (genError) {
+        updateAssistant({ status: "error", error: genError, pendingImages: 0 });
+      } else {
+        updateAssistant({ status: "done", error: null, pendingImages: 0 });
+      }
+
+      // 4. 持久化助手消息（只存 {historyId, path}）
+      const persistedOk = await persistAssistant(images);
+      if (!persistedOk || !isCurrent()) {
+        finalize();
+        return;
+      }
+      await get().loadConversations();
+      finalize();
+    };
+
+    try {
+      await execute();
     } finally {
-      offProgress();
-      // 任务已结束：清理活动任务 id（仅当仍是本次任务，避免误清新任务）
-      if (activeJobId === jobId) activeJobId = null;
+      if (myGeneration && activeGeneration === myGeneration) {
+        activeGeneration = null;
+      }
     }
-    if (!isCurrent()) return;
-    // 终态清算占位：服务商可能少于请求数量（模板接口常见只返回单图），
-    // 差额不能留成永久骨架。
-    updateAssistant({
-      images: [...images],
-      pendingImages: 0,
-      progress: undefined,
-    });
-    if (
-      !cancelled &&
-      !get().stopRequested &&
-      !genError &&
-      images.length < count
-    ) {
-      toast(`服务商仅返回 ${images.length} 张（请求 ${count} 张）`);
-    }
-
-    // 3. 停止/取消语义：已生成的图片保留并照常持久化，assistant 消息标记 stopped
-    if (cancelled || get().stopRequested) {
-      updateAssistant({ status: "stopped", error: null, pendingImages: 0 });
-      if (images.length > 0) await persistAssistant(images, false);
-      finalize();
-      return;
-    }
-
-    if (genError) {
-      updateAssistant({ status: "error", error: genError, pendingImages: 0 });
-    } else {
-      updateAssistant({ status: "done", error: null, pendingImages: 0 });
-    }
-
-    // 4. 持久化助手消息（只存 {historyId, path}）
-    const persistedOk = await persistAssistant(images);
-    if (!persistedOk || !isCurrent()) {
-      finalize();
-      return;
-    }
-    await get().loadConversations();
-    finalize();
   };
 
   return {
@@ -452,9 +481,16 @@ export const useChatStore = create<ChatState>((set, get) => {
         });
         // 切走之后才返回的响应必须丢弃，否则会把别的会话消息写进当前视图
         if (convSeq !== myConvSeq) return;
+        const loaded = messages.map(toDisplay);
+        // 该会话还有在途生成：DB 里没有 assistant 占位，切回时从快照接上
+        const inflight =
+          activeGeneration?.convId === id ? activeGeneration.message : null;
         set({
           activeId: id,
-          messages: messages.map(toDisplay),
+          messages:
+            inflight && !loaded.some((m) => m.id === inflight.id)
+              ? [...loaded, { ...inflight }]
+              : loaded,
           hasMore,
           loadingOlder: false,
           attachments: [],
@@ -694,6 +730,8 @@ export const useChatStore = create<ChatState>((set, get) => {
             ? { hasMore: false, loadingOlder: false }
             : undefined),
         });
+        // 占位一出现就登记快照：此后切走会话也能在切回时接上这条生成
+        activeGeneration = { convId, assistantLocalId, message: assistantMsg };
         committed = true;
         if (get().conversations.find((c) => c.id === convId) === undefined) {
           await get().loadConversations();
@@ -733,6 +771,14 @@ export const useChatStore = create<ChatState>((set, get) => {
       if (jobId) {
         activeJobId = null;
         void api.cancelGeneration(jobId).catch(() => undefined);
+      }
+      // 切走会话时停止：快照也要标记 stopped，切回才能看到停止态
+      if (activeGeneration) {
+        activeGeneration.message = {
+          ...activeGeneration.message,
+          status: "stopped",
+          pendingImages: 0,
+        };
       }
       set((s) => ({
         stopRequested: true,
@@ -829,6 +875,7 @@ export const useChatStore = create<ChatState>((set, get) => {
             assistantMsg,
           ],
         });
+        activeGeneration = { convId, assistantLocalId, message: assistantMsg };
         await runGeneration(
           convId,
           lastUser,
