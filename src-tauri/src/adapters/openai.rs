@@ -165,9 +165,7 @@ impl OpenAiAdapter {
             let text = resp.text().await.unwrap_or_default();
             return Err(classify_http(status, &text));
         }
-        resp.json().await.map_err(|e| AdapterError::Other {
-            message: format!("响应解析失败: {}", e),
-        })
+        super::parse_json_body(resp, "/images/edits").await
     }
 
     async fn first_image_b64(
@@ -362,9 +360,7 @@ impl ImageAdapter for OpenAiAdapter {
                 let text = resp.text().await.unwrap_or_default();
                 return Err(classify_http(status, &text));
             }
-            let parsed: ImageResponse = resp.json().await.map_err(|e| AdapterError::Other {
-                message: format!("响应解析失败: {}", e),
-            })?;
+            let parsed: ImageResponse = super::parse_json_body(resp, "/images/generations").await?;
             let mut out = Vec::new();
             for entry in &parsed.data {
                 out.push(Self::fetch_image_b64(entry, Self::timeout(config)).await?);

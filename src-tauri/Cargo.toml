@@ -1,6 +1,6 @@
 [package]
 name = "moling"
-version = "1.2.0"
+version = "1.2.1"
 description = "MoLing - AI drawing client for any API"
 authors = ["MoLing Contributors"]
 edition = "2021"
@@ -31,6 +31,10 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls-native-roots",
   # default-features=false 会关掉系统代理；代理设置依赖它读取系统/环境代理
   "system-proxy",
+  # 代理/网关可能擅自压缩响应；没有解压能力时拿到的是压缩字节，JSON 解析必然失败
+  "gzip",
+  "brotli",
+  "deflate",
 ] }
 tokio = { version = "1", features = ["rt", "time"] }
 aes-gcm = "0.10"

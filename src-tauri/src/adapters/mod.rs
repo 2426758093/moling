@@ -332,6 +332,72 @@ pub fn classify_reqwest(err: &reqwest::Error) -> AdapterError {
     }
 }
 
+/// 响应体解析失败时保留的字符数：够看出是 HTML 错误页、错误 JSON 还是压缩字节
+const JSON_PREVIEW_CHARS: usize = 300;
+
+/// 读取成功响应并按 JSON 解析。
+///
+/// 不走 `Response::json()`：reqwest 的 decode 错误只是 "error decoding response body"，
+/// 状态码 / Content-Type / 真实响应体全被丢掉，中转站或代理返回异常内容时无法定位。
+pub async fn parse_json_body<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+    api: &str,
+) -> Result<T, AdapterError> {
+    let status = resp.status().as_u16();
+    let content_type = header_value(&resp, reqwest::header::CONTENT_TYPE);
+    let content_encoding = header_value(&resp, reqwest::header::CONTENT_ENCODING);
+    let bytes = resp.bytes().await.map_err(|e| classify_reqwest(&e))?;
+    parse_json_bytes(api, status, &content_type, &content_encoding, &bytes)
+}
+
+fn header_value(resp: &reqwest::Response, name: reqwest::header::HeaderName) -> String {
+    resp.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// 解析失败时把接口、状态码、编码与响应体开头写进错误并落日志（诊断包会带上）。
+pub(crate) fn parse_json_bytes<T: serde::de::DeserializeOwned>(
+    api: &str,
+    status: u16,
+    content_type: &str,
+    content_encoding: &str,
+    bytes: &[u8],
+) -> Result<T, AdapterError> {
+    match serde_json::from_slice(bytes) {
+        Ok(value) => Ok(value),
+        Err(e) => {
+            let mut meta = format!("HTTP {status}");
+            if !content_type.is_empty() {
+                meta.push_str(", Content-Type: ");
+                meta.push_str(content_type);
+            }
+            if !content_encoding.is_empty() {
+                meta.push_str(", Content-Encoding: ");
+                meta.push_str(content_encoding);
+            }
+            let message = format!(
+                "{api} 响应解析失败（{meta}，{} 字节）: {e}；响应体开头: {}",
+                bytes.len(),
+                body_preview(bytes)
+            );
+            tracing::warn!("{}", message);
+            Err(AdapterError::Other { message })
+        }
+    }
+}
+
+fn body_preview(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return "<空响应体>".into();
+    }
+    // 先按字节截断再转字符串：多字节字符被切在中间时 lossy 兜底，不会 panic
+    let head = &bytes[..bytes.len().min(2048)];
+    openai::truncate_preview(&String::from_utf8_lossy(head), JSON_PREVIEW_CHARS)
+}
+
 #[cfg(test)]
 mod download_tests {
     use super::*;
@@ -371,5 +437,78 @@ mod download_tests {
             "{}",
             err.message()
         );
+    }
+}
+
+#[cfg(test)]
+mod json_parse_tests {
+    use super::*;
+
+    #[derive(Debug, serde::Deserialize)]
+    struct Payload {
+        data: Vec<String>,
+    }
+
+    #[test]
+    fn parses_valid_payload() {
+        let parsed: Payload =
+            parse_json_bytes("api", 200, "application/json", "", br#"{"data":["a"]}"#).unwrap();
+        assert_eq!(parsed.data, vec!["a".to_string()]);
+    }
+
+    /// 200 拿到 HTML（网关/代理拦截页）时，错误里必须有状态码、编码与响应体开头
+    #[test]
+    fn parse_error_reports_status_headers_and_body() {
+        let body = "<html><body>gateway blocked</body></html>";
+        let err = parse_json_bytes::<Payload>(
+            "/images/generations",
+            200,
+            "text/html; charset=utf-8",
+            "gzip",
+            body.as_bytes(),
+        )
+        .unwrap_err();
+        let message = err.message();
+        for needle in [
+            "/images/generations",
+            "HTTP 200",
+            "text/html",
+            "Content-Encoding: gzip",
+            &format!("{} 字节", body.len()),
+            "gateway blocked",
+        ] {
+            assert!(message.contains(needle), "缺少 {needle}: {message}");
+        }
+    }
+
+    /// 200 但 JSON 形状不对（中转站把上游错误包成 200）时，能看到 serde 原因与真实响应体
+    #[test]
+    fn parse_error_on_unexpected_json_shape() {
+        let err = parse_json_bytes::<Payload>(
+            "/images/generations",
+            200,
+            "application/json",
+            "",
+            br#"{"error":{"message":"upstream failed"}}"#,
+        )
+        .unwrap_err();
+        let message = err.message();
+        assert!(message.contains("missing field `data`"), "{message}");
+        assert!(message.contains("upstream failed"), "{message}");
+    }
+
+    #[test]
+    fn parse_error_on_empty_body() {
+        let err = parse_json_bytes::<Payload>("api", 200, "", "", b"").unwrap_err();
+        assert!(err.message().contains("<空响应体>"), "{}", err.message());
+    }
+
+    /// 多字节字符被字节截断切开时走 lossy 兜底，不 panic，预览仍按字符截断
+    #[test]
+    fn parse_error_preview_is_char_safe() {
+        let body = format!("<html>{}</html>", "错".repeat(400));
+        let err =
+            parse_json_bytes::<Payload>("api", 200, "text/html", "", body.as_bytes()).unwrap_err();
+        assert!(err.message().contains('…'), "{}", err.message());
     }
 }

@@ -57,9 +57,7 @@ pub async fn chat_complete_at(
         let text = resp.text().await.unwrap_or_default();
         return Err(classify_http(status, &text));
     }
-    let parsed: serde_json::Value = resp.json().await.map_err(|e| AdapterError::Other {
-        message: format!("响应解析失败: {}", e),
-    })?;
+    let parsed: serde_json::Value = super::parse_json_body(resp, "/chat/completions").await?;
     extract_reply_text(&parsed)
 }
 
@@ -249,11 +247,7 @@ where
         .and_then(|v| v.to_str().ok())
         .is_some_and(|ct| ct.to_ascii_lowercase().contains("text/event-stream"));
     if !is_sse {
-        let text = resp.text().await.map_err(|e| classify_reqwest(&e))?;
-        let parsed: serde_json::Value =
-            serde_json::from_str(&text).map_err(|e| AdapterError::Other {
-                message: format!("响应解析失败: {}", e),
-            })?;
+        let parsed: serde_json::Value = super::parse_json_body(resp, "/chat/completions").await?;
         return extract_reply_text(&parsed);
     }
 
@@ -461,9 +455,7 @@ pub async fn reverse_prompt(
         let text = resp.text().await.unwrap_or_default();
         return Err(classify_http(status, &text));
     }
-    let parsed: serde_json::Value = resp.json().await.map_err(|e| AdapterError::Other {
-        message: format!("响应解析失败: {}", e),
-    })?;
+    let parsed: serde_json::Value = super::parse_json_body(resp, "/chat/completions").await?;
     extract_reply_text(&parsed)
 }
 
