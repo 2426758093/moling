@@ -8,9 +8,10 @@
 
   行为：
     1. 已在运行（.run\moling.pid 存活）则直接提示，不会起第二份；
-    2. 后台启动并把输出写入 .run\moling-dev.log / .run\moling-dev.err.log；
-    3. 开发模式等待 http://localhost:1420 就绪（最长 300 秒）；
-    4. 停止请双击根目录 stop.bat。
+    2. 开发模式启动前检查 1420：本仓库残留进程自动清理，被其它程序占用则直接报错；
+    3. 后台启动并把输出写入 .run\moling-dev.log / .run\moling-dev.err.log；
+    4. 开发模式等待 http://localhost:1420 就绪（最长 300 秒）；
+    5. 停止请双击根目录 stop.bat。
 #>
 [CmdletBinding()]
 param([switch]$Release)
@@ -23,6 +24,8 @@ $pidFile  = Join-Path $runDir "moling.pid"
 $outLog   = Join-Path $runDir "moling-dev.log"
 $errLog   = Join-Path $runDir "moling-dev.err.log"
 $readyUrl = "http://localhost:1420"
+$devPort  = 1420
+$repoPattern = [regex]::Escape($root)
 
 function Write-Step([string]$text) { Write-Host $text -ForegroundColor Cyan }
 function Write-Ok([string]$text) { Write-Host $text -ForegroundColor Green }
@@ -31,6 +34,23 @@ function Fail([string]$text) {
   Write-Host $text -ForegroundColor Red
   Write-Host ""
   exit 1
+}
+
+function Test-IsOurProcess([string]$cmdLine, [string]$exePath) {
+  if (-not [string]::IsNullOrEmpty($cmdLine) -and $cmdLine -match $repoPattern) { return $true }
+  if (-not [string]::IsNullOrEmpty($exePath) -and $exePath -match $repoPattern) { return $true }
+  return $false
+}
+
+function Get-PortOwner([int]$port) {
+  $conns = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
+  foreach ($conn in $conns) {
+    $ownerId = [int]$conn.OwningProcess
+    if ($ownerId -le 0) { continue }
+    $owner = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $ownerId) -ErrorAction SilentlyContinue
+    if ($owner) { return $owner }
+  }
+  return $null
 }
 
 if (-not (Test-Path $runDir)) { New-Item -ItemType Directory -Path $runDir | Out-Null }
@@ -87,6 +107,25 @@ if ($Release) {
   if (-not (Test-Path (Join-Path $root "node_modules"))) {
     Fail "尚未安装前端依赖。请先在项目根目录运行：pnpm install"
   }
+
+  # 端口预检：避免 tauri 已拉起后才在 vite 里报 "Port 1420 is already in use"
+  Write-Step ("检查前端端口 " + $devPort + " …")
+  for ($attempt = 0; $attempt -lt 3; $attempt++) {
+    $owner = Get-PortOwner $devPort
+    if (-not $owner) { break }
+    if (Test-IsOurProcess $owner.CommandLine $owner.ExecutablePath) {
+      Write-Host ("端口 " + $devPort + " 被本仓库残留进程占用（PID " + $owner.ProcessId + " " + $owner.Name + "），正在清理 …") -ForegroundColor Yellow
+      & taskkill /PID $owner.ProcessId /T /F 2>$null | Out-Null
+      Start-Sleep -Milliseconds 600
+      continue
+    }
+    Fail ("端口 " + $devPort + " 被其它程序占用：PID " + $owner.ProcessId + " " + $owner.Name + "。请先关闭该程序后重试。")
+  }
+  $portOwner = Get-PortOwner $devPort
+  if ($portOwner) {
+    Fail ("端口 " + $devPort + " 仍被占用（PID " + $portOwner.ProcessId + " " + $portOwner.Name + "），无法启动。")
+  }
+
   Write-Step "正在后台启动开发实例（pnpm tauri dev）…"
   Set-Content -Path $outLog -Value "" -Encoding UTF8
   Set-Content -Path $errLog -Value "" -Encoding UTF8
@@ -134,6 +173,11 @@ if (-not $ready) {
     Write-Host ""
     Write-Host "---- 日志末尾 30 行 ----"
     Get-Content $outLog -Tail 30 -Encoding UTF8
+  }
+  if (Test-Path $errLog) {
+    Write-Host ""
+    Write-Host "---- 错误输出末尾 30 行 ----"
+    Get-Content $errLog -Tail 30 -Encoding UTF8
   }
   exit 1
 }
