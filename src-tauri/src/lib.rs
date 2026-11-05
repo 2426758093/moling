@@ -74,6 +74,8 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         // RA-06：生成任务取消注册表（jobId → 取消标记），供 generate_images / cancel_generation 共享
         .manage(commands::GenerationRegistry::default())
+        // 更新包缓存：下载 → 校验 → 安装分两步，安装阶段不再联网
+        .manage(commands::UpdateCache::default())
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -154,6 +156,7 @@ pub fn run() {
             commands::get_logs_dir,
             commands::export_diagnostics,
             commands::get_update_status,
+            commands::download_update,
             commands::install_update,
             commands::enqueue_job,
             commands::list_jobs,

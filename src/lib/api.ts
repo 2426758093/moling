@@ -303,6 +303,16 @@ export interface UpdateStatus {
   error: string | null;
 }
 
+/** 下载进度（Tauri 事件 update:progress）；total 未知时按已下载量展示 */
+export interface UpdateProgress {
+  downloaded: number;
+  total: number | null;
+  /** 平均速度（字节/秒） */
+  speed: number;
+  /** 当前线路：手动代理 / 系统网络 / 直连 */
+  route: string;
+}
+
 /** 画布元信息：列表不返回布局数据 */
 export interface CanvasBoardMeta {
   id: number;
@@ -543,7 +553,9 @@ export const api = {
   /** 导出脱敏诊断包（近 7 天日志 + 元信息），返回 zip 绝对路径 */
   exportDiagnostics: () => invoke<string>("export_diagnostics"),
   getUpdateStatus: () => invoke<UpdateStatus>("get_update_status"),
-  /** 下载并安装可用更新；成功后进程会重启 */
+  /** 下载更新包（自动选线路 + 多线程），完成后等待 installUpdate */
+  downloadUpdate: () => invoke<void>("download_update"),
+  /** 安装已下载的更新；Windows 会退出进程，其它平台会重启 */
   installUpdate: () => invoke<void>("install_update"),
   exportConfig: (includeKeys: boolean) =>
     invoke<Record<string, unknown>>("export_config", { includeKeys }),

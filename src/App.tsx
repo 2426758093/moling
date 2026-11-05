@@ -23,6 +23,7 @@ import TitleBar from "./components/shell/TitleBar";
 import ResizeHandles from "./components/shell/ResizeHandles";
 import ShortcutsSheet from "./components/shell/ShortcutsSheet";
 import DropOverlay from "./components/shell/DropOverlay";
+import UpdateDialog from "./components/shell/UpdateDialog";
 import { useWindowState } from "./hooks/useWindowState";
 import { useGlobalShortcuts } from "./hooks/useGlobalShortcuts";
 import { useAppStore } from "./stores/appStore";
@@ -30,6 +31,7 @@ import { useChatStore } from "./stores/chatStore";
 import { useProviderStore } from "./stores/providerStore";
 import { useQueueStore } from "./stores/queueStore";
 import { useCanvasStore } from "./stores/canvasStore";
+import { useUpdateStore } from "./stores/updateStore";
 import { api } from "./lib/api";
 import { installCloseFlush } from "./lib/closeFlush";
 import { validateImageFile } from "./lib/file";
@@ -129,7 +131,16 @@ function AppShell() {
         toast(`加载队列失败：${String(e)}`, "error");
       }
     })();
-    return () => useQueueStore.getState().unsubscribe();
+    // 启动静默检查更新：离线/未配置不打扰，有更新才弹窗
+    void useUpdateStore
+      .getState()
+      .subscribe()
+      .then(() => useUpdateStore.getState().check(false))
+      .catch(() => undefined);
+    return () => {
+      useQueueStore.getState().unsubscribe();
+      useUpdateStore.getState().unsubscribe();
+    };
   }, []);
 
   return (
@@ -219,6 +230,7 @@ function AppShell() {
       {dragging && <DropOverlay />}
       <CommandPalette />
       <ShortcutsSheet />
+      <UpdateDialog />
       <AnimatePresence>{editTarget && <EditorView />}</AnimatePresence>
       <AnimatePresence>{outpaintTarget && <OutpaintView />}</AnimatePresence>
       <AnimatePresence>{basicEditTarget && <BasicEditView />}</AnimatePresence>
