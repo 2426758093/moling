@@ -21,7 +21,10 @@
     "format:check": "prettier --check .",
     "release:config": "node scripts/release-config.mjs",
     "release:build": "pnpm release:config && pnpm tauri build --config src-tauri/tauri.release.conf.json",
-    "release:manifest": "node scripts/make-latest-json.mjs"
+    "release:manifest": "node scripts/make-latest-json.mjs",
+    "gh:push": "node scripts/gh.mjs push",
+    "gh:release": "node scripts/gh.mjs release",
+    "gh:status": "node scripts/gh.mjs status"
   },
   "dependencies": {
     "@radix-ui/react-context-menu": "^2.4.1",
