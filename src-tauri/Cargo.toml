@@ -1,6 +1,6 @@
 [package]
 name = "moling"
-version = "1.2.1"
+version = "1.2.2"
 description = "MoLing - AI drawing client for any API"
 authors = ["MoLing Contributors"]
 edition = "2021"
@@ -31,11 +31,12 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls-native-roots",
   # default-features=false 会关掉系统代理；代理设置依赖它读取系统/环境代理
   "system-proxy",
-  # 代理/网关可能擅自压缩响应；没有解压能力时拿到的是压缩字节，JSON 解析必然失败
-  "gzip",
-  "brotli",
-  "deflate",
+  # 不开 gzip/brotli/deflate：自动解压一旦遇到链路谎报的 Content-Encoding，
+  # 原始字节会被 reqwest 丢弃，只剩 "error decoding response body"。
+  # 这里统一请求明文，解压由 adapters::mod 按魔数/头自己做
 ] }
+# 响应体兜底解压：链路无视 Accept-Encoding: identity 强行压缩时仍能读出 JSON
+flate2 = "1"
 tokio = { version = "1", features = ["rt", "time"] }
 aes-gcm = "0.10"
 keyring = { version = "3", features = ["windows-native"] }

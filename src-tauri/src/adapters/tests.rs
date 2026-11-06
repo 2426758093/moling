@@ -252,3 +252,112 @@ fn mock_edit_receives_background_prompt() {
     // 占位图标签截断到 24 字符，指令前缀必须出现在最前面
     assert!(svg.contains("Replace the masked"), "{svg}");
 }
+
+fn gzip(data: &[u8]) -> Vec<u8> {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).unwrap();
+    encoder.finish().unwrap()
+}
+
+/// 起一个只服务一次的本地 HTTP/1.1 端点，返回监听端口
+fn serve_once(headers: Vec<(&'static str, &'static str)>, body: Vec<u8>) -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            match stream.read(&mut buf).unwrap_or(0) {
+                0 => break,
+                n => request.extend_from_slice(&buf[..n]),
+            }
+        }
+        let mut resp = String::from("HTTP/1.1 200 OK\r\n");
+        for (name, value) in headers {
+            resp.push_str(&format!("{name}: {value}\r\n"));
+        }
+        resp.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        ));
+        stream.write_all(resp.as_bytes()).unwrap();
+        stream.write_all(&body).unwrap();
+        stream.flush().unwrap();
+    });
+    port
+}
+
+/// 端到端：真实 HTTP 链路下，链路压缩与响应头不一致时仍要解析成功。
+/// 旧实现依赖 reqwest 自动解压，遇到「头写 gzip、body 已明文」只会报 decoding 错误。
+#[test]
+fn parse_json_body_tolerates_content_encoding_mismatch() {
+    use crate::adapters::http::{build_client, ProxyConfig, MODE_DIRECT};
+    use crate::adapters::parse_json_body;
+
+    struct Case {
+        name: &'static str,
+        headers: Vec<(&'static str, &'static str)>,
+        body: Vec<u8>,
+    }
+
+    let payload = br#"{"data":["ok"]}"#.to_vec();
+    let cases = vec![
+        Case {
+            name: "gzip body + 正确头",
+            headers: vec![
+                ("Content-Type", "application/json"),
+                ("Content-Encoding", "gzip"),
+            ],
+            body: gzip(&payload),
+        },
+        Case {
+            name: "gzip body + 无头",
+            headers: vec![("Content-Type", "application/json")],
+            body: gzip(&payload),
+        },
+        Case {
+            name: "明文 body + 谎报 gzip 头",
+            headers: vec![
+                ("Content-Type", "application/json"),
+                ("Content-Encoding", "gzip"),
+            ],
+            body: payload,
+        },
+    ];
+
+    let client = build_client(
+        &ProxyConfig {
+            mode: MODE_DIRECT.into(),
+            ..Default::default()
+        },
+        "",
+    )
+    .unwrap();
+
+    for Case {
+        name,
+        headers,
+        body,
+    } in cases
+    {
+        let port = serve_once(headers, body);
+        // 请求与读 body 必须在同一个运行时里：连接驱动任务随运行时销毁
+        let parsed: serde_json::Value = block_on(async {
+            let resp = client
+                .get(format!("http://127.0.0.1:{port}/x"))
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .unwrap();
+            parse_json_body(resp, "/x")
+                .await
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"))
+        });
+        assert_eq!(parsed["data"][0], "ok", "{name}");
+    }
+}

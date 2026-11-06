@@ -1,5 +1,6 @@
 use crate::adapters::http;
 use crate::storage;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,6 +25,35 @@ const PARALLEL_PARTS: usize = 4;
 const MAX_UPDATE_BYTES: u64 = 300 * 1024 * 1024;
 
 const USER_AGENT: &str = concat!("moling/", env!("CARGO_PKG_VERSION"));
+
+/// 单次清单请求与边缘探测的超时；检查阶段整体不超过 CHECK_TIMEOUT
+const MANIFEST_TIMEOUT: Duration = Duration::from_secs(3);
+const EDGE_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+/// 下载前探测各通道的总预算；真正下载不受此限制
+const PROBE_BUDGET: Duration = Duration::from_secs(45);
+/// 清单缓存有效期：过期后下载前重新获取，避免装到过旧版本
+const MANIFEST_TTL: Duration = Duration::from_secs(30 * 60);
+/// 清单只有几百字节，异常响应直接拒绝，避免拖爆内存
+const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+/// 镜像按 `{prefix}/{原始 github URL}` 转发；实测 gh-proxy 支持 Range
+const MIRRORS: &[(&str, &str)] = &[
+    ("gh-proxy.com", "https://gh-proxy.com"),
+    ("ghfast.top", "https://ghfast.top"),
+];
+
+/// 系统 DNS 可能解析到当前网络不可达的节点，这里按实测可达性排序。
+/// 与 scripts/lib/gh-net.mjs 的 KNOWN_EDGE_IPS 需人工保持一致。
+const EDGE_IPS: &[&str] = &[
+    "140.82.112.3",
+    "140.82.113.3",
+    "140.82.114.3",
+    "20.201.28.151",
+    "20.27.177.113",
+    "4.237.22.38",
+    "140.82.121.3",
+    "20.205.243.166",
+];
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,6 +101,154 @@ fn route_order(mode: &str) -> Vec<RouteKind> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChannelTag {
+    Official,
+    Edge,
+    Mirror,
+}
+
+/// 一条待尝试的下载通道：通道 × 线路（边缘 IP 只有直连）
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanItem {
+    tag: ChannelTag,
+    label: String,
+    url: reqwest::Url,
+    route: RouteKind,
+    /// 仅边缘 IP 通道：把 github.com 固定到该地址
+    pin: Option<IpAddr>,
+}
+
+fn is_github_endpoint(url: &reqwest::Url) -> bool {
+    url.host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("github.com"))
+}
+
+/// 本地验收端点（127.0.0.1 / ::1 / localhost）不能走代理，也没有镜像/边缘可言
+fn is_loopback(url: &reqwest::Url) -> bool {
+    match url.host_str() {
+        Some("localhost") => true,
+        Some(host) => host
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false),
+        None => false,
+    }
+}
+
+fn mirror_url(prefix: &str, url: &reqwest::Url) -> Option<reqwest::Url> {
+    let joined = format!("{}/{}", prefix.trim_end_matches('/'), url.as_str());
+    reqwest::Url::parse(&joined).ok()
+}
+
+fn dedupe_ips(raw: &[&str]) -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    for text in raw {
+        let Ok(ip) = text.trim().parse::<IpAddr>() else {
+            continue;
+        };
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    out
+}
+
+fn routes_for(url: &reqwest::Url, mode: &str) -> Vec<RouteKind> {
+    if is_loopback(url) {
+        vec![RouteKind::Direct]
+    } else {
+        route_order(mode)
+    }
+}
+
+/// 候选顺序：官方 → 边缘 IP → 镜像；非 github 端点只有官方。
+fn download_plan(url: &reqwest::Url, mode: &str) -> Vec<PlanItem> {
+    let routes = routes_for(url, mode);
+    let mut plan = Vec::new();
+    for route in routes.iter().copied() {
+        plan.push(PlanItem {
+            tag: ChannelTag::Official,
+            label: format!("官方({})", route.label()),
+            url: url.clone(),
+            route,
+            pin: None,
+        });
+    }
+    if !is_github_endpoint(url) {
+        return plan;
+    }
+    for ip in dedupe_ips(EDGE_IPS) {
+        plan.push(PlanItem {
+            tag: ChannelTag::Edge,
+            label: format!("边缘IP {ip}"),
+            url: url.clone(),
+            // 走代理时目标域名由代理解析，`.resolve` 不会生效
+            route: RouteKind::Direct,
+            pin: Some(ip),
+        });
+    }
+    for (name, prefix) in MIRRORS {
+        let Some(mirror) = mirror_url(prefix, url) else {
+            continue;
+        };
+        // 镜像本身就是为了绕开坏链路，前两条线路已足够
+        for route in routes.iter().copied().take(2) {
+            plan.push(PlanItem {
+                tag: ChannelTag::Mirror,
+                label: format!("镜像 {name}({})", route.label()),
+                url: mirror.clone(),
+                route,
+                pin: None,
+            });
+        }
+    }
+    plan
+}
+
+fn summarize_manifest_failure(attempts: &[String]) -> String {
+    if attempts.is_empty() {
+        return "获取更新清单失败：没有可用通道；如网络受限，请到「设置 → 网络」启用代理后重试"
+            .to_string();
+    }
+    let detail = attempts
+        .iter()
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("；");
+    let suffix = if attempts.len() > 3 {
+        format!("…（共 {} 条通道）", attempts.len())
+    } else {
+        String::new()
+    };
+    format!("获取更新清单失败：{detail}{suffix}；如网络受限，请到「设置 → 网络」启用代理后重试")
+}
+
+fn summarize_download_failure(attempts: &[String]) -> String {
+    let mut lines = vec![format!("更新下载失败：已尝试 {} 条通道", attempts.len())];
+    if attempts.is_empty() {
+        lines.push("  · 没有可用通道".to_string());
+    } else {
+        for attempt in attempts.iter().take(5) {
+            lines.push(format!("  · {attempt}"));
+        }
+        if attempts.len() > 5 {
+            lines.push(format!("  · 其余 {} 条略", attempts.len() - 5));
+        }
+    }
+    lines.push("如网络受限，请到「设置 → 网络」启用代理后重试。".to_string());
+    lines.join("\n")
+}
+
+/// 直连客户端：边缘 IP 通道专用，不叠加用户代理
+fn direct_config() -> http::ProxyConfig {
+    http::ProxyConfig {
+        mode: http::MODE_DIRECT.into(),
+        ..Default::default()
+    }
+}
+
 /// 把 `[0,total)` 拆成若干闭区间，覆盖完整且互不重叠。
 fn split_ranges(total: u64, parts: usize) -> Vec<(u64, u64)> {
     if total == 0 {
@@ -106,6 +284,20 @@ fn endpoints_configured(app: &AppHandle) -> bool {
         .and_then(|v| v.get("endpoints"))
         .and_then(|v| v.as_array())
         .is_some_and(|list| !list.is_empty())
+}
+
+fn configured_endpoint(app: &AppHandle) -> Result<reqwest::Url, String> {
+    let raw = app
+        .config()
+        .plugins
+        .0
+        .get("updater")
+        .and_then(|v| v.get("endpoints"))
+        .and_then(|v| v.as_array())
+        .and_then(|list| list.first())
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "尚未配置更新源".to_string())?;
+    reqwest::Url::parse(raw).map_err(|e| format!("更新源地址无效: {e}"))
 }
 
 /// 清单里的原始发布日期字符串；解析后的 OffsetDateTime 要额外引入 time 依赖，这里不取
@@ -228,11 +420,154 @@ async fn probe_route(client: &reqwest::Client, url: &reqwest::Url) -> Result<u64
     Err(format!("HTTP {status}"))
 }
 
+async fn fetch_manifest_once(
+    client: &reqwest::Client,
+    url: &reqwest::Url,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    let mut response = client
+        .get(url.clone())
+        .header(reqwest::header::USER_AGENT, USER_AGENT)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|e| format!("连接失败: {e}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
+    }
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_MANIFEST_BYTES)
+    {
+        return Err("更新清单异常（超出大小上限）".into());
+    }
+    let mut data = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("读取清单失败: {e}"))?
+    {
+        data.extend_from_slice(&chunk);
+        if data.len() as u64 > MAX_MANIFEST_BYTES {
+            return Err("更新清单异常（超出大小上限）".into());
+        }
+    }
+    serde_json::from_slice(&data).map_err(|e| format!("清单格式无效: {e}"))
+}
+
+/// 并发探测边缘 IP，首个能取回清单的直接返回；其余探测立即取消。
+async fn fetch_manifest_edges(
+    endpoint: &reqwest::Url,
+    timeout: Duration,
+) -> Option<(serde_json::Value, String)> {
+    let mut set = tokio::task::JoinSet::new();
+    for ip in dedupe_ips(EDGE_IPS) {
+        let url = endpoint.clone();
+        set.spawn(async move {
+            let client = http::build_client_pinned(
+                &direct_config(),
+                "",
+                "github.com",
+                SocketAddr::new(ip, 443),
+            )
+            .ok()?;
+            let raw = fetch_manifest_once(&client, &url, timeout).await.ok()?;
+            Some((ip, raw))
+        });
+    }
+    while let Some(joined) = set.join_next().await {
+        if let Ok(Some((ip, raw))) = joined {
+            set.abort_all();
+            return Some((raw, format!("边缘IP {ip}")));
+        }
+    }
+    None
+}
+
+/// 按线路尝试一次清单请求；失败原因写入 attempts，供最终错误文案使用。
+async fn try_manifest(
+    label: &str,
+    url: &reqwest::Url,
+    route: RouteKind,
+    deadline: Instant,
+    attempts: &mut Vec<String>,
+) -> Option<(serde_json::Value, String)> {
+    let Some(client) = route_client(route) else {
+        attempts.push(format!("{label}({}): 线路不可用", route.label()));
+        return None;
+    };
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return None;
+    }
+    match fetch_manifest_once(&client, url, MANIFEST_TIMEOUT.min(remaining)).await {
+        Ok(raw) => Some((raw, format!("{label}({})", route.label()))),
+        Err(e) => {
+            attempts.push(format!("{label}({}): {e}", route.label()));
+            None
+        }
+    }
+}
+
+/// 清单获取通道阶梯：官方（尊重用户代理）→ 边缘 IP（仅直连）→ 镜像。
+async fn fetch_manifest_ladder(
+    endpoint: &reqwest::Url,
+    mode: &str,
+) -> Result<(serde_json::Value, String, Vec<String>), String> {
+    let deadline = Instant::now() + CHECK_TIMEOUT;
+    let mut attempts = Vec::new();
+    let routes = routes_for(endpoint, mode);
+
+    for route in routes.iter().copied() {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if let Some((raw, source)) =
+            try_manifest("官方", endpoint, route, deadline, &mut attempts).await
+        {
+            return Ok((raw, source, attempts));
+        }
+    }
+
+    let github = is_github_endpoint(endpoint);
+    if github && Instant::now() < deadline {
+        let timeout = EDGE_PROBE_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
+        match fetch_manifest_edges(endpoint, timeout).await {
+            Some((raw, source)) => return Ok((raw, source, attempts)),
+            None => attempts.push(format!("边缘IP×{}", dedupe_ips(EDGE_IPS).len())),
+        }
+    }
+
+    if github {
+        for (name, prefix) in MIRRORS {
+            let label = format!("镜像 {name}");
+            let Some(url) = mirror_url(prefix, endpoint) else {
+                continue;
+            };
+            for route in routes.iter().copied().take(2) {
+                if Instant::now() >= deadline {
+                    attempts.push(format!("{label}: 预算耗尽未尝试"));
+                    break;
+                }
+                if let Some((raw, source)) =
+                    try_manifest(&label, &url, route, deadline, &mut attempts).await
+                {
+                    return Ok((raw, source, attempts));
+                }
+            }
+        }
+    }
+
+    Err(summarize_manifest_failure(&attempts))
+}
+
 /// 上传进度：分段计数分开累加，重试/回退时可精确回滚，不会出现进度倒退或超 100%。
 struct ProgressTracker {
     handle: AppHandle,
     total: u64,
-    route: &'static str,
+    route: String,
     started: Instant,
     /// 0 号槽位给单连接，1..=PARALLEL_PARTS 给各分段
     counters: Vec<AtomicU64>,
@@ -240,11 +575,11 @@ struct ProgressTracker {
 }
 
 impl ProgressTracker {
-    fn new(handle: AppHandle, total: u64, route: &'static str) -> Self {
+    fn new(handle: AppHandle, total: u64, route: impl Into<String>) -> Self {
         Self {
             handle,
             total,
-            route,
+            route: route.into(),
             started: Instant::now(),
             counters: (0..=PARALLEL_PARTS).map(|_| AtomicU64::new(0)).collect(),
             done: AtomicBool::new(false),
@@ -485,6 +820,70 @@ fn validate_range_total(total: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// 边缘 IP 组并发探测：先确认哪些可达，再串行下载，避免同时开多条下载连接。
+async fn probe_edge_group(
+    items: &[PlanItem],
+    timeout: Duration,
+) -> Vec<(String, reqwest::Client, reqwest::Url, u64)> {
+    let mut set = tokio::task::JoinSet::new();
+    for item in items {
+        let Some(ip) = item.pin else {
+            continue;
+        };
+        let label = item.label.clone();
+        let url = item.url.clone();
+        set.spawn(async move {
+            let client = http::build_client_pinned(
+                &direct_config(),
+                "",
+                "github.com",
+                SocketAddr::new(ip, 443),
+            )
+            .ok()?;
+            let total = tokio::time::timeout(timeout, probe_route(&client, &url))
+                .await
+                .ok()?
+                .ok()?;
+            Some((label, client, url, total))
+        });
+    }
+
+    let mut reached = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        if let Ok(Some(item)) = joined {
+            reached.push(item);
+        }
+    }
+    reached
+}
+
+async fn download_with_client(
+    app: &AppHandle,
+    client: &reqwest::Client,
+    url: &reqwest::Url,
+    total: u64,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    validate_range_total(total)?;
+    let progress = Arc::new(ProgressTracker::new(app.clone(), total, label));
+    let bytes = download_with_route(client, url, total, progress).await?;
+    if bytes.len() as u64 == total {
+        Ok(bytes)
+    } else {
+        Err(format!("下载不完整（{} / {total} 字节）", bytes.len()))
+    }
+}
+
+async fn try_download(
+    app: &AppHandle,
+    client: &reqwest::Client,
+    url: &reqwest::Url,
+    label: &str,
+) -> Result<Vec<u8>, String> {
+    let total = probe_route(client, url).await?;
+    download_with_client(app, client, url, total, label).await
+}
+
 #[tauri::command]
 pub async fn get_update_status(app: AppHandle) -> Result<UpdateStatus, String> {
     let current_version = app.package_info().version.to_string();
@@ -496,32 +895,64 @@ pub async fn get_update_status(app: AppHandle) -> Result<UpdateStatus, String> {
             error: None,
         });
     }
-    let updater = build_updater(&app)?;
-    match updater.check().await {
-        Ok(Some(update)) => Ok(UpdateStatus {
-            current_version,
-            configured: true,
-            available: Some(AvailableUpdate {
-                version: update.version.clone(),
-                notes: update.body.clone(),
-                date: date_of(&update.raw_json),
-            }),
-            error: None,
-        }),
-        Ok(None) => Ok(UpdateStatus {
-            current_version,
-            configured: true,
-            available: None,
-            error: None,
-        }),
+
+    let endpoint = configured_endpoint(&app)?;
+    let mode = http::stored_config().mode;
+    let (raw, source, _) = match fetch_manifest_ladder(&endpoint, &mode).await {
+        Ok(hit) => hit,
         // 检查失败（离线、更新源不可达）不是致命错误：前端要显示原因但保留重试入口
+        Err(e) => {
+            return Ok(UpdateStatus {
+                current_version,
+                configured: true,
+                available: None,
+                error: Some(e),
+            })
+        }
+    };
+    tracing::warn!("更新清单获取成功，来源：{source}");
+
+    let updater = build_updater(&app)?;
+    match updater.restore_update(raw.clone()) {
+        Ok(Some(update)) => {
+            store_manifest(&app, raw, &update.version, &source);
+            Ok(UpdateStatus {
+                current_version,
+                configured: true,
+                available: Some(AvailableUpdate {
+                    version: update.version.clone(),
+                    notes: update.body.clone(),
+                    date: date_of(&update.raw_json),
+                }),
+                error: None,
+            })
+        }
+        Ok(None) => {
+            // 已是最新：旧清单不能再用于下载，否则可能装到过旧版本
+            clear_manifest(&app);
+            Ok(UpdateStatus {
+                current_version,
+                configured: true,
+                available: None,
+                error: None,
+            })
+        }
         Err(e) => Ok(UpdateStatus {
             current_version,
             configured: true,
             available: None,
-            error: Some(e.to_string()),
+            error: Some(format!("更新清单无效：{e}")),
         }),
     }
+}
+
+/// 最近一次成功获取的清单；下载阶段据此还原 Update，不再联网
+#[derive(Clone)]
+struct CachedManifest {
+    raw_json: serde_json::Value,
+    version: String,
+    source: String,
+    saved_at: Instant,
 }
 
 /// 已下载校验通过的更新包；安装阶段直接用它，不再联网。
@@ -531,35 +962,72 @@ struct CachedUpdate {
 }
 
 #[derive(Default)]
-pub struct UpdateCache(Mutex<Option<CachedUpdate>>);
+struct UpdateCacheInner {
+    manifest: Option<CachedManifest>,
+    ready: Option<CachedUpdate>,
+}
+
+#[derive(Default)]
+pub struct UpdateCache(Mutex<UpdateCacheInner>);
+
+impl UpdateCache {
+    /// 锁中毒时继续用内部值：缓存损坏不应让整个进程再也无法检查或安装更新
+    fn with<R>(&self, f: impl FnOnce(&mut UpdateCacheInner) -> R) -> R {
+        match self.0.lock() {
+            Ok(mut guard) => f(&mut guard),
+            Err(poisoned) => f(&mut poisoned.into_inner()),
+        }
+    }
+}
+
+fn store_manifest(app: &AppHandle, raw_json: serde_json::Value, version: &str, source: &str) {
+    let cache = app.state::<UpdateCache>();
+    cache.with(|inner| {
+        inner.manifest = Some(CachedManifest {
+            raw_json,
+            version: version.to_string(),
+            source: source.to_string(),
+            saved_at: Instant::now(),
+        });
+        // 清单版本变了，之前下好的包不能再用于安装
+        if inner
+            .ready
+            .as_ref()
+            .is_some_and(|cached| cached.update.version != version)
+        {
+            inner.ready = None;
+        }
+    });
+}
+
+fn load_manifest(app: &AppHandle) -> Option<CachedManifest> {
+    let cache = app.state::<UpdateCache>();
+    cache.with(|inner| inner.manifest.clone())
+}
+
+fn clear_manifest(app: &AppHandle) {
+    let cache = app.state::<UpdateCache>();
+    cache.with(|inner| inner.manifest = None);
+}
 
 fn take_cached(app: &AppHandle) -> Option<CachedUpdate> {
     let cache = app.state::<UpdateCache>();
-    let taken = match cache.0.lock() {
-        Ok(mut guard) => guard.take(),
-        Err(poisoned) => poisoned.into_inner().take(),
-    };
-    taken
+    cache.with(|inner| inner.ready.take())
 }
 
 fn restore_cached(app: &AppHandle, cached: CachedUpdate) {
     let cache = app.state::<UpdateCache>();
-    match cache.0.lock() {
-        Ok(mut guard) => *guard = Some(cached),
-        Err(poisoned) => *poisoned.into_inner() = Some(cached),
-    };
+    cache.with(|inner| inner.ready = Some(cached));
 }
 
 fn cached_version(app: &AppHandle) -> Option<String> {
     let cache = app.state::<UpdateCache>();
-    let version = match cache.0.lock() {
-        Ok(guard) => guard.as_ref().map(|c| c.update.version.clone()),
-        Err(poisoned) => poisoned
-            .into_inner()
+    cache.with(|inner| {
+        inner
+            .ready
             .as_ref()
-            .map(|c| c.update.version.clone()),
-    };
-    version
+            .map(|cached| cached.update.version.clone())
+    })
 }
 
 #[tauri::command]
@@ -576,80 +1044,126 @@ pub async fn download_update(app: AppHandle) -> Result<(), String> {
     result
 }
 
+fn verify_failure(err: &tauri_plugin_updater::Error) -> String {
+    use tauri_plugin_updater::Error as UpdaterError;
+    match err {
+        UpdaterError::SignedVersionMismatch { signed, announced } => format!(
+            "更新包签名版本（{signed}）与清单版本（{announced}）不一致，可能被篡改，已拒绝安装"
+        ),
+        UpdaterError::MissingSignedVersion => {
+            "更新包签名不含版本信息（旧构建产物），请用新版 Tauri CLI 重新构建发布".to_string()
+        }
+        other => format!("更新包校验失败: {other}"),
+    }
+}
+
 async fn download_update_inner(app: &AppHandle) -> Result<(), String> {
     let updater = build_updater(app)?;
-    let update = updater
-        .check()
-        .await
-        .map_err(|e| format!("检查更新失败: {e}"))?
-        .ok_or_else(|| "当前已是最新版本".to_string())?;
+    let mode = http::stored_config().mode;
+
+    // 优先复用最近一次检查的清单：网络抖动不应该在点「下载」时再失败一次
+    let cached = load_manifest(app).filter(|manifest| manifest.saved_at.elapsed() < MANIFEST_TTL);
+    let (raw, source) = match cached {
+        Some(manifest) => {
+            tracing::warn!(
+                "复用缓存清单 v{}，来源：{}",
+                manifest.version,
+                manifest.source
+            );
+            (manifest.raw_json, manifest.source)
+        }
+        None => {
+            let endpoint = configured_endpoint(app)?;
+            let (raw, source, _) = fetch_manifest_ladder(&endpoint, &mode)
+                .await
+                .map_err(|e| format!("获取更新信息失败：{e}"))?;
+            (raw, source)
+        }
+    };
+
+    let update = match updater.restore_update(raw) {
+        Ok(Some(update)) => update,
+        Ok(None) => return Err("当前已是最新版本".to_string()),
+        Err(e) => return Err(format!("更新清单无效：{e}")),
+    };
+    store_manifest(app, update.raw_json.clone(), &update.version, &source);
 
     if cached_version(app).as_deref() == Some(update.version.as_str()) {
         return Ok(());
     }
 
-    let mode = http::stored_config().mode;
-    let url = update.download_url.clone();
-    let mut last_error = String::new();
+    let plan = download_plan(&update.download_url, &mode);
+    let deadline = Instant::now() + PROBE_BUDGET;
+    let mut attempts = Vec::new();
     let mut downloaded: Option<Vec<u8>> = None;
-    // 线路逐条尝试：探测通过但下载中途失败时，继续走下一线路
-    for kind in route_order(&mode) {
-        let Some(client) = route_client(kind) else {
-            continue;
-        };
-        let total = match probe_route(&client, &url).await {
-            Ok(total) => total,
-            Err(e) => {
-                tracing::warn!("更新线路 {} 探测失败: {e}", kind.label());
-                last_error = format!("{}: {e}", kind.label());
+    let mut edge_done = false;
+
+    for item in &plan {
+        if Instant::now() >= deadline {
+            attempts.push("剩余通道因探测超时未尝试".to_string());
+            break;
+        }
+
+        if item.tag == ChannelTag::Edge {
+            if edge_done {
                 continue;
             }
-        };
-        validate_range_total(total)?;
+            edge_done = true;
+            let edges: Vec<PlanItem> = plan
+                .iter()
+                .filter(|entry| entry.tag == ChannelTag::Edge)
+                .cloned()
+                .collect();
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let reached = probe_edge_group(&edges, PROBE_TIMEOUT.min(remaining)).await;
+            if reached.is_empty() {
+                attempts.push(format!("边缘IP×{}", edges.len()));
+            }
+            for (label, client, url, total) in reached {
+                match download_with_client(app, &client, &url, total, &label).await {
+                    Ok(bytes) => {
+                        downloaded = Some(bytes);
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!("{label} 下载失败: {e}");
+                        attempts.push(format!("{label}: {e}"));
+                    }
+                }
+            }
+            if downloaded.is_some() {
+                break;
+            }
+            continue;
+        }
 
-        tracing::warn!("更新下载线路已选：{}", kind.label());
-        let progress = Arc::new(ProgressTracker::new(app.clone(), total, kind.label()));
-        match download_with_route(&client, &url, total, progress).await {
-            Ok(bytes) if bytes.len() as u64 == total => {
+        let Some(client) = route_client(item.route) else {
+            continue;
+        };
+        match try_download(app, &client, &item.url, &item.label).await {
+            Ok(bytes) => {
                 downloaded = Some(bytes);
                 break;
             }
-            Ok(bytes) => {
-                tracing::warn!(
-                    "线路 {} 下载长度不符（{} / {total}）",
-                    kind.label(),
-                    bytes.len()
-                );
-                last_error = format!(
-                    "{}: 下载不完整（{} / {total} 字节）",
-                    kind.label(),
-                    bytes.len()
-                );
-            }
             Err(e) => {
-                tracing::warn!("线路 {} 下载失败: {e}", kind.label());
-                last_error = format!("{}: {e}", kind.label());
+                tracing::warn!("{} 下载失败: {e}", item.label);
+                attempts.push(format!("{}: {e}", item.label));
             }
         }
     }
-    let Some(bytes) = downloaded else {
-        return Err(format!("更新下载失败（{last_error}）"));
-    };
-    update
-        .verify(&bytes)
-        .map_err(|e| format!("更新包校验失败: {e}"))?;
 
-    {
-        let cache = app.state::<UpdateCache>();
-        let mut guard = match cache.0.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *guard = Some(CachedUpdate {
+    let Some(bytes) = downloaded else {
+        return Err(summarize_download_failure(&attempts));
+    };
+    update.verify(&bytes).map_err(|e| verify_failure(&e))?;
+
+    let cache = app.state::<UpdateCache>();
+    cache.with(|inner| {
+        inner.ready = Some(CachedUpdate {
             update,
             bytes: Arc::new(bytes),
-        });
-    }
+        })
+    });
     let _ = app.emit("update:downloaded", serde_json::json!({}));
     Ok(())
 }
@@ -772,5 +1286,172 @@ mod tests {
             "http://127.0.0.1:8787/latest.json"
         );
         assert!(cfg.dangerous_insecure_transport_protocol);
+    }
+
+    fn parse(url: &str) -> reqwest::Url {
+        url.parse().expect("url 有效")
+    }
+
+    #[test]
+    fn github_endpoint_detection_is_exact_host() {
+        assert!(is_github_endpoint(&parse(
+            "https://github.com/2426758093/moling/releases/latest/download/latest.json"
+        )));
+        assert!(!is_github_endpoint(&parse(
+            "https://cdn.github.com/latest.json"
+        )));
+        assert!(!is_github_endpoint(&parse(
+            "http://127.0.0.1:8787/latest.json"
+        )));
+        assert!(is_loopback(&parse("http://127.0.0.1:8787/latest.json")));
+        assert!(is_loopback(&parse("http://localhost:8787/latest.json")));
+        assert!(!is_loopback(&parse("https://gh-proxy.com/x")));
+    }
+
+    #[test]
+    fn mirror_url_keeps_path_and_query() {
+        let url = parse("https://github.com/o/r/releases/download/v1/latest.json?x=1");
+        let mirror = mirror_url("https://gh-proxy.com/", &url).expect("可改写");
+        assert_eq!(
+            mirror.as_str(),
+            "https://gh-proxy.com/https://github.com/o/r/releases/download/v1/latest.json?x=1"
+        );
+    }
+
+    #[test]
+    fn dedupe_ips_preserves_order_and_drops_invalid() {
+        let ips = dedupe_ips(&["1.2.3.4", "bad", "1.2.3.4", "5.6.7.8", " "]);
+        assert_eq!(ips.len(), 2);
+        assert_eq!(ips[0].to_string(), "1.2.3.4");
+        assert_eq!(ips[1].to_string(), "5.6.7.8");
+    }
+
+    #[test]
+    fn routes_for_loopback_is_direct_only() {
+        // 本地验收端点不能被系统代理接管
+        assert_eq!(
+            routes_for(
+                &parse("http://127.0.0.1:8787/latest.json"),
+                http::MODE_SYSTEM
+            ),
+            vec![RouteKind::Direct]
+        );
+        assert_eq!(
+            routes_for(&parse("https://github.com/x"), http::MODE_DIRECT),
+            vec![RouteKind::Direct, RouteKind::System]
+        );
+    }
+
+    #[test]
+    fn download_plan_orders_official_edge_mirror() {
+        let url = parse(
+            "https://github.com/2426758093/moling/releases/download/v1.2.1/moling_1.2.1_x64-setup.exe",
+        );
+        let plan = download_plan(&url, http::MODE_DIRECT);
+        let official_last = plan
+            .iter()
+            .rposition(|item| item.tag == ChannelTag::Official)
+            .expect("包含官方通道");
+        let edge_first = plan
+            .iter()
+            .position(|item| item.tag == ChannelTag::Edge)
+            .expect("包含边缘通道");
+        let mirror_first = plan
+            .iter()
+            .position(|item| item.tag == ChannelTag::Mirror)
+            .expect("包含镜像通道");
+        assert!(official_last < edge_first && edge_first < mirror_first);
+
+        let edge = &plan[edge_first];
+        assert_eq!(edge.route, RouteKind::Direct);
+        assert!(edge.pin.is_some());
+        assert!(plan[mirror_first]
+            .url
+            .as_str()
+            .starts_with("https://gh-proxy.com/https://github.com/"));
+    }
+
+    #[test]
+    fn download_plan_for_localhost_has_no_edge_or_mirror() {
+        let plan = download_plan(
+            &parse("http://127.0.0.1:8787/moling.exe"),
+            http::MODE_SYSTEM,
+        );
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].tag, ChannelTag::Official);
+        assert_eq!(plan[0].route, RouteKind::Direct);
+    }
+
+    #[test]
+    fn failure_summaries_stay_actionable() {
+        let attempts = vec![
+            "官方(直连): 连接失败".to_string(),
+            "镜像 gh-proxy.com(系统网络): 读取超时".to_string(),
+        ];
+        let single = summarize_manifest_failure(&attempts);
+        assert!(single.contains("官方(直连)"));
+        assert!(single.contains("设置 → 网络"));
+        assert!(!single.contains('\n'));
+
+        let multi = summarize_download_failure(&attempts);
+        assert!(multi.contains("已尝试 2 条通道"));
+        assert!(multi.contains("\n  · "));
+        assert!(multi.contains("设置 → 网络"));
+    }
+
+    /// 起一个只响应一次的本地 HTTP 服务，避免测试依赖外网
+    fn serve_once(response: &'static str) -> reqwest::Url {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
+        let addr = listener.local_addr().expect("本地地址");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        parse(&format!("http://{addr}/latest.json"))
+    }
+
+    #[test]
+    fn fetch_manifest_once_parses_json() {
+        let url = serve_once(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+        );
+        let value = tauri::async_runtime::block_on(fetch_manifest_once(
+            &reqwest::Client::new(),
+            &url,
+            Duration::from_secs(5),
+        ))
+        .expect("应解析成功");
+        assert_eq!(value["ok"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn fetch_manifest_once_rejects_http_error() {
+        let url = serve_once(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        );
+        let err = tauri::async_runtime::block_on(fetch_manifest_once(
+            &reqwest::Client::new(),
+            &url,
+            Duration::from_secs(5),
+        ))
+        .expect_err("500 应报错");
+        assert!(err.contains("HTTP 500"), "{err}");
+    }
+
+    #[test]
+    fn fetch_manifest_once_rejects_oversize() {
+        let url =
+            serve_once("HTTP/1.1 200 OK\r\nContent-Length: 2000000\r\nConnection: close\r\n\r\n");
+        let err = tauri::async_runtime::block_on(fetch_manifest_once(
+            &reqwest::Client::new(),
+            &url,
+            Duration::from_secs(5),
+        ))
+        .expect_err("超大清单应报错");
+        assert!(err.contains("超出大小上限"), "{err}");
     }
 }

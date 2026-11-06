@@ -335,10 +335,14 @@ pub fn classify_reqwest(err: &reqwest::Error) -> AdapterError {
 /// 响应体解析失败时保留的字符数：够看出是 HTML 错误页、错误 JSON 还是压缩字节
 const JSON_PREVIEW_CHARS: usize = 300;
 
+/// 解压后允许的最大字节数：防止被构造成压缩炸弹的响应撑爆内存
+const MAX_DECODED_BODY_BYTES: u64 = 64 * 1024 * 1024;
+
 /// 读取成功响应并按 JSON 解析。
 ///
-/// 不走 `Response::json()`：reqwest 的 decode 错误只是 "error decoding response body"，
-/// 状态码 / Content-Type / 真实响应体全被丢掉，中转站或代理返回异常内容时无法定位。
+/// 不用 `Response::json()`，也不交给 reqwest 自动解压：链路（安全软件 / 透明代理 /
+/// 网关）一旦谎报或篡改 Content-Encoding，reqwest 会丢掉原始字节，只留下
+/// "error decoding response body"。这里读原始字节后自己按「明文 → 魔数 → 头」宽容解码。
 pub async fn parse_json_body<T: serde::de::DeserializeOwned>(
     resp: reqwest::Response,
     api: &str,
@@ -346,7 +350,26 @@ pub async fn parse_json_body<T: serde::de::DeserializeOwned>(
     let status = resp.status().as_u16();
     let content_type = header_value(&resp, reqwest::header::CONTENT_TYPE);
     let content_encoding = header_value(&resp, reqwest::header::CONTENT_ENCODING);
-    let bytes = resp.bytes().await.map_err(|e| classify_reqwest(&e))?;
+    let content_length = header_value(&resp, reqwest::header::CONTENT_LENGTH);
+    let started = std::time::Instant::now();
+    let bytes = match resp.bytes().await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            // 读流失败原先只透出 "error decoding response body"，状态码 / 编码 / 耗时全丢失
+            let message = format!(
+                "{api} 读取响应失败（{}，耗时 {:.1}s）: {}",
+                response_meta(status, &content_type, &content_encoding, &content_length),
+                started.elapsed().as_secs_f64(),
+                reqwest_error_chain(&e),
+            );
+            tracing::warn!("{}", message);
+            return Err(if e.is_timeout() {
+                AdapterError::Timeout { message }
+            } else {
+                AdapterError::Other { message }
+            });
+        }
+    };
     parse_json_bytes(api, status, &content_type, &content_encoding, &bytes)
 }
 
@@ -358,6 +381,52 @@ fn header_value(resp: &reqwest::Response, name: reqwest::header::HeaderName) -> 
         .to_string()
 }
 
+fn response_meta(
+    status: u16,
+    content_type: &str,
+    content_encoding: &str,
+    content_length: &str,
+) -> String {
+    let mut meta = format!("HTTP {status}");
+    for (name, value) in [
+        ("Content-Type", content_type),
+        ("Content-Encoding", content_encoding),
+        ("Content-Length", content_length),
+    ] {
+        if !value.is_empty() {
+            meta.push_str(", ");
+            meta.push_str(name);
+            meta.push_str(": ");
+            meta.push_str(value);
+        }
+    }
+    meta
+}
+
+/// reqwest 顶层只有一句 "error decoding response body"，真正原因（连接中断 / 解压失败 /
+/// 超时）在 source 链里，必须展开才能定位。
+fn reqwest_error_chain(err: &reqwest::Error) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = current {
+        let text = e.to_string();
+        if !text.is_empty() && parts.last().map(String::as_str) != Some(text.as_str()) {
+            parts.push(text);
+        }
+        current = e.source();
+    }
+    let hint = if err.is_timeout() {
+        "（等待响应超时）"
+    } else if err.is_connect() {
+        "（连接失败）"
+    } else if err.is_body() || err.is_decode() {
+        "（响应流读取或解压失败）"
+    } else {
+        ""
+    };
+    format!("{}{}", parts.join(" <- "), hint)
+}
+
 /// 解析失败时把接口、状态码、编码与响应体开头写进错误并落日志（诊断包会带上）。
 pub(crate) fn parse_json_bytes<T: serde::de::DeserializeOwned>(
     api: &str,
@@ -366,27 +435,96 @@ pub(crate) fn parse_json_bytes<T: serde::de::DeserializeOwned>(
     content_encoding: &str,
     bytes: &[u8],
 ) -> Result<T, AdapterError> {
+    // 明文优先：头写了 gzip 但 body 已被中间层解压时，这一步就能直接成功
     match serde_json::from_slice(bytes) {
         Ok(value) => Ok(value),
-        Err(e) => {
-            let mut meta = format!("HTTP {status}");
-            if !content_type.is_empty() {
-                meta.push_str(", Content-Type: ");
-                meta.push_str(content_type);
+        Err(plain_err) => {
+            let Some(decoded) = decode_body(bytes, content_encoding) else {
+                return Err(parse_error(
+                    api,
+                    status,
+                    content_type,
+                    content_encoding,
+                    None,
+                    bytes,
+                    &plain_err,
+                ));
+            };
+            match serde_json::from_slice(&decoded) {
+                Ok(value) => Ok(value),
+                // 解压成功但内容不是 JSON：按解压后的内容报告，才能看到真实错误页
+                Err(decoded_err) => Err(parse_error(
+                    api,
+                    status,
+                    content_type,
+                    content_encoding,
+                    Some(&decoded),
+                    bytes,
+                    &decoded_err,
+                )),
             }
-            if !content_encoding.is_empty() {
-                meta.push_str(", Content-Encoding: ");
-                meta.push_str(content_encoding);
-            }
-            let message = format!(
-                "{api} 响应解析失败（{meta}，{} 字节）: {e}；响应体开头: {}",
-                bytes.len(),
-                body_preview(bytes)
-            );
-            tracing::warn!("{}", message);
-            Err(AdapterError::Other { message })
         }
     }
+}
+
+fn parse_error(
+    api: &str,
+    status: u16,
+    content_type: &str,
+    content_encoding: &str,
+    decoded: Option<&[u8]>,
+    body: &[u8],
+    err: &serde_json::Error,
+) -> AdapterError {
+    let meta = response_meta(status, content_type, content_encoding, "");
+    let (size, preview) = match decoded {
+        Some(decoded) => (
+            format!("解压后 {} 字节", decoded.len()),
+            body_preview(decoded),
+        ),
+        None => (format!("{} 字节", body.len()), body_preview(body)),
+    };
+    let message = format!("{api} 响应解析失败（{meta}，{size}）: {err}；响应体开头: {preview}");
+    tracing::warn!("{}", message);
+    AdapterError::Other { message }
+}
+
+/// 宽容解码：先看压缩魔数（头可能缺失），再按 Content-Encoding 逐段解。
+/// 请求已声明 `Accept-Encoding: identity`，走到这里说明链路仍然强行压缩了。
+fn decode_body(bytes: &[u8], content_encoding: &str) -> Option<Vec<u8>> {
+    if bytes.starts_with(&[0x1f, 0x8b]) {
+        return inflate_with(flate2::read::GzDecoder::new(bytes));
+    }
+    for token in content_encoding
+        .split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .rev()
+    {
+        match token.to_ascii_lowercase().as_str() {
+            "gzip" | "x-gzip" => return inflate_with(flate2::read::GzDecoder::new(bytes)),
+            // 规范是 zlib 包装，但不少服务端/网关发裸 deflate，两种都试
+            "deflate" => {
+                return inflate_with(flate2::read::ZlibDecoder::new(bytes))
+                    .or_else(|| inflate_with(flate2::read::DeflateDecoder::new(bytes)))
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn inflate_with<R: std::io::Read>(reader: R) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    reader
+        .take(MAX_DECODED_BODY_BYTES + 1)
+        .read_to_end(&mut out)
+        .ok()?;
+    if out.is_empty() || out.len() as u64 > MAX_DECODED_BODY_BYTES {
+        return None;
+    }
+    Some(out)
 }
 
 fn body_preview(bytes: &[u8]) -> String {
@@ -395,7 +533,15 @@ fn body_preview(bytes: &[u8]) -> String {
     }
     // 先按字节截断再转字符串：多字节字符被切在中间时 lossy 兜底，不会 panic
     let head = &bytes[..bytes.len().min(2048)];
+    if head.iter().any(|b| !is_displayable(*b)) {
+        let hex: Vec<String> = head.iter().take(32).map(|b| format!("{b:02x}")).collect();
+        return format!("<二进制> {}", hex.join(" "));
+    }
     openai::truncate_preview(&String::from_utf8_lossy(head), JSON_PREVIEW_CHARS)
+}
+
+fn is_displayable(b: u8) -> bool {
+    matches!(b, b'\t' | b'\n' | b'\r') || (0x20..=0x7e).contains(&b) || b >= 0x80
 }
 
 #[cfg(test)]
@@ -510,5 +656,58 @@ mod json_parse_tests {
         let err =
             parse_json_bytes::<Payload>("api", 200, "text/html", "", body.as_bytes()).unwrap_err();
         assert!(err.message().contains('…'), "{}", err.message());
+    }
+
+    fn gzip(data: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(data).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    /// 核心回归：头写了 gzip 但中间层已把 body 解成明文，必须直接解析成功
+    /// （旧实现交给 reqwest 自动解压，这条路径只会得到 "error decoding response body"）
+    #[test]
+    fn accepts_plain_body_with_lying_gzip_header() {
+        let parsed: Payload =
+            parse_json_bytes("api", 200, "application/json", "gzip", br#"{"data":["a"]}"#).unwrap();
+        assert_eq!(parsed.data, vec!["a".to_string()]);
+    }
+
+    /// 头缺失但字节是 gzip：按魔数兜底解压
+    #[test]
+    fn accepts_gzip_body_without_header() {
+        let body = gzip(br#"{"data":["b"]}"#);
+        let parsed: Payload = parse_json_bytes("api", 200, "application/json", "", &body).unwrap();
+        assert_eq!(parsed.data, vec!["b".to_string()]);
+    }
+
+    /// 头与字节一致的 gzip：由自身解码，不依赖 reqwest 的自动解压特性
+    #[test]
+    fn accepts_gzip_body_with_header() {
+        let body = gzip(br#"{"data":["c"]}"#);
+        let parsed: Payload =
+            parse_json_bytes("api", 200, "application/json", "gzip", &body).unwrap();
+        assert_eq!(parsed.data, vec!["c".to_string()]);
+    }
+
+    /// 截断的压缩流：错误里必须有状态码 / 编码 / 字节数，预览用十六进制而不是乱码
+    #[test]
+    fn binary_parse_error_previews_hex() {
+        let mut body = gzip(br#"{"data":["d"]}"#);
+        body.truncate(body.len() / 2);
+        let err =
+            parse_json_bytes::<Payload>("api", 200, "application/json", "gzip", &body).unwrap_err();
+        let message = err.message();
+        for needle in [
+            "HTTP 200",
+            "Content-Encoding: gzip",
+            &format!("{} 字节", body.len()),
+            "<二进制> 1f 8b",
+        ] {
+            assert!(message.contains(needle), "缺少 {needle}: {message}");
+        }
     }
 }

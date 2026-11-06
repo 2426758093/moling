@@ -1,6 +1,6 @@
 use super::{
-    classify_http, classify_reqwest, download_image_bytes, http_client, AdapterError, EditRequest,
-    GenerateRequest, ImageAdapter, ProviderConfig, TransformRequest,
+    classify_http, classify_reqwest, download_image_bytes, http_client, parse_json_body,
+    AdapterError, EditRequest, GenerateRequest, ImageAdapter, ProviderConfig, TransformRequest,
 };
 use base64::Engine;
 
@@ -307,11 +307,8 @@ impl TemplateAdapter {
             let text = resp.text().await.unwrap_or_default();
             return Err(classify_http(status, &text));
         }
-        let text = resp.text().await.map_err(|e| classify_reqwest(&e))?;
-        let json: serde_json::Value =
-            serde_json::from_str(&text).map_err(|_| AdapterError::Other {
-                message: "响应不是合法 JSON".into(),
-            })?;
+        // 与内置适配器同一条解析路径：关闭自动解压后仍能兜底处理压缩响应
+        let json: serde_json::Value = parse_json_body(resp, url).await?;
         // 从响应中提取图片：优先按 response_path 提取，其次寻找常见字段
         let path = if response_path.is_empty() {
             "data[0].b64_json".to_string()

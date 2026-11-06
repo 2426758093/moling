@@ -117,9 +117,15 @@ pub fn install(client: Arc<reqwest::Client>) {
     }
 }
 
-pub fn build_client(cfg: &ProxyConfig, password: &str) -> Result<reqwest::Client, String> {
+fn client_builder(cfg: &ProxyConfig, password: &str) -> Result<reqwest::ClientBuilder, String> {
     cfg.validate()?;
-    let mut builder = reqwest::Client::builder();
+    // 明确要求明文：压缩由 adapters::mod 兜底解码，避免中间层谎报编码时原始字节被丢弃
+    let mut default_headers = reqwest::header::HeaderMap::new();
+    default_headers.insert(
+        reqwest::header::ACCEPT_ENCODING,
+        reqwest::header::HeaderValue::from_static("identity"),
+    );
+    let mut builder = reqwest::Client::builder().default_headers(default_headers);
     match cfg.mode.as_str() {
         MODE_DIRECT => builder = builder.no_proxy(),
         MODE_MANUAL => {
@@ -136,7 +142,25 @@ pub fn build_client(cfg: &ProxyConfig, password: &str) -> Result<reqwest::Client
         // system：由 reqwest 的 system-proxy 特性读取系统/环境代理
         _ => {}
     }
-    builder
+    Ok(builder)
+}
+
+pub fn build_client(cfg: &ProxyConfig, password: &str) -> Result<reqwest::Client, String> {
+    client_builder(cfg, password)?
+        .build()
+        .map_err(|e| format!("HTTP 客户端构建失败: {e}"))
+}
+
+/// 把 `host` 固定到指定地址，绕过系统 DNS；TLS 仍按原域名校验证书。
+/// 仅适用于受限网络下访问解析结果不可达的同名主机。
+pub fn build_client_pinned(
+    cfg: &ProxyConfig,
+    password: &str,
+    host: &str,
+    addr: std::net::SocketAddr,
+) -> Result<reqwest::Client, String> {
+    client_builder(cfg, password)?
+        .resolve(host, addr)
         .build()
         .map_err(|e| format!("HTTP 客户端构建失败: {e}"))
 }
@@ -228,6 +252,18 @@ mod tests {
         }
         let cfg = manual("http://127.0.0.1:7890");
         assert!(build_client(&cfg, "secret").is_ok());
+    }
+
+    #[test]
+    fn build_client_pinned_accepts_direct_mode() {
+        let cfg = ProxyConfig {
+            mode: MODE_DIRECT.into(),
+            ..Default::default()
+        };
+        let addr: std::net::SocketAddr = "140.82.112.3:443".parse().expect("地址有效");
+        assert!(build_client_pinned(&cfg, "", "github.com", addr).is_ok());
+        // 配置非法时仍然要报错，不能静默放过
+        assert!(build_client_pinned(&manual(""), "", "github.com", addr).is_err());
     }
 
     #[test]
