@@ -33,5 +33,7 @@ src-tauri/tauri.release.conf.json
 # 本地 AI 助手的会话记忆，不属于工程产物
 .workbuddy/
 
-# 文档（README、产品 / 开发 / 设计规范等）只保留在本地，禁止提交到 GitHub
+# 文档（产品 / 开发 / 设计规范等）只保留在本地，禁止提交到 GitHub
 *.md
+# 例外：仓库根 README 是 GitHub 首页门面，需随仓库发布
+!/README.md
