@@ -14,16 +14,19 @@ interface QueueStore {
   paused: boolean;
   /** 并发上限（1–4），后端每次领取任务时读取设置 */
   concurrency: number;
+  /** 每服务商并发上限（1–2）：图像端点并发能力普遍很低 */
+  providerConcurrency: number;
   loaded: boolean;
   progress: Record<number, QueueProgress>;
   unlisteners: UnlistenFn[];
   load: () => Promise<void>;
-  /** 订阅后端事件（App 启动时调用一次；重复调用会被忽略） */
+  /** 订阅后端事件（引用计数：与 unsubscribe 成对调用） */
   subscribe: () => Promise<void>;
   unsubscribe: () => void;
   enqueue: (input: EnqueueJobInput) => Promise<void>;
   start: () => Promise<void>;
   setConcurrency: (n: number) => Promise<void>;
+  setProviderConcurrency: (n: number) => Promise<void>;
   cancel: (id: number) => Promise<void>;
   retry: (id: number) => Promise<void>;
   clearFinished: () => Promise<void>;
@@ -37,7 +40,10 @@ function upsertJob(jobs: QueueJob[], job: QueueJob): QueueJob[] {
   return [job, ...jobs];
 }
 
-// 订阅中的 Promise：StrictMode 会双调 effect，共享同一次订阅避免重复监听
+// 订阅引用计数：StrictMode 会「挂载 → 卸载 → 再挂载」，
+// 只按次数增减，归零才真正摘掉监听，避免第二次挂载前把监听关掉。
+let subscribers = 0;
+// 订阅中的 Promise：并发调用共享同一次订阅，避免重复监听
 let inflight: Promise<void> | null = null;
 
 export const useQueueStore = create<QueueStore>((set, get) => ({
@@ -45,16 +51,26 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
   counts: {},
   paused: true,
   concurrency: 1,
+  providerConcurrency: 1,
   loaded: false,
   progress: {},
   unlisteners: [],
 
   load: async () => {
-    const { jobs, counts, paused, concurrency } = await api.listJobs();
-    set({ jobs, counts, paused, concurrency, loaded: true });
+    const { jobs, counts, paused, concurrency, providerConcurrency } =
+      await api.listJobs();
+    set({
+      jobs,
+      counts,
+      paused,
+      concurrency,
+      providerConcurrency,
+      loaded: true,
+    });
   },
 
   subscribe: async () => {
+    subscribers += 1;
     if (get().unlisteners.length > 0) return;
     if (inflight) return inflight;
     inflight = (async () => {
@@ -86,6 +102,11 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
           },
         ),
       );
+      // 订阅尚未完成时消费者已全部卸载：立即摘掉，别把监听泄漏到下次挂载
+      if (subscribers === 0) {
+        for (const off of unlisteners) off();
+        return;
+      }
       set({ unlisteners });
     })().finally(() => {
       inflight = null;
@@ -94,8 +115,11 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
   },
 
   unsubscribe: () => {
-    for (const off of get().unlisteners) off();
+    subscribers = Math.max(0, subscribers - 1);
+    if (subscribers > 0) return;
+    const offs = get().unlisteners;
     set({ unlisteners: [] });
+    for (const off of offs) off();
   },
 
   enqueue: async (input) => {
@@ -114,6 +138,13 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
     await api.setSetting("queueConcurrency", String(next));
     set({ concurrency: next });
     toast(`并发数已设为 ${next}`);
+  },
+
+  setProviderConcurrency: async (n) => {
+    const next = Math.min(2, Math.max(1, Math.round(n)));
+    await api.setSetting("queueProviderConcurrency", String(next));
+    set({ providerConcurrency: next });
+    toast(`每服务商并发已设为 ${next}`);
   },
 
   cancel: async (id) => {

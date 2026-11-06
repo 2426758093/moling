@@ -8,7 +8,7 @@
 //! - 结果只写 history（画廊可见），不生成聊天消息，避免两套状态互相打架。
 
 use crate::commands::image::{
-    generate_core, normalize_generation, normalize_quality, CancelRegistration,
+    generate_core, is_cancelled, normalize_generation, normalize_quality, CancelRegistration,
     GenerateCommandInput, GenerationRegistry, MAX_REFERENCE_IMAGES,
 };
 use crate::image_store;
@@ -24,6 +24,24 @@ pub const QUEUE_CONCURRENCY_KEY: &str = "queueConcurrency";
 pub const MIN_CONCURRENCY: i64 = 1;
 pub const MAX_CONCURRENCY: i64 = 4;
 pub const DEFAULT_CONCURRENCY: i64 = 1;
+
+/// 每服务商并发：图像端点并发能力远低于文本，默认 1，最多 2
+pub const QUEUE_PROVIDER_CONCURRENCY_KEY: &str = "queueProviderConcurrency";
+pub const MIN_PROVIDER_CONCURRENCY: i64 = 1;
+pub const MAX_PROVIDER_CONCURRENCY: i64 = 2;
+pub const DEFAULT_PROVIDER_CONCURRENCY: i64 = 1;
+
+/// 待执行任务上限：无界堆积只会让用户排队几小时，不如尽早提示
+const MAX_QUEUED_JOBS: i64 = 200;
+
+/// 429 退避重试：最多 2 次，等待时间取 Retry-After（无则 5s），单次不超过 60s
+const MAX_QUOTA_RETRIES: u32 = 2;
+const DEFAULT_QUOTA_BACKOFF_SECS: u64 = 5;
+const MAX_QUOTA_BACKOFF_SECS: u64 = 60;
+
+/// running 任务心跳间隔与回收阈值：心跳存在时按心跳判断，长任务不会被误回收
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+const STALE_RUNNING_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 /// 固定 worker 槽位数：等于并发上限的最大值，空闲槽位只等通知不耗 CPU
 const WORKER_SLOTS: usize = 4;
@@ -106,6 +124,21 @@ fn concurrency_limit() -> i64 {
     )
 }
 
+pub fn provider_concurrency_from(raw: Option<&str>) -> i64 {
+    raw.and_then(|s| s.trim().parse::<i64>().ok())
+        .map(|n| n.clamp(MIN_PROVIDER_CONCURRENCY, MAX_PROVIDER_CONCURRENCY))
+        .unwrap_or(DEFAULT_PROVIDER_CONCURRENCY)
+}
+
+fn provider_concurrency_limit() -> i64 {
+    provider_concurrency_from(
+        storage::get_setting(QUEUE_PROVIDER_CONCURRENCY_KEY)
+            .ok()
+            .flatten()
+            .as_deref(),
+    )
+}
+
 fn emit_job(app: &tauri::AppHandle, id: i64) {
     if let Ok(Some(job)) = storage::get_job(id) {
         let _ = app.emit("queue:job", job);
@@ -125,9 +158,8 @@ pub fn spawn_worker(app: tauri::AppHandle, state: SharedQueue) {
 async fn worker_loop(app: tauri::AppHandle, state: SharedQueue) {
     // 卡死任务回收不需要每次空转都扫库，一分钟一次足够
     const REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
-    // running 超过这个时长仍未收尾 → 视为 worker 卡住；
+    // running 超过阈值且没有新心跳 → 视为 worker 卡住；
     // 进程崩溃留下的 running 由启动时的 mark_running_interrupted 负责
-    const STALE_RUNNING_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
     let mut last_reap = std::time::Instant::now();
     loop {
         if last_reap.elapsed() >= REAP_INTERVAL {
@@ -145,7 +177,10 @@ async fn worker_loop(app: tauri::AppHandle, state: SharedQueue) {
             state.wait().await;
             continue;
         }
-        let job = match storage::claim_next_job(concurrency_limit()) {
+        let job = match storage::claim_next_job_limited(
+            concurrency_limit(),
+            provider_concurrency_limit(),
+        ) {
             Ok(Some(job)) => job,
             Ok(None) => {
                 state.wait().await;
@@ -197,6 +232,9 @@ pub struct JobExtras {
     pub references: Vec<ReferenceSpec>,
     /// 质量档位快照；None = auto（老任务没有该字段，按默认处理）
     pub quality: Option<String>,
+    /// 429 退避重试次数（持久化，避免重新入队后无限重试）
+    #[serde(default)]
+    pub quota_retries: u32,
 }
 
 impl JobExtras {
@@ -221,15 +259,84 @@ pub fn normalize_reference_paths(paths: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// 心跳守卫：任务结束（含提前返回）时自动停止心跳协程
+struct HeartbeatGuard(tauri::async_runtime::JoinHandle<()>);
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn spawn_heartbeat(job_id: i64) -> HeartbeatGuard {
+    HeartbeatGuard(tauri::async_runtime::spawn(async move {
+        let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+        // interval 的第一拍立即完成，跳过后才是真正的 60s 周期
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            match storage::touch_job_heartbeat(job_id) {
+                Ok(true) => {}
+                // 已被回收 / 已离开 running，无需继续刷新
+                Ok(false) => break,
+                Err(e) => tracing::warn!("队列任务 #{job_id} 心跳写入失败: {e}"),
+            }
+        }
+    }))
+}
+
+/// 正常收尾失败时（任务已被 reaper 标记）强制写入真实终态，避免结果丢失
+fn finish_or_force(
+    id: i64,
+    status: &str,
+    images_json: &str,
+    error: Option<&str>,
+) -> Result<(), String> {
+    match storage::finish_job(id, status, images_json, error) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            tracing::warn!("队列任务 #{id} 已被回收，强制写入真实终态 {status}");
+            storage::finish_job_force(id, status, images_json, error)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// 从适配器错误 JSON 中识别 429；返回值外层 Some 表示是限流，内层是 Retry-After
+fn quota_retry_after(err_json: &str) -> Option<Option<u64>> {
+    let value: serde_json::Value = serde_json::from_str(err_json).ok()?;
+    if value.get("type")?.as_str()? != "quota_exceeded" {
+        return None;
+    }
+    Some(value.get("retry_after").and_then(|v| v.as_u64()))
+}
+
 /// 执行单个任务：领取时已是 running，这里只负责跑到终态。返回 Err 仅表示数据库收尾失败。
 async fn run_job(app: &tauri::AppHandle, job: &JobRow) -> Result<(), String> {
+    // B1：取消标记必须在读取参考图之前注册，否则解压/读盘阶段取消无效
+    let (registration, token) = {
+        let registry = app.state::<GenerationRegistry>();
+        CancelRegistration::new(&registry, Some(&job.job_key))
+    };
+    let _heartbeat = spawn_heartbeat(job.id);
+    if is_cancelled(&token) {
+        finish_or_force(job.id, "canceled", "[]", None)?;
+        return Ok(());
+    }
+
     let extras = JobExtras::parse(&job.input_json);
     let mut images: Vec<String> = Vec::with_capacity(extras.reference_paths.len());
     for path in &extras.reference_paths {
+        if is_cancelled(&token) {
+            finish_or_force(job.id, "canceled", "[]", None)?;
+            return Ok(());
+        }
         match image_store::read_ref_image(app, path) {
             Ok(url) => images.push(url),
             Err(e) => {
-                storage::finish_job(
+                finish_or_force(
                     job.id,
                     "failed",
                     "[]",
@@ -240,6 +347,7 @@ async fn run_job(app: &tauri::AppHandle, job: &JobRow) -> Result<(), String> {
         }
     }
 
+    let mut extras = extras;
     let input = GenerateCommandInput {
         provider_id: job.provider_id,
         prompt: job.prompt.clone(),
@@ -265,26 +373,20 @@ async fn run_job(app: &tauri::AppHandle, job: &JobRow) -> Result<(), String> {
         references: if extras.references.is_empty() {
             None
         } else {
-            Some(extras.references)
+            Some(extras.references.clone())
         },
         job_id: None,
     };
 
-    let (registration, token) = {
-        let registry = app.state::<GenerationRegistry>();
-        CancelRegistration::new(&registry, Some(&job.job_key))
-    };
-
     let progress_app = app.clone();
     let progress_id = job.id;
-    let result = generate_core(app, &input, token, move |done, total| {
+    let result = generate_core(app, &input, token.clone(), move |done, total| {
         let _ = progress_app.emit(
             "queue:progress",
             serde_json::json!({ "id": progress_id, "done": done, "total": total }),
         );
     })
     .await;
-    drop(registration);
 
     match result {
         Ok(outcome) => {
@@ -304,12 +406,60 @@ async fn run_job(app: &tauri::AppHandle, job: &JobRow) -> Result<(), String> {
             } else {
                 "done"
             };
-            storage::finish_job(job.id, status, &images_json, None)?;
+            // 部分图片落盘失败不影响任务成功，但要把原因留在任务上
+            let warning = (!outcome.failed.is_empty()).then(|| {
+                format!(
+                    "{} 张图片保存失败：{}",
+                    outcome.failed.len(),
+                    outcome
+                        .failed
+                        .iter()
+                        .map(|f| format!("第 {} 张 {}", f.index, f.reason))
+                        .collect::<Vec<_>>()
+                        .join("；")
+                )
+            });
+            finish_or_force(job.id, status, &images_json, warning.as_deref())?;
         }
         Err(e) => {
-            storage::finish_job(job.id, "failed", "[]", Some(&e))?;
+            if is_cancelled(&token) {
+                finish_or_force(job.id, "canceled", "[]", None)?;
+            } else if let Some(requested) = quota_retry_after(&e) {
+                // B6：429 按 Retry-After 退避重试，次数持久化，避免无限重试
+                if extras.quota_retries >= MAX_QUOTA_RETRIES {
+                    finish_or_force(job.id, "failed", "[]", Some(&e))?;
+                } else {
+                    extras.quota_retries += 1;
+                    let wait = requested
+                        .unwrap_or(DEFAULT_QUOTA_BACKOFF_SECS)
+                        .clamp(1, MAX_QUOTA_BACKOFF_SECS);
+                    let jitter = rand::random::<u64>() % 1000;
+                    tracing::warn!(
+                        "队列任务 #{} 遇到限流，{}s 后重试（第 {}/{} 次）",
+                        job.id,
+                        wait,
+                        extras.quota_retries,
+                        MAX_QUOTA_RETRIES
+                    );
+                    tokio::time::sleep(
+                        std::time::Duration::from_secs(wait)
+                            + std::time::Duration::from_millis(jitter),
+                    )
+                    .await;
+                    if is_cancelled(&token) {
+                        finish_or_force(job.id, "canceled", "[]", None)?;
+                    } else {
+                        let input_json =
+                            serde_json::to_string(&extras).map_err(|e| e.to_string())?;
+                        storage::requeue_running_job(job.id, &input_json)?;
+                    }
+                }
+            } else {
+                finish_or_force(job.id, "failed", "[]", Some(&e))?;
+            }
         }
     }
+    drop(registration);
     Ok(())
 }
 
@@ -357,6 +507,12 @@ pub async fn enqueue_job(
     }
     let provider =
         storage::get_provider(input.provider_id)?.ok_or_else(|| "服务商不存在".to_string())?;
+    // B6：队列有界，避免断网/限流时无界堆积把数据库和界面拖垮
+    if storage::queued_job_count()? >= MAX_QUEUED_JOBS {
+        return Err(format!(
+            "队列已满（最多 {MAX_QUEUED_JOBS} 个待执行任务），请等待执行或清理后再试"
+        ));
+    }
     // 入队即固化参数快照，之后改默认参数不影响已排队任务
     let reference_paths = normalize_reference_paths(input.reference_paths);
     let extras = JobExtras {
@@ -367,6 +523,7 @@ pub async fn enqueue_job(
             .collect(),
         reference_paths,
         quality: normalize_quality(input.quality.as_deref()),
+        quota_retries: 0,
     };
     let input_json = serde_json::to_string(&extras).map_err(|e| e.to_string())?;
     // 尺寸/张数在入队时就归一化（F-016）：任务参数快照与真正执行时一致
@@ -402,6 +559,7 @@ pub async fn list_jobs(state: tauri::State<'_, SharedQueue>) -> Result<serde_jso
         "counts": counts_json(),
         "paused": state.is_paused(),
         "concurrency": concurrency_limit(),
+        "providerConcurrency": provider_concurrency_limit(),
     }))
 }
 
@@ -520,6 +678,29 @@ mod tests {
         );
     }
 
+    /// 每服务商并发：非法/缺省回退 1，越界夹到 1–2
+    #[test]
+    fn provider_concurrency_parses_and_clamps() {
+        assert_eq!(provider_concurrency_from(None), 1);
+        assert_eq!(provider_concurrency_from(Some("")), 1);
+        assert_eq!(provider_concurrency_from(Some("x")), 1);
+        assert_eq!(provider_concurrency_from(Some("0")), 1);
+        assert_eq!(provider_concurrency_from(Some("2")), 2);
+        assert_eq!(provider_concurrency_from(Some(" 3 ")), 2);
+    }
+
+    /// 429 识别：只有 quota_exceeded 才算限流，并透出 Retry-After
+    #[test]
+    fn quota_retry_after_parses_adapter_error_json() {
+        let with_hint = r#"{"type":"quota_exceeded","message":"x","retry_after":12}"#;
+        assert_eq!(quota_retry_after(with_hint), Some(Some(12)));
+        let without_hint = r#"{"type":"quota_exceeded","message":"x"}"#;
+        assert_eq!(quota_retry_after(without_hint), Some(None));
+        let other = r#"{"type":"network","message":"x"}"#;
+        assert_eq!(quota_retry_after(other), None);
+        assert_eq!(quota_retry_after("{not json"), None);
+    }
+
     /// 扩展参数：空串按默认值，合法 JSON 往返，非法 JSON 不 panic
     #[test]
     fn job_extras_parse() {
@@ -531,6 +712,7 @@ mod tests {
                 strength: Some(80),
             }],
             quality: Some("high".into()),
+            quota_retries: 1,
         };
         let json = serde_json::to_string(&extras).unwrap();
         assert_eq!(JobExtras::parse(&json), extras);

@@ -148,6 +148,7 @@ export default function GalleryView() {
   const [favOnly, setFavOnly] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [compareOpen, setCompareOpen] = useState(false);
   const [cols, setCols] = useState(3);
@@ -157,35 +158,61 @@ export default function GalleryView() {
   // Shift 连选的锚点：上一次单独点选的 id
   const anchorRef = useRef<number | null>(null);
   const loadSeq = useRef(0);
+  // 下一页游标 = 已加载的最后一条 id；用游标而不是 offset，删除记录后不跳项
+  const cursorRef = useRef<number | null>(null);
+  const fetchingRef = useRef(false);
   useScrollEdge(parentRef);
 
   const load = useCallback(
-    async (offset: number, model: string, style: string, fav: boolean) => {
+    async (
+      beforeId: number | null,
+      model: string,
+      style: string,
+      fav: boolean,
+    ) => {
+      // 触底回调可能密集触发：同一时刻只允许一个列表请求
+      if (fetchingRef.current) return;
+      fetchingRef.current = true;
       const seq = ++loadSeq.current;
       setLoading(true);
+      setLoadError(false);
       try {
         const { items: page } = await api.listHistory(
           PAGE_SIZE,
-          offset,
+          beforeId,
           model,
           style,
           fav,
         );
         if (seq !== loadSeq.current) return;
         setHasMore(page.length === PAGE_SIZE);
-        setItems((prev) => (offset === 0 ? page : [...prev, ...page]));
+        setItems((prev) => {
+          if (beforeId === null) return page;
+          // 翻页期间新增/删除会让相邻页出现重复 id，按 id 去重
+          const seen = new Set(prev.map((i) => i.history.id));
+          return [...prev, ...page.filter((i) => !seen.has(i.history.id))];
+        });
+        const last = page[page.length - 1];
+        if (last) cursorRef.current = last.history.id;
       } catch {
-        // 数据库文件被占用/损坏时不能停在「加载中」且毫无反馈
-        if (seq === loadSeq.current) toast("加载画廊失败，请稍后重试", "error");
+        // 失败后停止自动触底，由用户点「重试」；避免无限重试刷屏
+        if (seq === loadSeq.current) setLoadError(true);
       } finally {
         if (seq === loadSeq.current) setLoading(false);
+        fetchingRef.current = false;
       }
     },
     [],
   );
 
+  const reload = useCallback(() => {
+    cursorRef.current = null;
+    void load(null, modelFilter, styleFilter, favOnly);
+  }, [load, modelFilter, styleFilter, favOnly]);
+
   useEffect(() => {
-    void load(0, modelFilter, styleFilter, favOnly);
+    cursorRef.current = null;
+    void load(null, modelFilter, styleFilter, favOnly);
     setSelected(new Set());
   }, [modelFilter, styleFilter, favOnly, load]);
 
@@ -363,18 +390,27 @@ export default function GalleryView() {
   // 触底自动续页：哨兵进入视口即加载；按钮作为 IO 不可用时的兜底保留
   useEffect(() => {
     const el = sentinelRef.current;
-    if (!el || !hasMore) return;
+    if (!el || !hasMore || loadError) return;
     const observer = new IntersectionObserver(
       (entries) => {
         if (entries.some((e) => e.isIntersecting) && !loading) {
-          void load(items.length, modelFilter, styleFilter, favOnly);
+          void load(cursorRef.current, modelFilter, styleFilter, favOnly);
         }
       },
       { root: parentRef.current, rootMargin: "400px" },
     );
     observer.observe(el);
     return () => observer.disconnect();
-  }, [hasMore, loading, items.length, modelFilter, styleFilter, favOnly, load]);
+  }, [
+    hasMore,
+    loadError,
+    loading,
+    items.length,
+    modelFilter,
+    styleFilter,
+    favOnly,
+    load,
+  ]);
 
   const doExport = async () => {
     const picked = selectedItems;
@@ -404,6 +440,7 @@ export default function GalleryView() {
       height: p.height,
       style: p.style,
       count: 1,
+      negativePrompt: p.negativePrompt,
     });
     useChatStore.getState().setDraftPrompt(p.prompt);
     setView("chat");
@@ -475,7 +512,7 @@ export default function GalleryView() {
                 size="sm"
                 label="刷新"
                 icon={<IconRotate size={14} />}
-                onClick={() => void load(0, modelFilter, styleFilter, favOnly)}
+                onClick={reload}
               />
             </div>
           </div>
@@ -487,16 +524,25 @@ export default function GalleryView() {
         className="scroll-edge min-h-0 flex-1 overflow-y-auto"
       >
         {items.length === 0 && !loading ? (
-          <EmptyState
-            className="h-full"
-            eyebrow="画廊"
-            title={favOnly ? "还没有收藏的作品" : "还没有生成记录"}
-            description={
-              favOnly
-                ? "在聊天里生成图片后点星标即可收藏"
-                : "回到聊天描述一个画面，生成结果会自动归档到这里"
-            }
-          />
+          loadError ? (
+            <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
+              <p className="text-footnote text-secondary">加载画廊失败</p>
+              <Button size="sm" variant="ghost" onClick={reload}>
+                重试
+              </Button>
+            </div>
+          ) : (
+            <EmptyState
+              className="h-full"
+              eyebrow="画廊"
+              title={favOnly ? "还没有收藏的作品" : "还没有生成记录"}
+              description={
+                favOnly
+                  ? "在聊天里生成图片后点星标即可收藏"
+                  : "回到聊天描述一个画面，生成结果会自动归档到这里"
+              }
+            />
+          )
         ) : (
           <div
             className="relative w-full"
@@ -543,13 +589,19 @@ export default function GalleryView() {
                           height: block.height,
                         }}
                       >
-                        <SafeImg
-                          src={item.thumbUrl}
-                          alt={item.history.prompt}
-                          className="h-full w-full object-contain"
-                          loading="lazy"
-                          decoding="async"
-                        />
+                        {item.thumbUrl ? (
+                          <SafeImg
+                            src={item.thumbUrl}
+                            alt={item.history.prompt}
+                            className="h-full w-full object-contain"
+                            loading="lazy"
+                            decoding="async"
+                          />
+                        ) : (
+                          <div className="flex h-full w-full items-center justify-center px-2 text-center text-caption text-tertiary">
+                            缩略图生成中
+                          </div>
+                        )}
                         <label
                           className={`glass-media absolute left-2 top-2 flex h-5 w-5 cursor-pointer items-center justify-center rounded-chip transition-opacity focus-within:opacity-100 group-hover:opacity-100 ${
                             selected.has(item.history.id)
@@ -653,13 +705,27 @@ export default function GalleryView() {
           </div>
         )}
         <div ref={sentinelRef} aria-hidden className="h-6 w-full" />
-        {hasMore && !loading && items.length > 0 && (
+        {loadError && items.length > 0 && (
+          <div className="flex flex-col items-center gap-2 py-3 text-center">
+            <span className="text-footnote text-secondary">加载更多失败</span>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() =>
+                void load(cursorRef.current, modelFilter, styleFilter, favOnly)
+              }
+            >
+              重试
+            </Button>
+          </div>
+        )}
+        {hasMore && !loading && !loadError && items.length > 0 && (
           <div className="py-3 text-center">
             <Button
               size="sm"
               variant="ghost"
               onClick={() =>
-                void load(items.length, modelFilter, styleFilter, favOnly)
+                void load(cursorRef.current, modelFilter, styleFilter, favOnly)
               }
             >
               加载更多

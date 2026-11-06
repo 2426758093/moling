@@ -41,7 +41,7 @@ pub async fn chat_complete_at(
         ],
         "temperature": temperature,
     });
-    let resp = http_client()
+    let resp = http_client()?
         .post(format!(
             "{}/chat/completions",
             config.base_url.trim_end_matches('/')
@@ -75,8 +75,14 @@ pub(crate) enum SseItem {
 /// 帧内多行 `data:` 按 SSE 规范用 `\n` 拼接后再解析。
 pub(crate) struct SseDecoder {
     buf: Vec<u8>,
+    /// 已经扫描过、确认没有分隔符的位置（分隔符最长 4 字节，留 4 字节回看）
+    scan_from: usize,
     warned: bool,
 }
+
+/// 单帧与整体缓冲上限：防止恶意/异常流把内存撑爆
+const MAX_SSE_FRAME: usize = 256 * 1024;
+const MAX_SSE_BUFFER: usize = 1024 * 1024;
 
 impl Default for SseDecoder {
     fn default() -> Self {
@@ -88,6 +94,7 @@ impl SseDecoder {
     pub fn new() -> Self {
         Self {
             buf: Vec::new(),
+            scan_from: 0,
             warned: false,
         }
     }
@@ -95,11 +102,35 @@ impl SseDecoder {
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<SseItem> {
         self.buf.extend_from_slice(chunk);
         let mut items = Vec::new();
-        while let Some((frame_len, sep_len)) = find_frame_end(&self.buf) {
-            let frame: Vec<u8> = self.buf.drain(..frame_len + sep_len).collect();
+        let mut consumed = 0usize;
+        // 只从上次扫描结束的位置继续找，避免每个 chunk 都把整个缓冲重扫一遍
+        let mut search = self.scan_from;
+        while let Some((frame_len, sep_len)) = find_frame_end(&self.buf[search..]) {
+            let frame_end = search + frame_len;
             // 分隔符可能是 CRLF 组合，帧体长度已排除它
-            let text = String::from_utf8_lossy(&frame[..frame_len]).into_owned();
+            let text = String::from_utf8_lossy(&self.buf[consumed..frame_end]).into_owned();
             items.push(self.parse_frame(&text));
+            consumed = frame_end + sep_len;
+            search = consumed;
+        }
+        if consumed > 0 {
+            self.buf.drain(..consumed);
+            search -= consumed;
+        }
+        self.scan_from = search.max(self.buf.len().saturating_sub(4));
+        // 完整帧每轮都已被吃掉，剩下的只会是一条未收尾的超大帧
+        if self.buf.len() > MAX_SSE_FRAME {
+            let too_big_buffer = self.buf.len() > MAX_SSE_BUFFER;
+            self.buf.clear();
+            self.scan_from = 0;
+            items.push(SseItem::Error(if too_big_buffer {
+                format!(
+                    "流响应异常膨胀（缓冲超过 {} KiB），已中止",
+                    MAX_SSE_BUFFER / 1024
+                )
+            } else {
+                format!("流响应单帧超过 {} KiB，已中止", MAX_SSE_FRAME / 1024)
+            }));
         }
         items
     }
@@ -225,7 +256,7 @@ where
         "temperature": CHAT_TEMPERATURE,
         "stream": true,
     });
-    let mut resp = http_client()
+    let mut resp = http_client()?
         .post(format!(
             "{}/chat/completions",
             config.base_url.trim_end_matches('/')
@@ -439,7 +470,7 @@ pub async fn reverse_prompt(
         ],
         "temperature": REVERSE_TEMPERATURE,
     });
-    let resp = http_client()
+    let resp = http_client()?
         .post(format!(
             "{}/chat/completions",
             config.base_url.trim_end_matches('/')
@@ -560,6 +591,40 @@ mod tests {
             deltas(decoder.feed(&bytes[cut..])),
             vec!["你好".to_string()]
         );
+    }
+
+    /// C1：任意切块方式喂入同一段流，结果必须完全一致（含 emoji 跨块）
+    #[test]
+    fn byte_by_byte_feeding_matches_one_shot() {
+        let mut payload = delta_frame("你好🙂");
+        payload.push_str(&delta_frame("世界"));
+        payload.push_str("data: [DONE]\n\n");
+        let one_shot = SseDecoder::new().feed(payload.as_bytes());
+        let mut decoder = SseDecoder::new();
+        let mut chunked = Vec::new();
+        for byte in payload.as_bytes() {
+            chunked.extend(decoder.feed(std::slice::from_ref(byte)));
+        }
+        assert_eq!(chunked, one_shot);
+        assert_eq!(
+            deltas(chunked),
+            vec!["你好🙂".to_string(), "世界".to_string()]
+        );
+    }
+
+    /// C1：单帧超过上限必须报错中止，而不是无限占内存
+    #[test]
+    fn oversized_frame_reports_error() {
+        let mut decoder = SseDecoder::new();
+        let chunk = [b'x'; 1024];
+        let mut items = Vec::new();
+        for _ in 0..(MAX_SSE_FRAME / 1024 + 2) {
+            items.extend(decoder.feed(&chunk));
+        }
+        assert!(items.iter().any(|item| matches!(
+            item,
+            SseItem::Error(message) if message.contains("单帧超过") || message.contains("异常膨胀")
+        )));
     }
 
     #[test]

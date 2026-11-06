@@ -104,6 +104,9 @@ pub enum AdapterError {
     },
     QuotaExceeded {
         message: String,
+        /// 服务商建议的等待秒数（Retry-After：秒或 HTTP 日期），队列据此退避
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retry_after: Option<u64>,
     },
     Timeout {
         message: String,
@@ -127,7 +130,7 @@ impl AdapterError {
     pub fn message(&self) -> &str {
         match self {
             AdapterError::AuthInvalid { message, .. }
-            | AdapterError::QuotaExceeded { message }
+            | AdapterError::QuotaExceeded { message, .. }
             | AdapterError::Timeout { message }
             | AdapterError::ContentBlocked { message }
             | AdapterError::Network { message }
@@ -196,8 +199,8 @@ pub fn adapter_error_json(e: AdapterError) -> String {
 
 /// 全局共享 reqwest Client（连接池/TLS 会话复用，P5）；超时在各请求级单独设置。
 /// 返回 `Arc` 让调用方在读锁外持有客户端，代理热切换不会中断在途请求。
-pub(crate) fn http_client() -> Arc<reqwest::Client> {
-    http::current_client()
+pub(crate) fn http_client() -> Result<Arc<reqwest::Client>, AdapterError> {
+    http::current_client().map_err(|e| AdapterError::Other { message: e })
 }
 
 /// 单张远程图片体积上限（20MB）：防止错误页 / 超大响应把内存与落盘打满。
@@ -240,6 +243,102 @@ fn validate_downloaded_image(bytes: &[u8], max_bytes: usize) -> Result<(), Adapt
     })
 }
 
+/// 本地/内网/云元数据地址：服务商返回的图片 URL 是不可信输入，必须拒绝（SSRF）
+fn blocked_host(host: &str) -> bool {
+    let host = host
+        .trim_end_matches('.')
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    if host.is_empty()
+        || host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+    {
+        return true;
+    }
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => blocked_v4(v4),
+        std::net::IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // fc00::/7 unique-local 与 fe80::/10 link-local
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some_and(blocked_v4)
+        }
+    }
+}
+
+fn blocked_v4(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_documentation()
+        || octets[0] == 0
+        // 100.64.0.0/10 运营商级 NAT
+        || (octets[0] == 100 && (64..128).contains(&octets[1]))
+}
+
+fn validate_remote_url(url: &str) -> Result<reqwest::Url, AdapterError> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| AdapterError::Other {
+        message: format!("图片地址无效: {e}"),
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(AdapterError::Other {
+            message: format!("图片地址不是 http(s): {}", parsed.scheme()),
+        });
+    }
+    let host = parsed.host_str().unwrap_or_default();
+    if host.is_empty() {
+        return Err(AdapterError::Other {
+            message: "图片地址缺少主机名".into(),
+        });
+    }
+    if blocked_host(host) {
+        return Err(AdapterError::Other {
+            message: "图片地址指向本地或内网，已拒绝下载".into(),
+        });
+    }
+    Ok(parsed)
+}
+
+/// 重定向每一跳都重新校验，最多 3 跳
+pub(crate) fn safe_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 3 {
+            return attempt.error("图片下载重定向次数过多");
+        }
+        let url = attempt.url();
+        if !matches!(url.scheme(), "http" | "https") {
+            return attempt.error("图片下载重定向到非 http(s) 地址");
+        }
+        match url.host_str() {
+            Some(host) if !blocked_host(host) => attempt.follow(),
+            _ => attempt.error("图片下载重定向到本地或内网地址"),
+        }
+    })
+}
+
+fn append_chunk(out: &mut Vec<u8>, chunk: &[u8], max: usize) -> Result<(), AdapterError> {
+    if out.len() + chunk.len() > max {
+        return Err(AdapterError::Other {
+            message: format!("图片体积超过上限 {} MB", max / 1024 / 1024),
+        });
+    }
+    out.extend_from_slice(chunk);
+    Ok(())
+}
+
 /// 下载远程图片并做安全校验（F-011）：状态码、体积上限、魔数。
 ///
 /// 不复用 `classify_http`：这里的 401/403 只表示图片链接不可访问，
@@ -248,13 +347,10 @@ pub(crate) async fn download_image_bytes(
     url: &str,
     timeout: Duration,
 ) -> Result<Vec<u8>, AdapterError> {
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err(AdapterError::Other {
-            message: format!("图片地址不是 http(s): {url}"),
-        });
-    }
-    let resp = http_client()
-        .get(url)
+    let parsed = validate_remote_url(url)?;
+    let mut resp = http::image_client()
+        .map_err(|e| AdapterError::Other { message: e })?
+        .get(parsed)
         .timeout(timeout)
         .send()
         .await
@@ -262,7 +358,10 @@ pub(crate) async fn download_image_bytes(
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        let truncated: String = text.chars().take(ERROR_BODY_TRUNCATE_LEN).collect();
+        let truncated: String = crate::redact::redact_secrets(&text)
+            .chars()
+            .take(ERROR_BODY_TRUNCATE_LEN)
+            .collect();
         return Err(AdapterError::Other {
             message: format!("下载图片失败 HTTP {status}: {truncated}"),
         });
@@ -278,13 +377,29 @@ pub(crate) async fn download_image_bytes(
             ),
         });
     }
-    let bytes = resp.bytes().await.map_err(|e| classify_reqwest(&e))?;
+    // 流式累加：没有 Content-Length 的超大响应也会在超过上限时立即中止
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(|e| classify_reqwest(&e))? {
+        append_chunk(&mut bytes, &chunk, MAX_REMOTE_IMAGE_BYTES)?;
+    }
     validate_downloaded_image(&bytes, MAX_REMOTE_IMAGE_BYTES)?;
-    Ok(bytes.to_vec())
+    Ok(bytes)
 }
 
 pub fn classify_http(status: reqwest::StatusCode, body: &str) -> AdapterError {
-    let truncated: String = body.chars().take(ERROR_BODY_TRUNCATE_LEN).collect();
+    classify_http_with_retry_after(status, body, None)
+}
+
+pub fn classify_http_with_retry_after(
+    status: reqwest::StatusCode,
+    body: &str,
+    retry_after: Option<u64>,
+) -> AdapterError {
+    // 错误体可能回显请求 URL / Header，统一脱敏后再截断
+    let truncated: String = crate::redact::redact_secrets(body)
+        .chars()
+        .take(ERROR_BODY_TRUNCATE_LEN)
+        .collect();
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
         AdapterError::AuthInvalid {
             message: truncated,
@@ -295,7 +410,10 @@ pub fn classify_http(status: reqwest::StatusCode, body: &str) -> AdapterError {
         || status.as_u16() == 402
         || status.as_u16() == 429
     {
-        AdapterError::QuotaExceeded { message: truncated }
+        AdapterError::QuotaExceeded {
+            message: truncated,
+            retry_after,
+        }
     } else if status.as_u16() == 400 && is_content_policy_block(body) {
         AdapterError::ContentBlocked { message: truncated }
     } else {
@@ -303,6 +421,73 @@ pub fn classify_http(status: reqwest::StatusCode, body: &str) -> AdapterError {
             message: format!("HTTP {}: {}", status, truncated),
         }
     }
+}
+
+/// 读取 Retry-After：支持秒数与 HTTP 日期两种格式
+pub(crate) fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
+    let raw = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?;
+    let raw = raw.trim();
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(secs);
+    }
+    let when = parse_http_date(raw)?;
+    when.duration_since(std::time::SystemTime::now())
+        .ok()
+        .map(|d| d.as_secs().max(1))
+}
+
+/// 解析 RFC 7231 IMF-fixdate（`Sun, 06 Nov 1994 08:49:37 GMT`）
+fn parse_http_date(raw: &str) -> Option<std::time::SystemTime> {
+    let parts: Vec<&str> = raw.split_whitespace().collect();
+    if parts.len() != 6 || !parts[5].eq_ignore_ascii_case("GMT") {
+        return None;
+    }
+    let day: u32 = parts[1].parse().ok()?;
+    let month = match parts[2].to_ascii_lowercase().as_str() {
+        "jan" => 1,
+        "feb" => 2,
+        "mar" => 3,
+        "apr" => 4,
+        "may" => 5,
+        "jun" => 6,
+        "jul" => 7,
+        "aug" => 8,
+        "sep" => 9,
+        "oct" => 10,
+        "nov" => 11,
+        "dec" => 12,
+        _ => return None,
+    };
+    let year: i32 = parts[3].parse().ok()?;
+    let time: Vec<u32> = parts[4]
+        .split(':')
+        .map(|p| p.parse::<u32>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if time.len() != 3 || day == 0 || day > 31 || time[0] > 23 || time[1] > 59 || time[2] > 60 {
+        return None;
+    }
+    let secs = days_from_civil(year, month, day) * 86_400
+        + time[0] as i64 * 3600
+        + time[1] as i64 * 60
+        + time[2] as i64;
+    if secs < 0 {
+        return None;
+    }
+    Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs as u64))
+}
+
+/// Howard Hinnant 的 days_from_civil 算法：公历日期 → 1970-01-01 起的天数
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let y = year - if month <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32;
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era as i64 * 146_097 + doe as i64 - 719_468
 }
 
 /// 内容审核拦截判定：仅当响应体出现明确的审核/安全关键词时才归类为
@@ -317,18 +502,16 @@ fn is_content_policy_block(body: &str) -> bool {
 }
 
 pub fn classify_reqwest(err: &reqwest::Error) -> AdapterError {
+    // reqwest 的 Display 会带上请求 URL；模板适配器把 key 放在 query 里，必须脱敏。
+    // 只取顶层 Display 会丢底层原因（如 connection closed），排障时无法区分
+    // 连接重置 / 证书 / DNS，因此带上 source 链。
+    let message = crate::redact::redact_secrets(&reqwest_error_chain(err));
     if err.is_timeout() {
-        AdapterError::Timeout {
-            message: err.to_string(),
-        }
+        AdapterError::Timeout { message }
     } else if err.is_connect() {
-        AdapterError::Network {
-            message: err.to_string(),
-        }
+        AdapterError::Network { message }
     } else {
-        AdapterError::Other {
-            message: err.to_string(),
-        }
+        AdapterError::Other { message }
     }
 }
 
@@ -356,12 +539,12 @@ pub async fn parse_json_body<T: serde::de::DeserializeOwned>(
         Ok(bytes) => bytes,
         Err(e) => {
             // 读流失败原先只透出 "error decoding response body"，状态码 / 编码 / 耗时全丢失
-            let message = format!(
+            let message = crate::redact::redact_secrets(&format!(
                 "{api} 读取响应失败（{}，耗时 {:.1}s）: {}",
                 response_meta(status, &content_type, &content_encoding, &content_length),
                 started.elapsed().as_secs_f64(),
                 reqwest_error_chain(&e),
-            );
+            ));
             tracing::warn!("{}", message);
             return Err(if e.is_timeout() {
                 AdapterError::Timeout { message }
@@ -484,7 +667,9 @@ fn parse_error(
         ),
         None => (format!("{} 字节", body.len()), body_preview(body)),
     };
-    let message = format!("{api} 响应解析失败（{meta}，{size}）: {err}；响应体开头: {preview}");
+    let message = crate::redact::redact_secrets(&format!(
+        "{api} 响应解析失败（{meta}，{size}）: {err}；响应体开头: {preview}"
+    ));
     tracing::warn!("{}", message);
     AdapterError::Other { message }
 }
@@ -583,6 +768,57 @@ mod download_tests {
             "{}",
             err.message()
         );
+    }
+
+    /// A4：本地/内网/云元数据地址一律拒绝（SSRF）
+    #[test]
+    fn rejects_loopback_private_and_metadata_hosts() {
+        for host in [
+            "127.0.0.1",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.64.0.1",
+            "0.0.0.0",
+            "::1",
+            "fc00::1",
+            "fe80::1",
+            "::ffff:127.0.0.1",
+            "localhost",
+            "app.local",
+            "metadata.google.internal",
+        ] {
+            assert!(blocked_host(host), "{host} 应被拒绝");
+        }
+        assert!(!blocked_host("8.8.8.8"));
+        assert!(!blocked_host("example.com"));
+    }
+
+    /// A4：初始 URL 与重定向都走同一套校验；非 http(s) 直接拒绝
+    #[test]
+    fn validate_remote_url_rejects_unsafe_targets() {
+        assert!(validate_remote_url("https://cdn.example.com/a.png").is_ok());
+        for url in [
+            "http://127.0.0.1/a.png",
+            "http://169.254.169.254/latest/meta-data",
+            "http://localhost:8080/a.png",
+            "file:///C:/a.png",
+            "not a url",
+        ] {
+            let err = validate_remote_url(url).unwrap_err();
+            assert!(matches!(err, AdapterError::Other { .. }), "{url}");
+        }
+    }
+
+    /// A4：没有 Content-Length 的流也要在超过上限时立即中止
+    #[test]
+    fn streaming_append_stops_oversize_chunks() {
+        let mut out = Vec::new();
+        append_chunk(&mut out, &[0u8; 6], 10).unwrap();
+        let err = append_chunk(&mut out, &[0u8; 6], 10).unwrap_err();
+        assert!(err.message().contains("体积超过上限"), "{}", err.message());
+        assert_eq!(out.len(), 6, "超限分块不应被写入");
     }
 }
 

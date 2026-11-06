@@ -26,7 +26,7 @@ import DropOverlay from "./components/shell/DropOverlay";
 import UpdateDialog from "./components/shell/UpdateDialog";
 import { useWindowState } from "./hooks/useWindowState";
 import { useGlobalShortcuts } from "./hooks/useGlobalShortcuts";
-import { useAppStore } from "./stores/appStore";
+import { sanitizePrefs, useAppStore } from "./stores/appStore";
 import { useChatStore } from "./stores/chatStore";
 import { useProviderStore } from "./stores/providerStore";
 import { useQueueStore } from "./stores/queueStore";
@@ -115,8 +115,8 @@ function AppShell() {
         if (!saved) return;
         try {
           const prefs = JSON.parse(saved);
-          const { prefs: current, setPrefs } = useAppStore.getState();
-          setPrefs({ ...current, ...prefs });
+          const { setPrefs } = useAppStore.getState();
+          setPrefs(sanitizePrefs(prefs));
         } catch {
           // 忽略损坏的默认参数
         }

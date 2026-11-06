@@ -259,10 +259,14 @@ export default function ProviderDialog({
       const savedId = saved.provider.id;
       const edited = Object.entries(capsEdits);
       if (savedId != null && edited.length > 0) {
-        for (const [model, caps] of edited) {
-          await api.setModelCaps(savedId, model, caps);
+        try {
+          await api.saveModelCapsBatch(savedId, Object.fromEntries(edited));
+          await useModelCapsStore.getState().load(savedId, true);
+        } catch (e) {
+          // 服务商本体已保存；能力批量写失败时不要静默关窗，让用户能重试
+          setError(`服务商已保存，但模型能力保存失败：${String(e)}`);
+          return;
         }
-        await useModelCapsStore.getState().load(savedId, true);
       }
       onClose();
     } catch (e) {

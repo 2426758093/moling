@@ -158,6 +158,33 @@ fn openai_auto_size_and_quality_mapping() {
 }
 
 #[test]
+fn openai_edit_form_drops_response_format() {
+    use crate::adapters::openai::edit_form_fields;
+    let body = serde_json::json!({
+        "model": "openai/gpt-image-2.5-sunburst",
+        "prompt": "画一只猫",
+        "n": 1,
+        "size": "1024x1024",
+        "response_format": "b64_json",
+        "nested": {"a": 1}
+    });
+    let fields = edit_form_fields(&body);
+    let keys: Vec<&str> = fields.iter().map(|(k, _)| k.as_str()).collect();
+    // 严格网关会因 response_format 返回 400；嵌套对象无法作为表单文本
+    assert!(keys.contains(&"model"));
+    assert!(keys.contains(&"prompt"));
+    assert_eq!(
+        fields
+            .iter()
+            .find(|(k, _)| k == "n")
+            .map(|(_, v)| v.as_str()),
+        Some("1")
+    );
+    assert!(!keys.contains(&"response_format"));
+    assert!(!keys.contains(&"nested"));
+}
+
+#[test]
 fn openai_extra_params_merge() {
     use crate::adapters::openai::merge_extra_params;
     let mut config = mock_config();

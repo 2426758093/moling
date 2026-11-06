@@ -110,6 +110,29 @@ pub fn strip_data_url(s: &str) -> String {
     s.to_string()
 }
 
+/// 不可信图片的解码上限：8K 边长 / 4000 万像素 / 512MB 分配。
+/// 解压炸弹常常只声明巨大尺寸、实际数据很小，必须在 decode 前限制而不是 decode 后检查。
+const MAX_DECODE_EDGE: u32 = 8192;
+const MAX_DECODE_PIXELS: u64 = 40_000_000;
+const MAX_DECODE_ALLOC: u64 = 512 * 1024 * 1024;
+
+/// 带资源上限的图片解码：缩略图、粘贴图、编辑/蒙版等所有外部输入统一走这里
+pub fn decode_limited(bytes: &[u8]) -> Result<image::DynamicImage, String> {
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|e| format!("图片格式无法识别: {e}"))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DECODE_EDGE);
+    limits.max_image_height = Some(MAX_DECODE_EDGE);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    reader.limits(limits);
+    let img = reader.decode().map_err(|e| format!("图片解码失败: {e}"))?;
+    if img.width() as u64 * img.height() as u64 > MAX_DECODE_PIXELS {
+        return Err("图片像素过大（上限 4000 万），请压缩后再试".into());
+    }
+    Ok(img)
+}
+
 /// 缩略图目录（位于 images/ 下；GC 主扫描按子目录跳过）
 const THUMB_DIR: &str = ".thumb";
 /// 缩略图最长边（像素）：512 在 3 列网格里足够清晰，体积约为原图的几十分之一
@@ -150,7 +173,8 @@ pub fn ensure_thumb(source: &Path) -> Option<PathBuf> {
 }
 
 fn write_thumb(source: &Path, thumb: &Path) -> Result<(), String> {
-    let img = image::open(source).map_err(|e| e.to_string())?;
+    let bytes = std::fs::read(source).map_err(|e| e.to_string())?;
+    let img = decode_limited(&bytes)?;
     let resized = img.thumbnail(THUMB_MAX_EDGE, THUMB_MAX_EDGE);
     // JPEG 无透明通道：先把透明像素合成到白底，避免黑边/黑块
     let rgb = if resized.color().has_alpha() {

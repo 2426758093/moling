@@ -290,7 +290,7 @@ impl TemplateAdapter {
         body: &str,
         response_path: &str,
     ) -> Result<Vec<String>, AdapterError> {
-        let mut request = http_client()
+        let mut request = http_client()?
             .post(url)
             .timeout(std::time::Duration::from_secs(config.timeout_secs));
         if !config.api_key.is_empty() {
@@ -307,8 +307,9 @@ impl TemplateAdapter {
             let text = resp.text().await.unwrap_or_default();
             return Err(classify_http(status, &text));
         }
-        // 与内置适配器同一条解析路径：关闭自动解压后仍能兜底处理压缩响应
-        let json: serde_json::Value = parse_json_body(resp, url).await?;
+        // 与内置适配器同一条解析路径：关闭自动解压后仍能兜底处理压缩响应。
+        // 不传渲染后的 URL：模板常把 key 放在 query 里，日志只保留「模板请求」。
+        let json: serde_json::Value = parse_json_body(resp, "模板请求").await?;
         // 从响应中提取图片：优先按 response_path 提取，其次寻找常见字段
         let path = if response_path.is_empty() {
             "data[0].b64_json".to_string()

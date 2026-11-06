@@ -89,31 +89,82 @@ impl ProxyConfig {
 }
 
 static CLIENT: RwLock<Option<Arc<reqwest::Client>>> = RwLock::new(None);
+/// 图片下载专用客户端：与主客户端同代理配置，但重定向逐跳校验（防 SSRF）
+static IMAGE_CLIENT: RwLock<Option<Arc<reqwest::Client>>> = RwLock::new(None);
 
 /// 当前生效的客户端。首次访问时按系统代理解析并缓存。
-pub(crate) fn current_client() -> Arc<reqwest::Client> {
+///
+/// D3/D4：构建失败必须上抛（带可读原因），不能在 release 下静默 abort。
+pub(crate) fn current_client() -> Result<Arc<reqwest::Client>, String> {
     if let Some(client) = read_installed() {
-        return client;
+        return Ok(client);
     }
-    let client =
-        Arc::new(build_client(&ProxyConfig::default(), "").expect("默认 HTTP 客户端构建不应失败"));
+    let client = Arc::new(build_client(&ProxyConfig::default(), "")?);
     install(client.clone());
-    client
+    Ok(client)
+}
+
+/// 图片下载客户端：沿用当前代理配置，但要求每一跳重定向都通过内网校验。
+/// 构建失败时退回主客户端（首跳仍会被 `validate_remote_url` 拦截）。
+pub(crate) fn image_client() -> Result<Arc<reqwest::Client>, String> {
+    if let Some(client) = read_guard(&IMAGE_CLIENT) {
+        return Ok(client);
+    }
+    let raw = crate::storage::get_setting(PROXY_SETTING_KEY)
+        .ok()
+        .flatten();
+    let cfg = ProxyConfig::from_stored(raw.as_deref());
+    let password = if cfg.mode == MODE_MANUAL {
+        crate::storage::decrypt_secret(&cfg.password_enc).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let built = client_builder(&cfg, &password)
+        .and_then(|builder| {
+            builder
+                .redirect(super::safe_redirect_policy())
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .map(Arc::new);
+    match built {
+        Ok(client) => {
+            write_guard(&IMAGE_CLIENT, client.clone());
+            Ok(client)
+        }
+        Err(e) => {
+            tracing::warn!("图片下载客户端构建失败（{e}），退回主客户端");
+            current_client()
+        }
+    }
 }
 
 fn read_installed() -> Option<Arc<reqwest::Client>> {
-    match CLIENT.read() {
+    read_guard(&CLIENT)
+}
+
+fn read_guard(slot: &RwLock<Option<Arc<reqwest::Client>>>) -> Option<Arc<reqwest::Client>> {
+    match slot.read() {
         Ok(guard) => guard.clone(),
         // 写线程 panic 不应让整个应用再也不能发请求；恢复内部值继续用
         Err(poisoned) => poisoned.into_inner().clone(),
     }
 }
 
-/// 原子替换全局客户端。调用方必须先用 `build_client` 构建成功。
-pub fn install(client: Arc<reqwest::Client>) {
-    match CLIENT.write() {
+fn write_guard(slot: &RwLock<Option<Arc<reqwest::Client>>>, client: Arc<reqwest::Client>) {
+    match slot.write() {
         Ok(mut guard) => *guard = Some(client),
         Err(poisoned) => *poisoned.into_inner() = Some(client),
+    }
+}
+
+/// 原子替换全局客户端。调用方必须先用 `build_client` 构建成功。
+pub fn install(client: Arc<reqwest::Client>) {
+    write_guard(&CLIENT, client);
+    // 代理切换后图片下载客户端必须重建
+    match IMAGE_CLIENT.write() {
+        Ok(mut guard) => *guard = None,
+        Err(poisoned) => *poisoned.into_inner() = None,
     }
 }
 
@@ -125,7 +176,10 @@ fn client_builder(cfg: &ProxyConfig, password: &str) -> Result<reqwest::ClientBu
         reqwest::header::ACCEPT_ENCODING,
         reqwest::header::HeaderValue::from_static("identity"),
     );
-    let mut builder = reqwest::Client::builder().default_headers(default_headers);
+    let mut builder = reqwest::Client::builder()
+        // 连接超时与请求总超时分离：连不上要尽快失败，慢生成由请求级超时管
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .default_headers(default_headers);
     match cfg.mode.as_str() {
         MODE_DIRECT => builder = builder.no_proxy(),
         MODE_MANUAL => {

@@ -352,6 +352,11 @@ export const api = {
     invoke<Record<string, ModelCaps>>("get_model_caps", { providerId }),
   setModelCaps: (providerId: number, model: string, caps: ModelCaps) =>
     invoke<void>("set_model_caps", { providerId, model, caps }),
+  /** 批量保存模型能力（后端单事务，任一条失败整体不生效） */
+  saveModelCapsBatch: (
+    providerId: number,
+    entries: Record<string, ModelCaps>,
+  ) => invoke<void>("save_model_caps_batch", { providerId, entries }),
   testConnection: (id: number) =>
     invoke<{
       ok: boolean;
@@ -492,16 +497,17 @@ export const api = {
     invoke<{ items: HistoryItem["history"][] }>("list_derived", {
       historyId,
     }),
+  /** 画廊分页：beforeId 为上一页最后一条的 id（游标），首页传 null */
   listHistory: (
     limit?: number,
-    offset?: number,
+    beforeId?: number | null,
     model?: string,
     style?: string,
     favoriteOnly?: boolean,
   ) =>
     invoke<{ items: HistoryItem[] }>("list_history", {
       limit,
-      offset,
+      beforeId,
       model,
       style,
       favoriteOnly,
@@ -574,10 +580,12 @@ export const api = {
     requestId?: string | null,
     conversationId?: number | null,
   ) =>
-    invoke<{ refined: string; used: boolean; error?: AdapterError }>(
-      "refine_prompt",
-      { input: { raw, context, requestId, conversationId } },
-    ),
+    invoke<{
+      refined: string;
+      used: boolean;
+      cancelled?: boolean;
+      error?: AdapterError;
+    }>("refine_prompt", { input: { raw, context, requestId, conversationId } }),
   /// 取消在途思考优化（幂等：未注册/已结束返回 false）
   cancelRefine: (requestId: string) =>
     invoke<boolean>("cancel_refine", { requestId }),
@@ -604,6 +612,7 @@ export const api = {
       counts: Record<string, number>;
       paused: boolean;
       concurrency: number;
+      providerConcurrency: number;
     }>("list_jobs"),
   cancelQueueJob: (id: number) => invoke<void>("cancel_queue_job", { id }),
   retryQueueJob: (id: number) => invoke<void>("retry_queue_job", { id }),

@@ -118,6 +118,7 @@ fn settings_json() -> serde_json::Value {
         "glassAppearance",
         "uiMode",
         "queueConcurrency",
+        "queueProviderConcurrency",
         "cacheRetentionDays",
         "defaultProviderId",
         "defaultParams",
@@ -137,26 +138,39 @@ fn settings_json() -> serde_json::Value {
         "networkProxy".into(),
         serde_json::json!({
             "mode": proxy.mode,
-            "url": proxy.url,
+            // 代理 URL 可能带 user:pass@ 或 ?key=，诊断包同样要脱敏
+            "url": crate::redact::redact_secrets(&proxy.url),
             "noProxy": proxy.no_proxy,
         }),
     );
     serde_json::Value::Object(out)
 }
 
+/// D5：先写临时文件 → fsync → rename，避免半截 zip 覆盖掉上一次可用的诊断包
 fn write_zip(out: &Path, entries: &[(String, Vec<u8>)]) -> AppResult<()> {
-    let file = std::fs::File::create(out)?;
-    let mut zip = zip::ZipWriter::new(file);
-    let options = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
-    for (name, bytes) in entries {
-        zip.start_file(name.as_str(), options)
-            .map_err(|e| AppError::Other(format!("写入诊断包失败: {e}")))?;
-        zip.write_all(bytes)?;
+    let tmp = out.with_extension("zip.tmp");
+    let result = (|| -> AppResult<()> {
+        let file = std::fs::File::create(&tmp)?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        for (name, bytes) in entries {
+            zip.start_file(name.as_str(), options)
+                .map_err(|e| AppError::Other(format!("写入诊断包失败: {e}")))?;
+            zip.write_all(bytes)?;
+        }
+        let file = zip
+            .finish()
+            .map_err(|e| AppError::Other(format!("完成诊断包失败: {e}")))?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, out)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    zip.finish()
-        .map_err(|e| AppError::Other(format!("完成诊断包失败: {e}")))?;
-    Ok(())
+    result
 }
 
 #[cfg(test)]

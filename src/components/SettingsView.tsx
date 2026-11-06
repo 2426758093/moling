@@ -3,7 +3,7 @@ import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { api, ProviderItem } from "../lib/api";
 import { saveTextFile } from "../lib/save";
 import { useProviderStore } from "../stores/providerStore";
-import { useAppStore } from "../stores/appStore";
+import { sanitizePrefs, useAppStore } from "../stores/appStore";
 import { toast } from "../lib/notify";
 import type { GlassAppearance } from "../lib/types";
 import { isUiMode, qualityLabel, sizeLabel } from "../lib/types";
@@ -357,7 +357,7 @@ export default function SettingsView() {
                         const saved = await api.getSetting("defaultParams");
                         if (!saved) return;
                         try {
-                          setPrefs(JSON.parse(saved));
+                          setPrefs(sanitizePrefs(JSON.parse(saved)));
                           toast("已恢复默认参数");
                         } catch {
                           toast("默认参数损坏，无法恢复", "error");

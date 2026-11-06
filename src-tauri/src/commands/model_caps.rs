@@ -84,6 +84,30 @@ pub fn set_model_caps(provider_id: i64, model: String, caps: ModelCaps) -> Resul
     storage::save_model_caps(provider_id, &model, &json).map_err(|e| e.to_string())
 }
 
+/// 批量保存模型能力：单事务写入，避免逐个调用中途失败留下半套配置。
+#[tauri::command]
+pub fn save_model_caps_batch(
+    provider_id: i64,
+    entries: HashMap<String, ModelCaps>,
+) -> Result<(), String> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    storage::get_provider(provider_id)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("服务商 #{provider_id} 不存在"))?;
+    let mut rows = Vec::with_capacity(entries.len());
+    for (model, caps) in entries {
+        let model = model.trim().to_string();
+        if model.is_empty() {
+            return Err("模型名不能为空".into());
+        }
+        let json = serde_json::to_string(&caps).map_err(|e| e.to_string())?;
+        rows.push((model, json));
+    }
+    storage::save_model_caps_batch(provider_id, &rows).map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

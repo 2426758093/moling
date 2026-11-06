@@ -196,9 +196,11 @@ pub async fn save_provider(input: ProviderInput) -> Result<serde_json::Value, St
         input.id,
         &row_to_draft(&input, &edit_template_json, &transform_template_json),
     )?;
-    if let Some(ep) = &input.extra_params {
-        storage::set_setting(&format!("extraParams:{}", row.id), ep)?;
-    }
+    // D9：始终写入，空值即清空；只在前端传 Some 时写会让旧参数永远删不掉
+    storage::set_setting(
+        &format!("extraParams:{}", row.id),
+        input.extra_params.as_deref().unwrap_or(""),
+    )?;
     Ok(provider_item(&row))
 }
 

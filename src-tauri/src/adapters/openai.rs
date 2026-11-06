@@ -1,6 +1,7 @@
 use super::{
-    classify_http, classify_reqwest, download_image_bytes, http_client, prompt_with_negative,
-    AdapterError, EditRequest, GenerateRequest, ImageAdapter, ProviderConfig, TransformRequest,
+    classify_http, classify_http_with_retry_after, classify_reqwest, download_image_bytes,
+    http_client, prompt_with_negative, retry_after_secs, AdapterError, EditRequest,
+    GenerateRequest, ImageAdapter, ProviderConfig, TransformRequest,
 };
 use base64::Engine;
 
@@ -53,6 +54,28 @@ pub(crate) fn map_quality(model: &str, quality: Option<&str>) -> Option<String> 
     Some(quality.to_string())
 }
 
+/// `response_format` 只属于 DALL·E 系列；gpt-image 系列会以
+/// `400 Unknown parameter: 'response_format'` 拒绝（Cherry Studio 踩过同款坑）。
+pub(crate) fn supports_response_format(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("dall-e")
+}
+
+/// 尺寸能力：DALL·E / gpt-image-1 系列只认固定档位，必须吸附；
+/// gpt-image-2 与未知模型保留用户请求，避免把 1792x1024 静默改成 1536x1024。
+pub(crate) fn size_for_model(model: &str, width: u32, height: u32) -> Option<String> {
+    if is_auto_size(width, height) {
+        return None;
+    }
+    let model = model.to_ascii_lowercase();
+    if model.contains("dall-e") || model.contains("gpt-image-1") {
+        return Some(snap_size(width, height));
+    }
+    if width.is_multiple_of(8) && height.is_multiple_of(8) {
+        return Some(format!("{width}x{height}"));
+    }
+    Some(snap_size(width, height))
+}
+
 /// gpt-image / dall-e 系列只支持这几种尺寸，按宽高比吸附到最近档位
 pub(crate) fn snap_size(width: u32, height: u32) -> String {
     const PRESETS: [(u32, u32); 3] = [(1024, 1024), (1536, 1024), (1024, 1536)];
@@ -82,7 +105,162 @@ pub(crate) fn truncate_preview(body: &str, max_chars: usize) -> String {
     }
 }
 
-/// 把服务商的「透传参数」JSON 合并进请求体（顶层键覆盖默认值）
+/// `/images/edits` 的表单文本字段：嵌套值无法作为表单发送直接跳过。
+/// `response_format` 必须剔除——该字段只对 DALL·E 2 有意义，gpt-image 系列一律返回
+/// b64_json；严格网关会因这个多余字段直接 400（上游错误常被中转包装成
+/// `bad_response_status_code`，从响应体看不出真实原因）。
+pub(crate) fn edit_form_fields(body: &serde_json::Value) -> Vec<(String, String)> {
+    let Some(obj) = body.as_object() else {
+        return Vec::new();
+    };
+    obj.iter()
+        .filter(|(key, _)| key.as_str() != "response_format")
+        .filter_map(|(key, value)| {
+            let text = match value {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::Bool(b) => b.to_string(),
+                _ => return None,
+            };
+            Some((key.clone(), text))
+        })
+        .collect()
+}
+
+/// 编辑端点单张图片的体积/像素上限：超过时服务商通常直接 400，本地先给出可读错误
+const MAX_EDIT_IMAGE_BYTES: usize = 25 * 1024 * 1024;
+const MAX_EDIT_PIXELS: u64 = 40_000_000;
+
+/// 解码并校验待上送图片，防止超大图/解压炸弹进入网络请求
+fn decode_edit_image(bytes: &[u8], label: &str) -> Result<image::DynamicImage, AdapterError> {
+    if bytes.len() > MAX_EDIT_IMAGE_BYTES {
+        return Err(AdapterError::Other {
+            message: format!("{label}超过 {}MB 上限", MAX_EDIT_IMAGE_BYTES / 1024 / 1024),
+        });
+    }
+    let img = crate::image_store::decode_limited(bytes).map_err(|e| AdapterError::Other {
+        message: format!("{label}解码失败: {e}"),
+    })?;
+    if img.width() as u64 * img.height() as u64 > MAX_EDIT_PIXELS {
+        return Err(AdapterError::Other {
+            message: format!("{label}像素过大，请压缩后再试"),
+        });
+    }
+    Ok(img)
+}
+
+fn normalize_edit_image(bytes: Vec<u8>) -> Result<Vec<u8>, AdapterError> {
+    decode_edit_image(&bytes, "参考图")?;
+    Ok(bytes)
+}
+
+/// 蒙版必须是与原图同尺寸、带 Alpha 的 PNG：不满足时不发请求，避免不可诊断的 400
+fn normalize_mask(mask: Vec<u8>, image: &[u8]) -> Result<Vec<u8>, AdapterError> {
+    let base = decode_edit_image(image, "参考图")?;
+    let mask_img = decode_edit_image(&mask, "蒙版")?;
+    if (base.width(), base.height()) != (mask_img.width(), mask_img.height()) {
+        return Err(AdapterError::Other {
+            message: format!(
+                "蒙版尺寸 {}x{} 与参考图 {}x{} 不一致",
+                mask_img.width(),
+                mask_img.height(),
+                base.width(),
+                base.height()
+            ),
+        });
+    }
+    if !mask_img.color().has_alpha() {
+        return Err(AdapterError::Other {
+            message: "蒙版必须包含 Alpha 通道（透明区域表示要修改的范围）".into(),
+        });
+    }
+    let mut out = std::io::Cursor::new(Vec::new());
+    mask_img
+        .write_to(&mut out, image::ImageFormat::Png)
+        .map_err(|e| AdapterError::Other {
+            message: format!("蒙版转 PNG 失败: {e}"),
+        })?;
+    Ok(out.into_inner())
+}
+
+/// 构造 `/images/edits` 的 multipart 表单；字段名在部分服务商那里可能是单数 `image`
+fn build_edit_form(
+    body: &serde_json::Value,
+    images: &[(Vec<u8>, &'static str, &'static str)],
+    field: &str,
+) -> Result<reqwest::multipart::Form, AdapterError> {
+    let mut form = reqwest::multipart::Form::new();
+    for (key, text) in edit_form_fields(body) {
+        form = form.text(key, text);
+    }
+    for (i, (bytes, ext, mime)) in images.iter().enumerate() {
+        form = form.part(
+            field.to_string(),
+            reqwest::multipart::Part::bytes(bytes.clone())
+                .file_name(format!("ref.{i}.{ext}"))
+                .mime_str(mime)
+                .map_err(|e| AdapterError::Other {
+                    message: e.to_string(),
+                })?,
+        );
+    }
+    Ok(form)
+}
+
+/// 中转常见的 400 文案差异：`image` 单数 / `image[]` 数组，只回退一次（400 不计费）
+fn suggests_singular_image_field(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("image")
+        && !lower.contains("image[]")
+        && (lower.contains("required")
+            || lower.contains("missing")
+            || lower.contains("unknown")
+            || lower.contains("expected"))
+}
+
+/// 400 参数错误的可执行上下文：只列字段名与端点，不记录任何值/密钥
+fn enrich_400(
+    err: AdapterError,
+    endpoint: &str,
+    model: &str,
+    fields: impl IntoIterator<Item = String>,
+) -> AdapterError {
+    let fields: Vec<String> = fields.into_iter().collect();
+    let context = format!(
+        "（端点 {endpoint}，模型 {model}，字段 [{}]；常见原因：不支持的 response_format / 尺寸档位 / 蒙版格式）",
+        fields.join(", ")
+    );
+    match err {
+        AdapterError::Other { message } => AdapterError::Other {
+            message: format!("{message}{context}"),
+        },
+        other => other,
+    }
+}
+
+/// edits 请求失败的统一诊断：字段清单来自实际表单（不含值），
+/// 让「中转把上游 400 包装成 bad_response_status_code」也能定位到真实字段
+fn edit_error(
+    status: reqwest::StatusCode,
+    text: &str,
+    model: &str,
+    body: &serde_json::Value,
+    extra_fields: &[&str],
+    retry_after: Option<u64>,
+) -> AdapterError {
+    let mut fields: Vec<String> = edit_form_fields(body)
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    fields.extend(extra_fields.iter().map(|field| field.to_string()));
+    enrich_400(
+        classify_http_with_retry_after(status, text, retry_after),
+        "/images/edits",
+        model,
+        fields,
+    )
+}
+
 pub(crate) fn merge_extra_params(body: &mut serde_json::Value, config: &ProviderConfig) {
     if config.extra_params.trim().is_empty() {
         return;
@@ -116,6 +294,24 @@ impl OpenAiAdapter {
         std::time::Duration::from_secs(config.timeout_secs)
     }
 
+    /// 发送 /images/edits 表单；字段名可切换（image[] / image）
+    async fn send_edits(
+        config: &ProviderConfig,
+        body: &serde_json::Value,
+        images: &[(Vec<u8>, &'static str, &'static str)],
+        field: &str,
+    ) -> Result<reqwest::Response, AdapterError> {
+        let form = build_edit_form(body, images, field)?;
+        http_client()?
+            .post(format!("{}/images/edits", Self::base(config)))
+            .timeout(Self::timeout(config))
+            .bearer_auth(&config.api_key)
+            .multipart(form)
+            .send()
+            .await
+            .map_err(|e| classify_reqwest(&e))
+    }
+
     /// 构造并发送 /images/edits 请求（编辑与变换共用同一端点）。
     async fn post_edit(
         config: &ProviderConfig,
@@ -125,22 +321,21 @@ impl OpenAiAdapter {
         mask_bytes: Option<Vec<u8>>,
         size: Option<String>,
     ) -> Result<ImageResponse, AdapterError> {
-        let mut form = reqwest::multipart::Form::new()
-            .text("model", model.to_string())
-            .text("prompt", prompt.to_string());
+        let mut body = serde_json::json!({ "model": model, "prompt": prompt });
         // RA-02：编辑分支同样吸附到服务商支持的尺寸档位，与 generate 保持一致
         if let Some(size) = size {
-            form = form.text("size", size);
+            body["size"] = serde_json::Value::String(size);
         }
-        form = form.part(
-            "image",
-            reqwest::multipart::Part::bytes(image_bytes)
-                .file_name("image.png")
-                .mime_str("image/png")
-                .map_err(|e| AdapterError::Other {
-                    message: e.to_string(),
-                })?,
-        );
+        // A2：上送前本地校验体积/像素；蒙版必须是同尺寸且带 Alpha 的 PNG
+        let has_mask = mask_bytes.is_some();
+        let image_bytes = normalize_edit_image(image_bytes)?;
+        let mask_bytes = match mask_bytes {
+            Some(mask) => Some(normalize_mask(mask, &image_bytes)?),
+            None => None,
+        };
+        // 文件名与 MIME 按真实格式上报：JPEG 谎报 PNG 会被严格网关拒绝
+        let (ext, mime) = crate::image_store::sniff_image_mime(&image_bytes);
+        let mut form = build_edit_form(&body, &[(image_bytes, ext, mime)], "image")?;
         if let Some(mask_bytes) = mask_bytes {
             form = form.part(
                 "mask",
@@ -152,7 +347,7 @@ impl OpenAiAdapter {
                     })?,
             );
         }
-        let resp = http_client()
+        let resp = http_client()?
             .post(format!("{}/images/edits", Self::base(config)))
             .timeout(Self::timeout(config))
             .bearer_auth(&config.api_key)
@@ -162,8 +357,14 @@ impl OpenAiAdapter {
             .map_err(|e| classify_reqwest(&e))?;
         if !resp.status().is_success() {
             let status = resp.status();
+            let retry_after = retry_after_secs(&resp);
             let text = resp.text().await.unwrap_or_default();
-            return Err(classify_http(status, &text));
+            let extra: &[&str] = if has_mask {
+                &["image", "mask"]
+            } else {
+                &["image"]
+            };
+            return Err(edit_error(status, &text, model, &body, extra, retry_after));
         }
         super::parse_json_body(resp, "/images/edits").await
     }
@@ -241,7 +442,7 @@ fn scaled_size(bytes: &[u8], scale: u32) -> Option<String> {
     if scale <= 1 {
         return None;
     }
-    let img = image::load_from_memory(bytes).ok()?;
+    let img = crate::image_store::decode_limited(bytes).ok()?;
     Some(snap_size(
         img.width().saturating_mul(scale.max(1)),
         img.height().saturating_mul(scale.max(1)),
@@ -254,7 +455,7 @@ impl ImageAdapter for OpenAiAdapter {
         config: &'a ProviderConfig,
     ) -> super::BoxFuture<'a, Result<Vec<String>, AdapterError>> {
         Box::pin(async move {
-            let resp = http_client()
+            let resp = http_client()?
                 .get(format!("{}/models", Self::base(config)))
                 .timeout(Self::timeout(config))
                 .bearer_auth(&config.api_key)
@@ -287,80 +488,87 @@ impl ImageAdapter for OpenAiAdapter {
                 prompt: prompt_with_negative(&req.prompt, req.negative_prompt.as_deref()),
                 // count 映射为 OpenAI n 参数；多图返回在下方按 data 数组逐项解析
                 n: req.count.max(1),
-                size: if is_auto_size(req.width, req.height) {
-                    None
-                } else {
-                    Some(snap_size(req.width, req.height))
-                },
+                size: size_for_model(&req.model, req.width, req.height),
                 quality: map_quality(&req.model, req.quality.as_deref()),
-                response_format: Some("b64_json".into()),
+                response_format: supports_response_format(&req.model)
+                    .then(|| "b64_json".to_string()),
             })
             .map_err(|e| AdapterError::Other {
                 message: e.to_string(),
             })?;
             merge_extra_params(&mut body, config);
-            let resp = if req.images.is_empty() {
+            // 透传参数也可能塞回 response_format；能力过滤必须放在合并之后
+            if !supports_response_format(&req.model) {
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove("response_format");
+                }
+            }
+            let (resp, endpoint, edit_field) = if req.images.is_empty() {
                 // 纯文生图：JSON 请求 /images/generations
-                http_client()
+                let resp = http_client()?
                     .post(format!("{}/images/generations", Self::base(config)))
                     .timeout(Self::timeout(config))
                     .bearer_auth(&config.api_key)
                     .json(&body)
                     .send()
                     .await
-                    .map_err(|e| classify_reqwest(&e))?
+                    .map_err(|e| classify_reqwest(&e))?;
+                (resp, "/images/generations", None)
             } else {
                 // 参考图（图生图/编辑）：gpt-image 规范走 multipart /images/edits；
-                // RA-01：此前只搬运字符串字段，导致数字型 n 丢失，这里按标量统一转文本，
-                // 覆盖 model/prompt/n/size/response_format 以及透传的标量参数。
-                let mut form = reqwest::multipart::Form::new();
-                if let Some(obj) = body.as_object() {
-                    for (key, value) in obj {
-                        let text = match value {
-                            serde_json::Value::String(s) => s.clone(),
-                            serde_json::Value::Number(n) => n.to_string(),
-                            serde_json::Value::Bool(b) => b.to_string(),
-                            // 嵌套对象/数组无法作为表单文本字段，跳过
-                            _ => continue,
-                        };
-                        form = form.text(key.clone(), text);
-                    }
-                }
-                for (i, img_b64) in req.images.iter().enumerate() {
+                // RA-01：数字型 n 等标量统一转文本；response_format 由 edit_form_fields 剔除。
+                let mut prepared = Vec::with_capacity(req.images.len());
+                for img_b64 in &req.images {
                     let bytes = base64::engine::general_purpose::STANDARD
                         .decode(img_b64)
                         .map_err(|e| AdapterError::Other {
                             message: format!("参考图 base64 解码失败: {}", e),
                         })?;
-                    // 文件名与 MIME 按真实格式上报：压缩后的参考图多为 JPEG，
-                    // 谎报 image/png 会被严格网关拒绝
+                    // A8：解码校验 + 体积/像素上限；A2：MIME 按真实格式上报
+                    let bytes = normalize_edit_image(bytes)?;
                     let (ext, mime) = crate::image_store::sniff_image_mime(&bytes);
-                    form = form.part(
-                        "image[]",
-                        reqwest::multipart::Part::bytes(bytes)
-                            // 文件名必须带扩展名，否则服务商可能按二进制拒绝
-                            .file_name(format!("ref.{}.{}", i, ext))
-                            .mime_str(mime)
-                            .map_err(|e| AdapterError::Other {
-                                message: e.to_string(),
-                            })?,
-                    );
+                    prepared.push((bytes, ext, mime));
                 }
-                http_client()
-                    .post(format!("{}/images/edits", Self::base(config)))
-                    .timeout(Self::timeout(config))
-                    .bearer_auth(&config.api_key)
-                    .multipart(form)
-                    .send()
-                    .await
-                    .map_err(|e| classify_reqwest(&e))?
+                let mut field = "image[]";
+                let mut resp = Self::send_edits(config, &body, &prepared, field).await?;
+                // A7：部分中转只认单数 image 字段；400 不计费，允许回退一次
+                if resp.status() == reqwest::StatusCode::BAD_REQUEST && prepared.len() == 1 {
+                    let status = resp.status();
+                    let text = resp.text().await.unwrap_or_default();
+                    if suggests_singular_image_field(&text) {
+                        tracing::warn!("服务商要求单数 image 字段，回退重试一次");
+                        field = "image";
+                        resp = Self::send_edits(config, &body, &prepared, field).await?;
+                    } else {
+                        return Err(edit_error(status, &text, &req.model, &body, &[field], None));
+                    }
+                }
+                (resp, "/images/edits", Some(field))
             };
             if !resp.status().is_success() {
                 let status = resp.status();
+                let retry_after = retry_after_secs(&resp);
                 let text = resp.text().await.unwrap_or_default();
-                return Err(classify_http(status, &text));
+                return Err(match edit_field {
+                    Some(field) => {
+                        edit_error(status, &text, &req.model, &body, &[field], retry_after)
+                    }
+                    None => {
+                        // 只记录字段名，不记录值（可能含密钥/超长提示词）
+                        let fields = body
+                            .as_object()
+                            .map(|obj| obj.keys().cloned().collect::<Vec<_>>())
+                            .unwrap_or_default();
+                        enrich_400(
+                            classify_http_with_retry_after(status, &text, retry_after),
+                            endpoint,
+                            &req.model,
+                            fields,
+                        )
+                    }
+                });
             }
-            let parsed: ImageResponse = super::parse_json_body(resp, "/images/generations").await?;
+            let parsed: ImageResponse = super::parse_json_body(resp, endpoint).await?;
             let mut out = Vec::new();
             for entry in &parsed.data {
                 out.push(Self::fetch_image_b64(entry, Self::timeout(config)).await?);
@@ -396,7 +604,7 @@ impl ImageAdapter for OpenAiAdapter {
                 &prompt_with_negative(&req.prompt, req.negative_prompt.as_deref()),
                 image_bytes,
                 mask_bytes,
-                Some(snap_size(req.width, req.height)),
+                size_for_model(&req.model, req.width, req.height),
             )
             .await?;
             Self::first_image_b64(parsed, Self::timeout(config)).await
@@ -483,6 +691,104 @@ mod tests {
             scaled_size(cursor.get_ref(), 1).is_none(),
             "风格转换保持原尺寸，不带 size 字段"
         );
+    }
+
+    /// A1：能力矩阵——只有 DALL·E 系列发 response_format，gpt-image 一律不发
+    #[test]
+    fn generation_body_omits_response_format_for_gpt_image() {
+        let body = |model: &str| {
+            serde_json::to_value(GenerationBody {
+                model: model.into(),
+                prompt: "x".into(),
+                n: 1,
+                size: size_for_model(model, 1024, 1024),
+                quality: map_quality(model, None),
+                response_format: supports_response_format(model).then(|| "b64_json".to_string()),
+            })
+            .unwrap()
+        };
+        assert!(body("gpt-image-1").get("response_format").is_none());
+        assert!(body("openai/gpt-image-2.5")
+            .get("response_format")
+            .is_none());
+        assert_eq!(body("dall-e-3")["response_format"], "b64_json");
+    }
+
+    /// A1：新模型保留用户尺寸，不吸附到 DALL·E 三档
+    #[test]
+    fn size_for_model_keeps_requested_dimensions_for_new_models() {
+        assert_eq!(
+            size_for_model("gpt-image-2", 1792, 1024).as_deref(),
+            Some("1792x1024")
+        );
+        assert_eq!(
+            size_for_model("weird-model", 768, 512).as_deref(),
+            Some("768x512")
+        );
+        assert_eq!(
+            size_for_model("gpt-image-1", 1792, 1024).as_deref(),
+            Some("1536x1024")
+        );
+        assert_eq!(
+            size_for_model("dall-e-3", 680, 1024).as_deref(),
+            Some("1024x1536")
+        );
+        assert_eq!(size_for_model("gpt-image-2", 0, 0), None);
+    }
+
+    fn png_of(width: u32, height: u32, alpha: bool) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        if alpha {
+            image::DynamicImage::ImageRgba8(image::RgbaImage::new(width, height))
+                .write_to(&mut cursor, image::ImageFormat::Png)
+                .unwrap();
+        } else {
+            image::DynamicImage::ImageRgb8(image::RgbImage::new(width, height))
+                .write_to(&mut cursor, image::ImageFormat::Png)
+                .unwrap();
+        }
+        cursor.into_inner()
+    }
+
+    /// A2：蒙版必须与参考图同尺寸且带 Alpha，否则本地直接报错不发请求
+    #[test]
+    fn mask_normalization_requires_same_size_and_alpha() {
+        let image = png_of(64, 64, true);
+        assert!(normalize_mask(png_of(64, 64, true), &image).is_ok());
+        let mismatch = normalize_mask(png_of(32, 32, true), &image).unwrap_err();
+        assert!(
+            mismatch.message().contains("尺寸"),
+            "{}",
+            mismatch.message()
+        );
+        let no_alpha = normalize_mask(png_of(64, 64, false), &image).unwrap_err();
+        assert!(
+            no_alpha.message().contains("Alpha"),
+            "{}",
+            no_alpha.message()
+        );
+    }
+
+    /// A2/A8：超过体积上限的图片在本地拒绝，不进入网络请求
+    #[test]
+    fn edit_image_limit_rejects_oversized_payload() {
+        let err = normalize_edit_image(vec![0u8; MAX_EDIT_IMAGE_BYTES + 1]).unwrap_err();
+        assert!(err.message().contains("上限"), "{}", err.message());
+        let err = normalize_edit_image(b"not an image".to_vec()).unwrap_err();
+        assert!(err.message().contains("解码失败"), "{}", err.message());
+    }
+
+    /// A7：只在错误明确指向单数 image 字段时回退，避免误触发重复请求
+    #[test]
+    fn singular_image_field_hint_detection() {
+        assert!(suggests_singular_image_field(
+            r#"{"error":{"message":"image is required"}}"#
+        ));
+        assert!(suggests_singular_image_field("missing field `image`"));
+        assert!(!suggests_singular_image_field(
+            "unknown parameter: image[] is deprecated"
+        ));
+        assert!(!suggests_singular_image_field("content policy violation"));
     }
 
     /// F-012：空结果必须报错，非空结果原样透传

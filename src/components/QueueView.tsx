@@ -73,6 +73,11 @@ const CONCURRENCY_OPTIONS = [1, 2, 3, 4].map((n) => ({
   label: `${n} 个任务`,
 }));
 
+const PROVIDER_CONCURRENCY_OPTIONS = [1, 2].map((n) => ({
+  value: String(n),
+  label: `${n} 个任务`,
+}));
+
 type Filter = "all" | "pending" | "done" | "issue";
 
 const FILTERS: { id: Filter; label: string }[] = [
@@ -95,8 +100,20 @@ function matchesFilter(job: QueueJob, filter: Filter) {
   }
 }
 
-/// 参考图 data URL 缓存：队列条目重渲染时不重复读盘
+/// 参考图 data URL 缓存：队列条目重渲染时不重复读盘。
+/// 上限 200 条（LRU）：长队列里 data URL 每条都是几百 KB，无界缓存会吃光内存。
+const REF_URL_CACHE_LIMIT = 200;
 const refUrlCache = new Map<string, string>();
+
+function cacheRefUrl(path: string, url: string) {
+  refUrlCache.delete(path);
+  refUrlCache.set(path, url);
+  while (refUrlCache.size > REF_URL_CACHE_LIMIT) {
+    const oldest = refUrlCache.keys().next().value;
+    if (oldest === undefined) break;
+    refUrlCache.delete(oldest);
+  }
+}
 
 /// 队列条目上的参考图缩略图（最多 4 张，路径来自 inputJson）
 function ReferenceThumbs({ inputJson }: { inputJson: string }) {
@@ -122,7 +139,7 @@ function ReferenceThumbs({ inputJson }: { inputJson: string }) {
         if (hit) return hit;
         try {
           const url = await api.readReferenceImage(p);
-          refUrlCache.set(p, url);
+          cacheRefUrl(p, url);
           return url;
         } catch {
           return "";
@@ -332,6 +349,8 @@ export default function QueueView() {
   const jobs = useQueueStore((s) => s.jobs);
   const paused = useQueueStore((s) => s.paused);
   const concurrency = useQueueStore((s) => s.concurrency);
+  const providerConcurrency = useQueueStore((s) => s.providerConcurrency);
+  const setProviderConcurrency = useQueueStore((s) => s.setProviderConcurrency);
   const loaded = useQueueStore((s) => s.loaded);
   const load = useQueueStore((s) => s.load);
   const start = useQueueStore((s) => s.start);
@@ -386,6 +405,20 @@ export default function QueueView() {
                 options={CONCURRENCY_OPTIONS}
                 widthClass="w-28"
                 label="队列并发数"
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <span className="text-footnote text-tertiary">每服务商</span>
+              <Select
+                value={String(providerConcurrency)}
+                onValueChange={(v) =>
+                  setProviderConcurrency(Number(v)).catch((e) =>
+                    toast(`并发设置失败：${String(e)}`, "error"),
+                  )
+                }
+                options={PROVIDER_CONCURRENCY_OPTIONS}
+                widthClass="w-28"
+                label="每服务商并发数"
               />
             </div>
             {paused && (

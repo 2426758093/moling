@@ -1,4 +1,5 @@
 use crate::error::{AppError, AppResult};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 use tauri::Manager;
@@ -72,18 +73,35 @@ pub(crate) fn resolve_media_root(config_path: &Path, fallback: &Path) -> PathBuf
     }
 }
 
-/// 原子写入引导文件：先写临时文件再改名，进程中断不会留下半截 JSON。
-pub(crate) fn write_storage_config(path: &Path, root: &Path) -> AppResult<()> {
+/// 原子写入：同目录临时文件 → fsync → rename。进程中断或 rename 失败都不会
+/// 破坏原文件，也不会留下写了一半的内容。
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> AppResult<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    let mut tmp_name = path.as_os_str().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp = PathBuf::from(tmp_name);
+    let result = (|| -> AppResult<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// 原子写入引导文件：先写临时文件再改名，进程中断不会留下半截 JSON。
+pub(crate) fn write_storage_config(path: &Path, root: &Path) -> AppResult<()> {
     let body = serde_json::json!({ "version": 1, "root": root.to_string_lossy() });
-    let tmp = path.with_extension("json.tmp");
     let bytes = serde_json::to_vec_pretty(&body)
         .map_err(|e| AppError::Other(format!("序列化媒体目录配置失败: {e}")))?;
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    atomic_write(path, &bytes)
 }
 
 /// 启动时初始化媒体根，返回解析结果供图片回收使用。
@@ -191,6 +209,25 @@ mod tests {
         write_storage_config(&cfg, &root).expect("写入配置");
         assert_eq!(resolve_media_root(&cfg, &dir), root);
         assert!(!cfg.with_extension("json.tmp").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// rename 失败时原文件保持完整，临时文件被清理
+    #[test]
+    fn atomic_write_keeps_target_when_rename_fails() {
+        let dir = temp_dir("atomic_fail");
+        let target = dir.join("cfg.json");
+        std::fs::write(&target, b"original").unwrap();
+        // 目标变成目录后 rename 必然失败
+        std::fs::remove_file(&target).unwrap();
+        std::fs::create_dir(&target).unwrap();
+
+        let err = atomic_write(&target, b"new");
+        assert!(err.is_err(), "复制到目录应失败");
+        assert!(target.is_dir());
+        let mut tmp = target.as_os_str().to_os_string();
+        tmp.push(".tmp");
+        assert!(!PathBuf::from(tmp).exists(), "失败后不应残留临时文件");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

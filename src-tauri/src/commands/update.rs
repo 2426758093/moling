@@ -1,11 +1,13 @@
 use crate::adapters::http;
 use crate::storage;
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_updater::{Updater, UpdaterExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 /// 同一时刻只允许一次下载 / 安装：重复点击会重复下载整包
 static DOWNLOADING: AtomicBool = AtomicBool::new(false);
@@ -21,8 +23,10 @@ const PROGRESS_INTERVAL: Duration = Duration::from_millis(400);
 /// 小于该大小分段收益有限，直接单连接
 const MIN_PARALLEL_BYTES: u64 = 1024 * 1024;
 const PARALLEL_PARTS: usize = 4;
-/// 更新包大小上限：全量放内存，避免异常清单把进程拖爆
+/// 更新包大小上限：分段直接落盘，但仍限制总量，避免异常清单把磁盘写满
 const MAX_UPDATE_BYTES: u64 = 300 * 1024 * 1024;
+/// 中断下载的残留只有在超过该时长后才清理，避免误删正在进行的下载
+const STALE_DOWNLOAD_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 const USER_AGENT: &str = concat!("moling/", env!("CARGO_PKG_VERSION"));
 
@@ -645,15 +649,90 @@ fn spawn_progress_monitor(progress: Arc<ProgressTracker>) -> tauri::async_runtim
     })
 }
 
+/// 更新包落盘目录：放在系统缓存目录，便于启动时按年龄清理
+fn updates_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("无法确定更新缓存目录: {e}"))?
+        .join("updates");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建更新缓存目录: {e}"))?;
+    Ok(dir)
+}
+
+/// 版本号来自远端清单，不能直接拼进路径
+fn safe_file_component(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// 启动时清理中断下载留下的半成品；只删超过 24h 的文件，避免误伤正在下载的包
+pub fn cleanup_stale_downloads(app: &AppHandle) {
+    let Ok(dir) = app.path().app_cache_dir().map(|p| p.join("updates")) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let expired = entry
+            .metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > STALE_DOWNLOAD_AGE);
+        if expired && std::fs::remove_file(&path).is_ok() {
+            tracing::warn!("已清理过期的更新下载残留: {}", path.display());
+        }
+    }
+}
+
+/// 失败路径统一把进度归零，避免界面停在半截进度条
+fn reset_progress(app: &AppHandle) {
+    let _ = app.emit(
+        "update:progress",
+        serde_json::json!({
+            "downloaded": 0,
+            "total": 0,
+            "speed": 0,
+            "route": "",
+        }),
+    );
+}
+
+async fn open_part(path: &Path, start: u64) -> Result<tokio::fs::File, String> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .await
+        .map_err(|e| format!("打开临时文件失败: {e}"))?;
+    file.seek(std::io::SeekFrom::Start(start))
+        .await
+        .map_err(|e| format!("定位临时文件失败: {e}"))?;
+    Ok(file)
+}
+
 async fn fetch_range(
     client: &reqwest::Client,
     url: &reqwest::Url,
-    start: u64,
-    end: u64,
+    (start, end): (u64, u64),
     total: u64,
     progress: &ProgressTracker,
     slot: usize,
-) -> Result<Vec<u8>, String> {
+    path: &Path,
+) -> Result<(), String> {
     let mut response = client
         .get(url.clone())
         .header(reqwest::header::USER_AGENT, USER_AGENT)
@@ -681,23 +760,27 @@ async fn fetch_range(
         _ => return Err(format!("分段响应不匹配: {raw}")),
     }
 
-    let expected = (end - start + 1) as usize;
-    let mut data = Vec::with_capacity(expected);
+    let expected = end - start + 1;
+    let mut file = open_part(path, start).await?;
+    let mut written = 0u64;
     while let Some(chunk) = response
         .chunk()
         .await
         .map_err(|e| format!("读取分段失败: {e}"))?
     {
-        data.extend_from_slice(&chunk);
-        if data.len() > expected {
+        written += chunk.len() as u64;
+        if written > expected {
             return Err("分段数据超出预期长度".into());
         }
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("写入临时文件失败: {e}"))?;
         progress.add(slot, chunk.len() as u64);
     }
-    if data.len() != expected {
-        return Err(format!("分段数据不完整（{} / {expected}）", data.len()));
+    if written != expected {
+        return Err(format!("分段数据不完整（{written} / {expected}）"));
     }
-    Ok(data)
+    Ok(())
 }
 
 async fn download_parallel(
@@ -705,19 +788,22 @@ async fn download_parallel(
     url: &reqwest::Url,
     total: u64,
     progress: Arc<ProgressTracker>,
-) -> Result<Vec<u8>, String> {
+    path: PathBuf,
+) -> Result<(), String> {
     let ranges = split_ranges(total, PARALLEL_PARTS);
     let mut handles = Vec::with_capacity(ranges.len());
     for (index, (start, end)) in ranges.iter().copied().enumerate() {
         let client = client.clone();
         let url = url.clone();
         let progress = progress.clone();
+        let path = path.clone();
         let slot = index + 1;
         handles.push(tauri::async_runtime::spawn(async move {
             let mut last = String::new();
             for attempt in 0..2 {
-                match fetch_range(&client, &url, start, end, total, &progress, slot).await {
-                    Ok(bytes) => return Ok((index, bytes)),
+                match fetch_range(&client, &url, (start, end), total, &progress, slot, &path).await
+                {
+                    Ok(()) => return Ok(()),
                     Err(e) => {
                         last = e;
                         if attempt == 0 {
@@ -731,11 +817,10 @@ async fn download_parallel(
         }));
     }
 
-    let mut pieces: Vec<Option<Vec<u8>>> = vec![None; ranges.len()];
     let mut error = None;
     for handle in handles {
         match handle.await {
-            Ok(Ok((index, bytes))) => pieces[index] = Some(bytes),
+            Ok(Ok(())) => {}
             Ok(Err((index, e))) => {
                 error.get_or_insert(format!("第 {} 段: {e}", index + 1));
             }
@@ -744,15 +829,10 @@ async fn download_parallel(
             }
         }
     }
-    if let Some(e) = error {
-        return Err(e);
+    match error {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
-
-    let mut out = Vec::with_capacity(total as usize);
-    for piece in pieces {
-        out.extend_from_slice(&piece.ok_or_else(|| "分段结果缺失".to_string())?);
-    }
-    Ok(out)
 }
 
 async fn download_single(
@@ -760,7 +840,8 @@ async fn download_single(
     url: &reqwest::Url,
     total: u64,
     progress: &ProgressTracker,
-) -> Result<Vec<u8>, String> {
+    path: &Path,
+) -> Result<(), String> {
     let mut response = client
         .get(url.clone())
         .header(reqwest::header::USER_AGENT, USER_AGENT)
@@ -771,19 +852,32 @@ async fn download_single(
     if !response.status().is_success() {
         return Err(format!("下载失败（HTTP {}）", response.status()));
     }
-    let mut data = Vec::with_capacity(total as usize);
+    // 多线程失败回退时文件里可能已有半截数据，先清空再顺序写
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .await
+        .map_err(|e| format!("打开临时文件失败: {e}"))?;
+    file.set_len(total)
+        .await
+        .map_err(|e| format!("预分配临时文件失败: {e}"))?;
+    let mut written = 0u64;
     while let Some(chunk) = response
         .chunk()
         .await
         .map_err(|e| format!("读取下载数据失败: {e}"))?
     {
-        data.extend_from_slice(&chunk);
-        progress.add(0, chunk.len() as u64);
-        if data.len() as u64 > MAX_UPDATE_BYTES {
+        written += chunk.len() as u64;
+        if written > total || written > MAX_UPDATE_BYTES {
             return Err("更新包超出大小上限，已中止下载".into());
         }
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| format!("写入临时文件失败: {e}"))?;
+        progress.add(0, chunk.len() as u64);
     }
-    Ok(data)
+    Ok(())
 }
 
 async fn download_with_route(
@@ -791,19 +885,20 @@ async fn download_with_route(
     url: &reqwest::Url,
     total: u64,
     progress: Arc<ProgressTracker>,
-) -> Result<Vec<u8>, String> {
+    path: &Path,
+) -> Result<(), String> {
     let monitor = spawn_progress_monitor(progress.clone());
     let result = if total >= MIN_PARALLEL_BYTES {
-        match download_parallel(client, url, total, progress.clone()).await {
-            Ok(bytes) => Ok(bytes),
+        match download_parallel(client, url, total, progress.clone(), path.to_path_buf()).await {
+            Ok(()) => Ok(()),
             Err(e) => {
                 tracing::warn!("多线程下载失败（{e}），回退单连接");
                 progress.reset_all();
-                download_single(client, url, total, &progress).await
+                download_single(client, url, total, &progress, path).await
             }
         }
     } else {
-        download_single(client, url, total, &progress).await
+        download_single(client, url, total, &progress, path).await
     };
     progress.finish();
     let _ = monitor.await;
@@ -863,14 +958,27 @@ async fn download_with_client(
     url: &reqwest::Url,
     total: u64,
     label: &str,
-) -> Result<Vec<u8>, String> {
+    path: &Path,
+) -> Result<(), String> {
     validate_range_total(total)?;
+    {
+        let file = tokio::fs::File::create(path)
+            .await
+            .map_err(|e| format!("创建临时文件失败: {e}"))?;
+        file.set_len(total)
+            .await
+            .map_err(|e| format!("预分配临时文件失败: {e}"))?;
+    }
     let progress = Arc::new(ProgressTracker::new(app.clone(), total, label));
-    let bytes = download_with_route(client, url, total, progress).await?;
-    if bytes.len() as u64 == total {
-        Ok(bytes)
+    download_with_route(client, url, total, progress, path).await?;
+    let written = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| format!("读取临时文件失败: {e}"))?
+        .len();
+    if written == total {
+        Ok(())
     } else {
-        Err(format!("下载不完整（{} / {total} 字节）", bytes.len()))
+        Err(format!("下载不完整（{written} / {total} 字节）"))
     }
 }
 
@@ -879,9 +987,28 @@ async fn try_download(
     client: &reqwest::Client,
     url: &reqwest::Url,
     label: &str,
-) -> Result<Vec<u8>, String> {
+    path: &Path,
+) -> Result<(), String> {
     let total = probe_route(client, url).await?;
-    download_with_client(app, client, url, total, label).await
+    download_with_client(app, client, url, total, label, path).await
+}
+
+/// 下载完成后先 fsync 再 rename：中断只会留下 `.tmp`，不会出现“看起来完整”的半包
+async fn finalize_download(tmp: &Path, final_path: &Path) -> Result<(), String> {
+    let file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(tmp)
+        .await
+        .map_err(|e| format!("打开临时文件失败: {e}"))?;
+    file.sync_all()
+        .await
+        .map_err(|e| format!("刷新临时文件失败: {e}"))?;
+    drop(file);
+    // Windows 上 rename 不覆盖已存在文件
+    let _ = tokio::fs::remove_file(final_path).await;
+    tokio::fs::rename(tmp, final_path)
+        .await
+        .map_err(|e| format!("保存更新包失败: {e}"))
 }
 
 #[tauri::command]
@@ -1035,12 +1162,20 @@ pub async fn download_update(app: AppHandle) -> Result<(), String> {
     if !endpoints_configured(&app) {
         return Err("尚未配置更新源".to_string());
     }
+    // 安装阶段会读内存缓存，两边同时进行会拿到被清掉的包
+    if INSTALLING.load(Ordering::SeqCst) {
+        return Err("正在安装更新，无法同时下载".to_string());
+    }
     if DOWNLOADING.swap(true, Ordering::SeqCst) {
         return Err("正在下载更新，请稍候".to_string());
     }
     // 失败必须复位，否则本次进程内再也无法重试
     let result = download_update_inner(&app).await;
     DOWNLOADING.store(false, Ordering::SeqCst);
+    if let Err(e) = &result {
+        reset_progress(&app);
+        tracing::warn!("更新下载失败: {e}");
+    }
     result
 }
 
@@ -1095,8 +1230,15 @@ async fn download_update_inner(app: &AppHandle) -> Result<(), String> {
     let plan = download_plan(&update.download_url, &mode);
     let deadline = Instant::now() + PROBE_BUDGET;
     let mut attempts = Vec::new();
-    let mut downloaded: Option<Vec<u8>> = None;
+    let mut downloaded = false;
     let mut edge_done = false;
+
+    // 下载直接写入临时文件：避免「分段 Vec + 拼接」造成 2 倍内存峰值
+    let dir = updates_dir(app)?;
+    let component = safe_file_component(&update.version);
+    let tmp_path = dir.join(format!("moling-update-{component}.pkg.tmp"));
+    let final_path = dir.join(format!("moling-update-{component}.pkg"));
+    let _ = tokio::fs::remove_file(&tmp_path).await;
 
     for item in &plan {
         if Instant::now() >= deadline {
@@ -1120,9 +1262,9 @@ async fn download_update_inner(app: &AppHandle) -> Result<(), String> {
                 attempts.push(format!("边缘IP×{}", edges.len()));
             }
             for (label, client, url, total) in reached {
-                match download_with_client(app, &client, &url, total, &label).await {
-                    Ok(bytes) => {
-                        downloaded = Some(bytes);
+                match download_with_client(app, &client, &url, total, &label, &tmp_path).await {
+                    Ok(()) => {
+                        downloaded = true;
                         break;
                     }
                     Err(e) => {
@@ -1131,7 +1273,7 @@ async fn download_update_inner(app: &AppHandle) -> Result<(), String> {
                     }
                 }
             }
-            if downloaded.is_some() {
+            if downloaded {
                 break;
             }
             continue;
@@ -1140,9 +1282,9 @@ async fn download_update_inner(app: &AppHandle) -> Result<(), String> {
         let Some(client) = route_client(item.route) else {
             continue;
         };
-        match try_download(app, &client, &item.url, &item.label).await {
-            Ok(bytes) => {
-                downloaded = Some(bytes);
+        match try_download(app, &client, &item.url, &item.label, &tmp_path).await {
+            Ok(()) => {
+                downloaded = true;
                 break;
             }
             Err(e) => {
@@ -1152,9 +1294,23 @@ async fn download_update_inner(app: &AppHandle) -> Result<(), String> {
         }
     }
 
-    let Some(bytes) = downloaded else {
+    if !downloaded {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
         return Err(summarize_download_failure(&attempts));
+    }
+    if let Err(e) = finalize_download(&tmp_path, &final_path).await {
+        let _ = tokio::fs::remove_file(&tmp_path).await;
+        return Err(e);
+    }
+    let bytes = match tokio::fs::read(&final_path).await {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&final_path).await;
+            return Err(format!("读取更新包失败: {e}"));
+        }
     };
+    // 安装使用内存副本，磁盘上不保留整包
+    let _ = tokio::fs::remove_file(&final_path).await;
     update.verify(&bytes).map_err(|e| verify_failure(&e))?;
 
     let cache = app.state::<UpdateCache>();
@@ -1194,12 +1350,14 @@ pub async fn install_update(app: AppHandle) -> Result<(), String> {
         Ok(Err(e)) => {
             restore_cached(&app, cached);
             INSTALLING.store(false, Ordering::SeqCst);
+            reset_progress(&app);
             tracing::warn!("安装更新失败: {e}");
             return Err(format!("安装更新失败: {e}"));
         }
         Err(e) => {
             restore_cached(&app, cached);
             INSTALLING.store(false, Ordering::SeqCst);
+            reset_progress(&app);
             return Err(format!("安装更新失败: {e}"));
         }
     }
@@ -1453,5 +1611,33 @@ mod tests {
         ))
         .expect_err("超大清单应报错");
         assert!(err.contains("超出大小上限"), "{err}");
+    }
+
+    /// 版本号来自远端清单，拼接文件名时不能带出路径分隔符
+    #[test]
+    fn version_component_cannot_escape_cache_dir() {
+        assert_eq!(safe_file_component("1.2.3"), "1.2.3");
+        for raw in ["../../evil", r"..\..\evil", "a/b", "1.0 beta"] {
+            let name = safe_file_component(raw);
+            assert!(!name.contains('/'), "{name}");
+            assert!(!name.contains('\\'), "{name}");
+        }
+    }
+
+    #[test]
+    fn finalize_download_atomically_replaces_target() {
+        let dir = std::env::temp_dir().join(format!("moling-update-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let tmp = dir.join("pkg.tmp");
+        let target = dir.join("pkg");
+        std::fs::write(&tmp, b"new payload").unwrap();
+        std::fs::write(&target, b"old").unwrap();
+
+        tauri::async_runtime::block_on(finalize_download(&tmp, &target)).unwrap();
+
+        assert!(!tmp.exists(), "临时文件应已重命名");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new payload");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

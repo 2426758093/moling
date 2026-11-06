@@ -91,20 +91,30 @@ impl Drop for CancelRegistration {
 }
 
 /// 检查取消标记（无 jobId 时恒为 false）
-fn is_cancelled(token: &Option<CancelToken>) -> bool {
+pub(crate) fn is_cancelled(token: &Option<CancelToken>) -> bool {
     token
         .as_ref()
         .map(|t| t.load(Ordering::SeqCst))
         .unwrap_or(false)
 }
 
-/// RA-04：仅 Network/Timeout 这类瞬时错误重试一次。生成接口按次计费且非幂等，
-/// QuotaExceeded/AuthInvalid/ContentBlocked/Other 重试既无意义又可能重复扣费。
+/// RA-04/A6：只重试「连接都没建立」的 Network 错误（肯定未计费）。
+/// Timeout 可能是上游已经生成、只是读响应超时，自动重试会重复扣费，因此不重试；
+/// QuotaExceeded/AuthInvalid/ContentBlocked/Other 重试同样既无意义又可能重复扣费。
 fn is_retryable(err: &AdapterError) -> bool {
-    matches!(
-        err,
-        AdapterError::Network { .. } | AdapterError::Timeout { .. }
-    )
+    matches!(err, AdapterError::Network { .. })
+}
+
+/// 超时提示：上游可能已生成并计费，引导用户先确认再重试
+fn timeout_billing_hint(err: AdapterError) -> AdapterError {
+    match err {
+        AdapterError::Timeout { message } => AdapterError::Timeout {
+            message: format!(
+                "{message}（请求可能已在上游生成并计费，请先到画廊或服务商后台确认后再重试）"
+            ),
+        },
+        other => other,
+    }
 }
 
 /// 参考图上限：前端三个入口（上传 / 拖拽 / 引用图）已统一限制，
@@ -248,13 +258,35 @@ pub async fn generate_images(
         }
     })
     .await?;
-    Ok(serde_json::json!({ "images": outcome.images, "cancelled": outcome.cancelled }))
+    Ok(serde_json::json!({
+        "images": outcome.images,
+        "cancelled": outcome.cancelled,
+        "failed": outcome.failed,
+    }))
 }
 
 /// 生成结果（聊天命令与队列 worker 共用）
 pub(crate) struct GenerateOutcome {
     pub images: Vec<GeneratedImage>,
+    /// 单张落盘/入库失败明细：部分失败不影响其余图片
+    pub failed: Vec<FailedImage>,
     pub cancelled: bool,
+}
+
+/// 单张图片落盘失败：序号从 1 开始，与用户看到的第几张一致
+#[derive(serde::Serialize)]
+pub(crate) struct FailedImage {
+    pub index: usize,
+    pub reason: String,
+}
+
+/// 缩略图生成要完整解码图片，属于 CPU 密集操作：放到 blocking 线程池，
+/// 避免大图把异步运行时的 worker 卡住（B5）。
+async fn ensure_thumb_async(path: String) {
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        image_store::ensure_thumb(std::path::Path::new(&path));
+    })
+    .await;
 }
 
 /// 生成 + 逐张落盘/入库的核心流程；取消 token 由调用方注册与回收。
@@ -372,7 +404,7 @@ where
                         }
                         continue;
                     }
-                    return Err(adapters::adapter_error_json(e));
+                    return Err(adapters::adapter_error_json(timeout_billing_hint(e)));
                 }
             }
         }
@@ -380,6 +412,7 @@ where
 
     let now = storage::timestamp_millis();
     let mut out = Vec::new();
+    let mut failed: Vec<FailedImage> = Vec::new();
     if let Some(images) = images {
         let total = images.len();
         for (i, b64) in images.iter().enumerate() {
@@ -388,38 +421,55 @@ where
                 cancelled = true;
                 break;
             }
-            let name = image_store::unique_name("", &now, i);
-            let (path, data_url) = image_store::save_b64_image(app, b64, &name)?;
-            // 生成即建缩略图：画廊首屏只传缩略图，避免每页几十 MB 的原图 base64
-            image_store::ensure_thumb(std::path::Path::new(&path));
+            // B4：单张失败只记录明细，不丢掉已成功的其它图片
             let seed_val = Some(input.seed.map(|s| s as i64).unwrap_or_else(rand::random));
-            let id = storage::add_history(&storage::HistoryRow {
-                id: 0,
-                prompt: full_prompt.clone(),
-                negative_prompt: input.negative_prompt.clone().unwrap_or_default(),
-                model: input.model.clone(),
-                provider_name: row.name.clone(),
-                seed: seed_val,
-                width: width as i64,
-                height: height as i64,
-                guidance: input.guidance.unwrap_or(0.0) as f64,
-                steps: input.steps.unwrap_or(0) as i64,
-                style: input.style.clone(),
-                file_path: path.clone(),
-                favorite: false,
-                created_at: now.clone(),
-                parent_id: None,
-                op: "generate".into(),
-            })?;
-            out.push(GeneratedImage {
-                history_id: id,
-                data_url,
-                file_path: path,
-                prompt: full_prompt.clone(),
-                model: input.model.clone(),
-                seed: seed_val,
-            });
-            on_progress(out.len(), total);
+            let persisted = (|| -> Result<(String, String, i64), String> {
+                let name = image_store::unique_name("", &now, i);
+                let (path, data_url) =
+                    image_store::save_b64_image(app, b64, &name).map_err(|e| e.to_string())?;
+                let id = storage::add_history(&storage::HistoryRow {
+                    id: 0,
+                    prompt: full_prompt.clone(),
+                    negative_prompt: input.negative_prompt.clone().unwrap_or_default(),
+                    model: input.model.clone(),
+                    provider_name: row.name.clone(),
+                    seed: seed_val,
+                    width: width as i64,
+                    height: height as i64,
+                    guidance: input.guidance.unwrap_or(0.0) as f64,
+                    steps: input.steps.unwrap_or(0) as i64,
+                    style: input.style.clone(),
+                    file_path: path.clone(),
+                    favorite: false,
+                    created_at: now.clone(),
+                    parent_id: None,
+                    op: "generate".into(),
+                })
+                .map_err(|e| e.to_string())?;
+                Ok((path, data_url, id))
+            })();
+            match persisted {
+                Ok((path, data_url, id)) => {
+                    // 生成即建缩略图：画廊首屏只传缩略图，避免每页几十 MB 的原图 base64
+                    ensure_thumb_async(path.clone()).await;
+                    out.push(GeneratedImage {
+                        history_id: id,
+                        data_url,
+                        file_path: path,
+                        prompt: full_prompt.clone(),
+                        model: input.model.clone(),
+                        seed: seed_val,
+                    });
+                    on_progress(out.len(), total);
+                }
+                Err(reason) => {
+                    tracing::warn!("第 {} 张图片保存失败: {reason}", i + 1);
+                    failed.push(FailedImage {
+                        index: i + 1,
+                        reason,
+                    });
+                }
+            }
         }
     } else if !cancelled {
         // 未取消却没有图片：只可能是所有 Key 均鉴权失败或重试耗尽
@@ -427,8 +477,18 @@ where
             last_err.expect("无图片且未取消必有错误"),
         ));
     }
+    // 全部失败时按错误返回，避免前端看到“成功但 0 张”的误导状态
+    if out.is_empty() && !cancelled && !failed.is_empty() {
+        let reason = failed
+            .iter()
+            .map(|f| format!("第 {} 张：{}", f.index, f.reason))
+            .collect::<Vec<_>>()
+            .join("；");
+        return Err(format!("图片保存失败：{reason}"));
+    }
     Ok(GenerateOutcome {
         images: out,
+        failed,
         cancelled,
     })
 }
@@ -490,7 +550,7 @@ async fn run_edit(provider_id: i64, req: &EditRequest) -> Result<String, String>
                 key_pool::note_auth_failure(provider_id, candidate.index, &e);
                 last_err = Some(e);
             }
-            Err(e) => return Err(adapters::adapter_error_json(e)),
+            Err(e) => return Err(adapters::adapter_error_json(timeout_billing_hint(e))),
         }
     }
     b64.ok_or_else(|| adapters::adapter_error_json(last_err.expect("候选列表非空时必有结果或错误")))
@@ -537,7 +597,7 @@ pub async fn edit_image(
     // 统一命名：edit_ 前缀 + 纳秒 + 随机尾（旧版只到毫秒，同毫秒多张编辑会互相覆盖）
     let name = image_store::unique_name("edit_", &now, 0);
     let (path, data_url) = image_store::save_b64_image(&app, &b64, &name)?;
-    image_store::ensure_thumb(std::path::Path::new(&path));
+    ensure_thumb_async(path.clone()).await;
     let id = storage::add_history(&storage::HistoryRow {
         id: 0,
         prompt: input.prompt.clone(),
@@ -589,7 +649,7 @@ fn decoded_size(b64: &str) -> (u32, u32) {
     let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(raw) else {
         return (0, 0);
     };
-    match image::load_from_memory(&bytes) {
+    match image_store::decode_limited(&bytes) {
         Ok(img) => (img.width(), img.height()),
         Err(_) => (0, 0),
     }
@@ -638,7 +698,7 @@ pub async fn transform_image(
                 key_pool::note_auth_failure(input.provider_id, candidate.index, &e);
                 last_err = Some(e);
             }
-            Err(e) => return Err(adapters::adapter_error_json(e)),
+            Err(e) => return Err(adapters::adapter_error_json(timeout_billing_hint(e))),
         }
     }
     let b64 = b64.ok_or_else(|| {
@@ -653,7 +713,7 @@ pub async fn transform_image(
     let prefix = if op == "style" { "style_" } else { "up_" };
     let name = image_store::unique_name(prefix, &now, 0);
     let (path, data_url) = image_store::save_b64_image(&app, &b64, &name)?;
-    image_store::ensure_thumb(std::path::Path::new(&path));
+    ensure_thumb_async(path.clone()).await;
     let (width, height) = decoded_size(&b64);
     let prompt = if op == "style" {
         style.clone()
@@ -721,7 +781,7 @@ pub async fn apply_edit(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(raw)
         .map_err(|e| format!("图片 base64 解码失败: {e}"))?;
-    let img = image::load_from_memory(&bytes).map_err(|e| format!("图片解码失败: {e}"))?;
+    let img = image_store::decode_limited(&bytes).map_err(|e| format!("图片解码失败: {e}"))?;
     let out = crate::basic_edit::apply_ops(img, &input.ops)?;
     let (width, height) = (out.width(), out.height());
     let mut cursor = std::io::Cursor::new(Vec::new());
@@ -739,7 +799,7 @@ pub async fn apply_edit(
     let now = storage::timestamp_millis();
     let name = image_store::unique_name("edit_", &now, 0);
     let (path, data_url) = image_store::save_b64_image(&app, &b64, &name)?;
-    image_store::ensure_thumb(std::path::Path::new(&path));
+    ensure_thumb_async(path.clone()).await;
     let prompt = parent
         .as_ref()
         .map(|p| p.prompt.clone())
@@ -835,13 +895,14 @@ pub async fn replace_background(
     let base_bytes = base64::engine::general_purpose::STANDARD
         .decode(&base_raw)
         .map_err(|e| format!("图片 base64 解码失败: {e}"))?;
-    let base = image::load_from_memory(&base_bytes).map_err(|e| format!("图片解码失败: {e}"))?;
+    let base =
+        image_store::decode_limited(&base_bytes).map_err(|e| format!("图片解码失败: {e}"))?;
     let mask_raw = image_store::strip_data_url(&input.mask_b64);
     let mask_bytes = base64::engine::general_purpose::STANDARD
         .decode(&mask_raw)
         .map_err(|e| format!("蒙版 base64 解码失败: {e}"))?;
     let mask_img =
-        image::load_from_memory(&mask_bytes).map_err(|e| format!("蒙版解码失败: {e}"))?;
+        image_store::decode_limited(&mask_bytes).map_err(|e| format!("蒙版解码失败: {e}"))?;
     // 本地合成用「白 = 替换」口径；AI 路径沿用 inpainting 的透明孔口径
     let mask = mask_img.to_luma8();
     let painted = if input.kind == "ai" {
@@ -927,7 +988,7 @@ pub async fn replace_background(
     let now = storage::timestamp_millis();
     let name = image_store::unique_name("bg_", &now, 0);
     let (path, data_url) = image_store::save_b64_image(&app, &b64, &name)?;
-    image_store::ensure_thumb(std::path::Path::new(&path));
+    ensure_thumb_async(path.clone()).await;
     let (width, height) = decoded_size(&b64);
     let id = storage::add_history(&storage::HistoryRow {
         id: 0,
@@ -991,36 +1052,39 @@ pub async fn save_chat_image(
     Ok(serde_json::json!({ "path": path }))
 }
 
-/// 画廊列表：只返回缩略图 data URL（缺失时回退原图，覆盖 SVG / 回填未完成）。
-/// 读路径不生成缩略图（避免列表请求触发批量写盘），缩略图由生成/编辑时创建，
-/// 存量数据由启动时的后台回填补齐。
+/// 画廊列表：只返回缩略图 data URL（缺失时为空串，前端显示占位）。
+/// 不回退原图：原图是几 MB 的 base64，回退会把列表响应撑爆。
+/// 读盘 + base64 编码是 CPU/IO 操作，整段放阻塞线程。
 #[tauri::command]
 pub async fn list_history(
     limit: Option<i64>,
     offset: Option<i64>,
+    before_id: Option<i64>,
     model: Option<String>,
     style: Option<String>,
     favorite_only: Option<bool>,
 ) -> Result<serde_json::Value, String> {
-    let rows = storage::list_history(
-        limit.unwrap_or(200),
-        offset.unwrap_or(0),
-        &model.unwrap_or_default(),
-        &style.unwrap_or_default(),
-        favorite_only.unwrap_or(false),
-    )?;
-    let mut items = Vec::new();
-    for r in rows {
-        let thumb = image_store::thumb_path_for(std::path::Path::new(&r.file_path));
-        let thumb_url = image_store::path_to_data_url(&thumb.to_string_lossy())
-            .or_else(|| image_store::path_to_data_url(&r.file_path))
-            .unwrap_or_default();
-        items.push(serde_json::json!({
-            "history": r,
-            "thumbUrl": thumb_url,
-        }));
-    }
-    Ok(serde_json::json!({ "items": items }))
+    let limit = limit.unwrap_or(200);
+    let offset = offset.unwrap_or(0);
+    let model = model.unwrap_or_default();
+    let style = style.unwrap_or_default();
+    let favorite_only = favorite_only.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        let rows = storage::list_history(limit, offset, before_id, &model, &style, favorite_only)
+            .map_err(|e| e.to_string())?;
+        let items: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|r| {
+                let thumb = image_store::thumb_path_for(std::path::Path::new(&r.file_path));
+                let thumb_url =
+                    image_store::path_to_data_url(&thumb.to_string_lossy()).unwrap_or_default();
+                serde_json::json!({ "history": r, "thumbUrl": thumb_url })
+            })
+            .collect();
+        Ok(serde_json::json!({ "items": items }))
+    })
+    .await
+    .map_err(|e| format!("读取画廊失败: {e}"))?
 }
 
 /// 画布粘贴：把剪贴板图片落盘并作为一条无提示词的画廊记录入库，
@@ -1035,13 +1099,13 @@ pub async fn import_image(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(image_store::strip_data_url(&data_url))
         .map_err(|e| format!("图片 base64 解码失败: {e}"))?;
-    let (width, height) = image::load_from_memory(&bytes)
+    let (width, height) = image_store::decode_limited(&bytes)
         .map_err(|e| format!("图片解码失败: {e}"))?
         .dimensions();
     let now = storage::timestamp_millis();
     let name = image_store::unique_name("paste_", &now, 0);
     let (path, data_url) = image_store::save_b64_image(&app, &data_url, &name)?;
-    image_store::ensure_thumb(std::path::Path::new(&path));
+    ensure_thumb_async(path.clone()).await;
     let id = storage::add_history(&storage::HistoryRow {
         id: 0,
         prompt: String::new(),
@@ -1121,9 +1185,9 @@ pub async fn delete_history(id: i64) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// RA-04：仅 Network/Timeout 可重试，配额/鉴权/内容拦截/其他一律不重试
+    /// A6：只有 Network（连接未建立）可重试；Timeout 可能已计费，配额/鉴权/内容拦截/其他一律不重试
     #[test]
-    fn retry_whitelist_only_network_or_timeout() {
+    fn retry_whitelist_only_network() {
         let cases = [
             (
                 AdapterError::Network {
@@ -1135,11 +1199,12 @@ mod tests {
                 AdapterError::Timeout {
                     message: "x".into(),
                 },
-                true,
+                false,
             ),
             (
                 AdapterError::QuotaExceeded {
                     message: "x".into(),
+                    retry_after: None,
                 },
                 false,
             ),
@@ -1171,6 +1236,19 @@ mod tests {
                 err.message()
             );
         }
+    }
+
+    /// A6：超时错误必须带上「可能已计费」提示，其他错误原样返回
+    #[test]
+    fn timeout_error_carries_billing_hint() {
+        let err = timeout_billing_hint(AdapterError::Timeout {
+            message: "x".into(),
+        });
+        assert!(err.message().contains("可能已在上游生成并计费"));
+        let other = timeout_billing_hint(AdapterError::Other {
+            message: "y".into(),
+        });
+        assert_eq!(other.message(), "y");
     }
 
     /// RA-06：注册 → 取消置位 → 未知 jobId 取消幂等 → 守卫结束时清理 token

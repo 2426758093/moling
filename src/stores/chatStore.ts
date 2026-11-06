@@ -165,6 +165,8 @@ let sendSeq = 0;
 let convSeq = 0;
 // 当前在途生成任务 id：stop() 用它请求后端取消（同一时刻只有一路生成）
 let activeJobId: string | null = null;
+// 一张图都没生成就取消时，仍落一条可读的助手消息，避免提问在历史里凭空消失
+const CANCELED_MESSAGE = "（已取消生成）";
 
 /// 在途生成的快照：切换会话会重建 messages 列表，切回原会话时靠它把
 /// 占位气泡与后续进度/结果接回去（DB 里此时还没有这条 assistant 消息）。
@@ -200,6 +202,8 @@ export const useChatStore = create<ChatState>((set, get) => {
       if (myGeneration && activeGeneration === myGeneration) {
         myGeneration.message = { ...myGeneration.message, ...patch };
       }
+      // 已切到别的会话：只更新快照，绝不能按同样的本地 id 改到当前会话的消息
+      if (get().activeId !== convId) return;
       set({
         messages: get().messages.map((m) =>
           m.id === assistantLocalId ? { ...m, ...patch } : m,
@@ -250,7 +254,12 @@ export const useChatStore = create<ChatState>((set, get) => {
     const execute = async (): Promise<void> => {
       // 停止发生在附件落盘/用户消息入库阶段：不再发起生成，占位直接收尾
       if (get().stopRequested) {
-        updateAssistant({ status: "stopped", pendingImages: 0 });
+        updateAssistant({
+          status: "stopped",
+          pendingImages: 0,
+          content: CANCELED_MESSAGE,
+        });
+        await persistAssistant([], false);
         finalize();
         return;
       }
@@ -318,7 +327,12 @@ export const useChatStore = create<ChatState>((set, get) => {
       //    每次生成分配 jobId，stop() 用它调用后端 cancel_generation 中断在途请求。
       if (!isCurrent()) return;
       if (get().stopRequested) {
-        updateAssistant({ status: "stopped", pendingImages: 0 });
+        updateAssistant({
+          status: "stopped",
+          pendingImages: 0,
+          content: CANCELED_MESSAGE,
+        });
+        await persistAssistant([], false);
         finalize();
         return;
       }
@@ -399,8 +413,14 @@ export const useChatStore = create<ChatState>((set, get) => {
 
       // 3. 停止/取消语义：已生成的图片保留并照常持久化，assistant 消息标记 stopped
       if (cancelled || get().stopRequested) {
-        updateAssistant({ status: "stopped", error: null, pendingImages: 0 });
-        if (images.length > 0) await persistAssistant(images, false);
+        updateAssistant({
+          status: "stopped",
+          error: null,
+          pendingImages: 0,
+          // 一张都没生成时也落一条消息，否则这条提问在历史里没有任何回复痕迹
+          ...(images.length === 0 ? { content: CANCELED_MESSAGE } : undefined),
+        });
+        await persistAssistant(images, false);
         finalize();
         return;
       }
@@ -820,6 +840,14 @@ export const useChatStore = create<ChatState>((set, get) => {
       const lastUser = msgs[userIdx];
       const convId = get().activeId;
       if (convId === null) return;
+      // 会话可能已在别处被删除：先确认仍存在，再删旧消息，避免删到孤儿数据后卡住
+      if (
+        get().conversationsLoaded &&
+        !get().conversations.some((c) => c.id === convId)
+      ) {
+        toast("会话不存在或已被删除，无法重试", "error");
+        return;
+      }
 
       // 重试不重复 user 气泡：移除目标 assistant 回复，随后重建一条占位。
       const assistantAfter = target;

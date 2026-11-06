@@ -121,6 +121,54 @@ export function snapSize(
   return { width: snap(width), height: snap(height) };
 }
 
+export const DEFAULT_PREFS: GenPrefs = {
+  ratio: "1:1",
+  width: BASE,
+  height: BASE,
+  style: "",
+  count: 1,
+  quality: "auto",
+  negativePrompt: "",
+};
+
+/// 从磁盘/导入的 JSON 恢复生成参数：逐字段校验，非法值直接丢弃，
+/// 由调用方用当前值兜底，避免坏数据把界面推进非法状态。
+export function sanitizePrefs(raw: unknown): Partial<GenPrefs> {
+  if (!raw || typeof raw !== "object") return {};
+  const src = raw as Record<string, unknown>;
+  const out: Partial<GenPrefs> = {};
+  const size = (v: unknown): number | undefined => {
+    if (typeof v !== "number" || !Number.isFinite(v) || v < 0) return undefined;
+    // 0 = 自动尺寸；其余按 8 对齐并限制在 512–4096
+    if (v === 0) return 0;
+    return Math.min(SIZE_MAX, Math.max(SIZE_MIN, Math.round(v / 8) * 8));
+  };
+  if (typeof src.ratio === "string" && src.ratio.length > 0) {
+    out.ratio = src.ratio;
+  }
+  const width = size(src.width);
+  if (width !== undefined) out.width = width;
+  const height = size(src.height);
+  if (height !== undefined) out.height = height;
+  if (typeof src.style === "string") out.style = src.style;
+  if (typeof src.count === "number" && Number.isFinite(src.count)) {
+    out.count = Math.min(4, Math.max(1, Math.round(src.count)));
+  }
+  const quality = src.quality;
+  if (
+    quality === "auto" ||
+    quality === "low" ||
+    quality === "medium" ||
+    quality === "high"
+  ) {
+    out.quality = quality;
+  }
+  if (typeof src.negativePrompt === "string") {
+    out.negativePrompt = src.negativePrompt;
+  }
+  return out;
+}
+
 export const useAppStore = create<AppState>((set) => ({
   view: "chat",
   theme: "system",
@@ -130,15 +178,7 @@ export const useAppStore = create<AppState>((set) => ({
   sidebarCollapsed: false,
   paletteOpen: false,
   shortcutsOpen: false,
-  prefs: {
-    ratio: "1:1",
-    width: BASE,
-    height: BASE,
-    style: "",
-    count: 1,
-    quality: "auto",
-    negativePrompt: "",
-  },
+  prefs: { ...DEFAULT_PREFS },
   editTarget: null,
   outpaintTarget: null,
   transformTarget: null,

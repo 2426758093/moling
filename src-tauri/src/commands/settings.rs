@@ -17,6 +17,7 @@ const ALLOWED_SETTING_KEYS: &[&str] = &[
     "glassAppearance",
     "uiMode",
     "queueConcurrency",
+    "queueProviderConcurrency",
     "cacheRetentionDays",
 ];
 
@@ -50,6 +51,16 @@ fn check_setting_value(key: &str, value: &str) -> Result<(), String> {
             ) =>
         {
             Err(format!("队列并发数取值非法: {value}"))
+        }
+        "queueProviderConcurrency"
+            if !matches!(
+                value.trim().parse::<i64>(),
+                Ok(n) if (crate::commands::queue::MIN_PROVIDER_CONCURRENCY
+                    ..=crate::commands::queue::MAX_PROVIDER_CONCURRENCY)
+                    .contains(&n)
+            ) =>
+        {
+            Err(format!("每服务商并发数取值非法: {value}"))
         }
         "cacheRetentionDays"
             if !matches!(
@@ -146,6 +157,7 @@ mod tests {
         assert!(check_setting_key("theme").is_ok());
         assert!(check_setting_key("glassAppearance").is_ok());
         assert!(check_setting_key("queueConcurrency").is_ok());
+        assert!(check_setting_key("queueProviderConcurrency").is_ok());
         assert!(check_setting_key("cacheRetentionDays").is_ok());
         assert!(check_setting_key("extraParams:1").is_err());
         assert!(check_setting_key("任意 key").is_err());
@@ -183,6 +195,23 @@ mod tests {
         }
         assert!(check_setting_value("glassAppearance", "blurred").is_err());
         assert!(check_setting_value("glassAppearance", "").is_err());
+    }
+
+    /// 每服务商并发数只接受 1–2 的整数字符串
+    #[test]
+    fn queue_provider_concurrency_value_validation() {
+        for ok in ["1", "2", " 2 "] {
+            assert!(
+                check_setting_value("queueProviderConcurrency", ok).is_ok(),
+                "{ok} 应被接受"
+            );
+        }
+        for bad in ["0", "3", "-1", "1.5", "", "two"] {
+            assert!(
+                check_setting_value("queueProviderConcurrency", bad).is_err(),
+                "{bad} 应被拒绝"
+            );
+        }
     }
 
     /// 队列并发数只接受 1–4 的整数字符串

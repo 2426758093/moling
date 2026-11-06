@@ -61,7 +61,10 @@ where
         let Some(path) = fetch(id) else {
             continue;
         };
-        let thumb = image_store::thumb_path_for(Path::new(&path));
+        // 缩略图可能还没回填：先补生成，再编码；仍失败才回退原图
+        let source = Path::new(&path);
+        let _ = image_store::ensure_thumb(source);
+        let thumb = image_store::thumb_path_for(source);
         let Some(url) = encode(&thumb.to_string_lossy()).or_else(|| encode(&path)) else {
             continue;
         };
@@ -101,5 +104,28 @@ mod tests {
         assert_eq!(out[0]["thumbUrl"], "thumb-one");
         assert_eq!(out[1]["historyId"], 4);
         assert_eq!(out[1]["thumbUrl"], "orig-four");
+    }
+
+    /// 缩略图缺失时批量读取会先补生成，而不是直接回退原图
+    #[test]
+    fn thumbs_payload_generates_missing_thumbnail() {
+        let dir = std::env::temp_dir().join(format!("moling_canvas_thumb_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("big.png");
+        image::RgbImage::from_pixel(1024, 512, image::Rgb([1, 2, 3]))
+            .save(&source)
+            .unwrap();
+
+        let out = thumbs_payload(
+            vec![7],
+            |_| Some(source.to_string_lossy().to_string()),
+            image_store::path_to_data_url,
+        );
+        assert_eq!(out.len(), 1);
+        let url = out[0]["thumbUrl"].as_str().unwrap();
+        assert!(url.starts_with("data:image/jpeg;base64,"), "{url}");
+        assert!(image_store::thumb_path_for(&source).exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

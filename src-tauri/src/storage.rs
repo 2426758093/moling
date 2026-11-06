@@ -357,6 +357,12 @@ const PROMPT_ASSETS_SQL: &str = "
             ON workflow_presets(updated_at DESC);
 ";
 
+/// 迁移 011：运行中任务心跳。长任务（多张参考图、慢服务商）可能超过回收阈值，
+/// 只按 started_at 回收会误伤；worker 每 60s 刷新 heartbeat_at。
+const JOBS_HEARTBEAT_SQL: &str = "
+        ALTER TABLE jobs ADD COLUMN heartbeat_at TEXT;
+";
+
 /// 迁移 010：画布工作区。只存 historyId 与布局，不存 dataUrl / base64；
 /// 画布引用本机 history，不参与配置备份。
 const CANVAS_SQL: &str = "
@@ -382,6 +388,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("008_jobs_input", JOBS_INPUT_SQL),
     ("009_prompt_assets", PROMPT_ASSETS_SQL),
     ("010_canvas", CANVAS_SQL),
+    ("011_jobs_heartbeat", JOBS_HEARTBEAT_SQL),
 ];
 
 /// 当前 schema 版本 = 迁移条数
@@ -400,6 +407,9 @@ pub fn init(app_data_dir: PathBuf) -> AppResult<()> {
 /// 打不开新 schema 了，留一份可回退的副本比事后补救便宜。
 pub(crate) fn open_and_migrate(db_path: &std::path::Path) -> AppResult<Connection> {
     let mut conn = Connection::open(db_path)?;
+    // WAL 下并发写会短暂 SQLITE_BUSY：等 5s 而不是立刻失败；外键约束必须显式打开
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
     let version = current_version(&conn)?;
     // 全新的空库（还没有 providers 表）没有数据可备份，跳过以免产生噪声文件
     if version < SCHEMA_VERSION && !table_missing(&conn, "providers") {
@@ -676,115 +686,158 @@ fn row_to_provider(row: &rusqlite::Row) -> rusqlite::Result<ProviderRow> {
     })
 }
 
-pub fn save_provider(id: Option<i64>, draft: &ProviderDraft) -> AppResult<ProviderRow> {
-    // 加解密是慢操作（首次读 keyring 可达数百毫秒），必须在拿 DB 锁之前算好（F-013），
-    // 否则一次「保存服务商」会把整个 UI 的读写都堵在同一个 Mutex 后面。
-    let empty_enc = encrypt_secret("")?;
-    // 换 Key 时需要旧密文才能保留整组列表：短锁只读，解密同样放到锁外。
-    let existing_keys = match (id, draft.api_key.is_some()) {
-        (Some(existing), true) => {
-            let c = conn()?;
-            c.query_row(
-                "SELECT api_keys_enc, api_key_enc FROM providers WHERE id = ?1",
-                params![existing],
-                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
-            )
-            .optional()?
-        }
-        _ => None,
-    };
-    // 主密钥变化后旧密文解不开：按用户新填的 Key 重建列表，而不是让保存失败
-    let rebuilt_keys = match draft.api_key {
-        Some(new_key) => {
-            let mut keys = match existing_keys {
-                Some((keys_enc, legacy_enc)) => {
-                    decode_keys(&keys_enc, &legacy_enc).unwrap_or_else(|e| {
-                        tracing::warn!("保存服务商时旧 Key 解密失败，按新 Key 重建列表: {e}");
-                        Vec::new()
-                    })
-                }
-                None => Vec::new(),
-            };
-            if keys.is_empty() {
-                keys.push(ProviderKey::new(new_key));
-            } else {
-                keys[0] = ProviderKey::new(new_key);
-            }
-            Some(encode_keys(&keys)?)
-        }
-        None => None,
-    };
+/// 服务商请求超时的合法区间（秒）：过小会截断正常出图，过大则像卡死
+pub const MIN_PROVIDER_TIMEOUT_SECS: u64 = 5;
+pub const MAX_PROVIDER_TIMEOUT_SECS: u64 = 600;
 
-    let id = {
-        // 元数据与 Key 列表同事务写入：避免「编辑资料 + 换主 Key」中途失败留下两列不一致
-        let mut c = conn()?;
-        let tx = c.transaction()?;
-        let id = match id {
+/// 超时越界值静默夹到合法区间，避免 0s 必超时 / 10 万秒像卡死
+pub fn clamp_provider_timeout(secs: u64) -> u64 {
+    secs.clamp(MIN_PROVIDER_TIMEOUT_SECS, MAX_PROVIDER_TIMEOUT_SECS)
+}
+
+/// 保存服务商：读-改-写走两阶段 CAS（D1）。
+///
+/// 加解密是慢操作（首次读 keyring 可达数百毫秒），必须在拿 DB 锁之前算好（F-013）。
+/// 先短锁读取 Key 密文 → 锁外解密重建 → `BEGIN IMMEDIATE` 内重读比对；
+/// 期间被其它保存改过就重试，避免把并发写入的 Key 列表覆盖掉。
+pub fn save_provider(id: Option<i64>, draft: &ProviderDraft) -> AppResult<ProviderRow> {
+    const MAX_CAS_ATTEMPTS: usize = 3;
+    let empty_enc = encrypt_secret("")?;
+    // D10：超时只接受 5–600 秒，越界值静默夹住，避免 0s 必超时 / 10 万秒像卡死
+    let timeout_secs = clamp_provider_timeout(draft.timeout_secs);
+    for attempt in 1..=MAX_CAS_ATTEMPTS {
+        // 短锁只读：换 Key 时需要旧密文才能保留整组列表，解密放到锁外
+        let observed = match id {
             Some(existing) => {
-                let n = tx.execute(
-                    "UPDATE providers SET name=?1, base_url=?2, kind=?3, models_json=?4,
+                let c = conn()?;
+                c.query_row(
+                    "SELECT api_keys_enc, api_key_enc FROM providers WHERE id = ?1",
+                    params![existing],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()?
+            }
+            None => None,
+        };
+        // 主密钥变化后旧密文解不开：按用户新填的 Key 重建列表，而不是让保存失败
+        let rebuilt_keys = match draft.api_key {
+            Some(new_key) => {
+                let mut keys = match &observed {
+                    Some((keys_enc, legacy_enc)) => decode_keys(keys_enc, legacy_enc)
+                        .unwrap_or_else(|e| {
+                            tracing::warn!("保存服务商时旧 Key 解密失败，按新 Key 重建列表: {e}");
+                            Vec::new()
+                        }),
+                    None => Vec::new(),
+                };
+                if keys.is_empty() {
+                    keys.push(ProviderKey::new(new_key));
+                } else {
+                    keys[0] = ProviderKey::new(new_key);
+                }
+                Some(encode_keys(&keys)?)
+            }
+            None => None,
+        };
+
+        // 元数据与 Key 列表同事务写入：避免「编辑资料 + 换主 Key」中途失败留下两列不一致。
+        // 事务必须放在独立作用域里：ConnGuard 未释放时再调用 get_provider 会自锁。
+        let saved_id = {
+            let mut c = conn()?;
+            // IMMEDIATE：读后升级写不会触发 SQLITE_BUSY_SNAPSHOT
+            let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if draft.api_key.is_some() {
+                if let Some(existing) = id {
+                    let current = tx
+                        .query_row(
+                            "SELECT api_keys_enc, api_key_enc FROM providers WHERE id = ?1",
+                            params![existing],
+                            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+                        )
+                        .optional()?;
+                    if current != observed {
+                        drop(tx);
+                        if attempt < MAX_CAS_ATTEMPTS {
+                            tracing::debug!(
+                                "服务商 #{existing} 保存期间 Key 被修改，重试第 {attempt} 次"
+                            );
+                            continue;
+                        }
+                        return Err(AppError::Other(
+                            "服务商 Key 在保存期间被其它操作修改，请重试".into(),
+                        ));
+                    }
+                }
+            }
+            let id = match id {
+                Some(existing) => {
+                    let n = tx.execute(
+                        "UPDATE providers SET name=?1, base_url=?2, kind=?3, models_json=?4,
                      default_model=?5, timeout_secs=?6, template_url=?7, template_body=?8,
                      template_response_path=?9, edit_template_json=?10,
                      transform_template_json=?11 WHERE id=?12",
-                    params![
-                        draft.name,
-                        draft.base_url,
-                        draft.kind,
-                        draft.models_json,
-                        draft.default_model,
-                        draft.timeout_secs as i64,
-                        draft.template_url,
-                        draft.template_body,
-                        draft.template_response_path,
-                        draft.edit_template_json,
-                        draft.transform_template_json,
-                        existing
-                    ],
-                )?;
-                if n == 0 {
-                    return Err(AppError::NotFound(format!("服务商 #{existing} 不存在")));
+                        params![
+                            draft.name,
+                            draft.base_url,
+                            draft.kind,
+                            draft.models_json,
+                            draft.default_model,
+                            timeout_secs as i64,
+                            draft.template_url,
+                            draft.template_body,
+                            draft.template_response_path,
+                            draft.edit_template_json,
+                            draft.transform_template_json,
+                            existing
+                        ],
+                    )?;
+                    if n == 0 {
+                        return Err(AppError::NotFound(format!("服务商 #{existing} 不存在")));
+                    }
+                    existing
                 }
-                existing
-            }
-            None => {
-                // Key 统一由下面的 replace_first 逻辑写两列，这里先落空密文
-                tx.execute(
-                    "INSERT INTO providers (name, base_url, api_key_enc, kind, models_json,
+                None => {
+                    // Key 统一由下面的 replace_first 逻辑写两列，这里先落空密文
+                    tx.execute(
+                        "INSERT INTO providers (name, base_url, api_key_enc, kind, models_json,
                      default_model, timeout_secs, template_url, template_body, template_response_path,
                      edit_template_json, transform_template_json)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
-                    params![
-                        draft.name,
-                        draft.base_url,
-                        empty_enc,
-                        draft.kind,
-                        draft.models_json,
-                        draft.default_model,
-                        draft.timeout_secs as i64,
-                        draft.template_url,
-                        draft.template_body,
-                        draft.template_response_path,
-                        draft.edit_template_json,
-                        draft.transform_template_json
-                    ],
+                        params![
+                            draft.name,
+                            draft.base_url,
+                            empty_enc,
+                            draft.kind,
+                            draft.models_json,
+                            draft.default_model,
+                            timeout_secs as i64,
+                            draft.template_url,
+                            draft.template_body,
+                            draft.template_response_path,
+                            draft.edit_template_json,
+                            draft.transform_template_json
+                        ],
+                    )?;
+                    tx.last_insert_rowid()
+                }
+            };
+            // 未填新 Key 时保持整组 Key 与密文原样，避免解密失败的旧数据在纯改资料时被清空
+            if let Some((keys_enc, first_enc)) = &rebuilt_keys {
+                let n = tx.execute(
+                    "UPDATE providers SET api_keys_enc = ?1, api_key_enc = ?2 WHERE id = ?3",
+                    params![keys_enc, first_enc, id],
                 )?;
-                tx.last_insert_rowid()
+                if n == 0 {
+                    return Err(AppError::NotFound(format!("服务商 #{id} 不存在")));
+                }
             }
+            tx.commit()?;
+            id
         };
-        // 未填新 Key 时保持整组 Key 与密文原样，避免解密失败的旧数据在纯改资料时被清空
-        if let Some((keys_enc, first_enc)) = &rebuilt_keys {
-            let n = tx.execute(
-                "UPDATE providers SET api_keys_enc = ?1, api_key_enc = ?2 WHERE id = ?3",
-                params![keys_enc, first_enc, id],
-            )?;
-            if n == 0 {
-                return Err(AppError::NotFound(format!("服务商 #{id} 不存在")));
-            }
-        }
-        tx.commit()?;
-        id
-    };
-    get_provider(id)?.ok_or_else(|| AppError::NotFound("provider not found after save".into()))
+        return get_provider(saved_id)?
+            .ok_or_else(|| AppError::NotFound("provider not found after save".into()));
+    }
+    unreachable!("CAS 循环至少返回一次")
 }
 
 pub fn get_provider(id: i64) -> AppResult<Option<ProviderRow>> {
@@ -839,6 +892,25 @@ fn save_model_caps_in(
          DO UPDATE SET caps_json = excluded.caps_json, updated_at = excluded.updated_at",
         params![provider_id, model, caps_json, timestamp_millis()],
     )?;
+    Ok(())
+}
+
+/// 批量写入模型能力：单事务提交，避免弹窗保存时出现「存了一半」的半成功状态。
+pub fn save_model_caps_batch(provider_id: i64, entries: &[(String, String)]) -> AppResult<()> {
+    let mut guard = conn()?;
+    save_model_caps_batch_in(&mut guard, provider_id, entries)
+}
+
+fn save_model_caps_batch_in(
+    c: &mut Connection,
+    provider_id: i64,
+    entries: &[(String, String)],
+) -> AppResult<()> {
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    for (model, caps_json) in entries {
+        save_model_caps_in(&tx, provider_id, model, caps_json)?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1043,6 +1115,7 @@ pub const BACKUP_SETTING_KEYS: &[&str] = &[
     "glassAppearance",
     "uiMode",
     "queueConcurrency",
+    "queueProviderConcurrency",
     "cacheRetentionDays",
 ];
 
@@ -1082,6 +1155,7 @@ const IMPORT_SETTINGS_V2: &[&str] = &[
     "glassAppearance",
     "uiMode",
     "queueConcurrency",
+    "queueProviderConcurrency",
     "cacheRetentionDays",
 ];
 
@@ -1138,6 +1212,19 @@ fn validate_import_settings(
             });
         if !ok {
             return Err(invalid_import("导入文件中的队列并发数取值非法"));
+        }
+    }
+    if let Some(concurrency) = settings.get("queueProviderConcurrency") {
+        let ok = concurrency
+            .as_str()
+            .and_then(|v| v.trim().parse::<i64>().ok())
+            .is_some_and(|n| {
+                (crate::commands::queue::MIN_PROVIDER_CONCURRENCY
+                    ..=crate::commands::queue::MAX_PROVIDER_CONCURRENCY)
+                    .contains(&n)
+            });
+        if !ok {
+            return Err(invalid_import("导入文件中的每服务商并发数取值非法"));
         }
     }
     if let Some(days) = settings.get("cacheRetentionDays") {
@@ -1886,18 +1973,28 @@ pub fn add_history(h: &HistoryRow) -> AppResult<i64> {
 pub fn list_history(
     limit: i64,
     offset: i64,
+    before_id: Option<i64>,
     model_filter: &str,
     style_filter: &str,
     favorite_only: bool,
 ) -> AppResult<Vec<HistoryRow>> {
     let c = conn()?;
-    list_history_in(&c, limit, offset, model_filter, style_filter, favorite_only)
+    list_history_in(
+        &c,
+        limit,
+        offset,
+        before_id,
+        model_filter,
+        style_filter,
+        favorite_only,
+    )
 }
 
 pub(crate) fn list_history_in(
     c: &Connection,
     limit: i64,
     offset: i64,
+    before_id: Option<i64>,
     model_filter: &str,
     style_filter: &str,
     favorite_only: bool,
@@ -1906,7 +2003,11 @@ pub(crate) fn list_history_in(
     // 直接绑定调用方传来的值等于把「一次拉全库」的能力暴露给 IPC。
     let limit = limit.clamp(1, 200);
     let offset = offset.max(0);
+    let before_id = before_id.filter(|id| *id > 0);
     let mut conditions = Vec::new();
+    if before_id.is_some() {
+        conditions.push("id < ?");
+    }
     if !model_filter.is_empty() {
         conditions.push("model = ?");
     }
@@ -1928,6 +2029,9 @@ pub(crate) fn list_history_in(
     );
     let mut stmt = c.prepare(&sql)?;
     let mut values: Vec<&dyn rusqlite::ToSql> = Vec::new();
+    if let Some(before_id) = before_id.as_ref() {
+        values.push(before_id);
+    }
     if !model_filter.is_empty() {
         values.push(&model_filter);
     }
@@ -3012,23 +3116,25 @@ pub fn job_counts() -> AppResult<Vec<(String, i64)>> {
     rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
 }
 
-/// 原子领取下一个排队任务：queued → running。
-///
-/// 单条 UPDATE 完成「选最早一条 + 抢占 + 并发上限判断」，多个 worker 同时调用
-/// 也不会领到同一条；`limit` 是正在运行的上限（1–4），达到上限时返回 None。
-pub fn claim_next_job(limit: i64) -> AppResult<Option<JobRow>> {
+/// 领取任务：同时受全局并发与服务商并发约束（服务商图像端点并发能力普遍很低）。
+pub fn claim_next_job_limited(global_limit: i64, provider_limit: i64) -> AppResult<Option<JobRow>> {
     let c = conn()?;
-    claim_next_job_in(&c, limit)
+    claim_next_job_in(&c, global_limit, provider_limit)
 }
 
-fn claim_next_job_in(c: &Connection, limit: i64) -> AppResult<Option<JobRow>> {
+fn claim_next_job_in(c: &Connection, limit: i64, provider_limit: i64) -> AppResult<Option<JobRow>> {
+    let now = timestamp_millis();
     let id: Option<i64> = c
         .query_row(
-            "UPDATE jobs SET status = 'running', started_at = ?1
-             WHERE id = (SELECT id FROM jobs WHERE status = 'queued' ORDER BY id ASC LIMIT 1)
+            "UPDATE jobs SET status = 'running', started_at = ?1, heartbeat_at = ?1
+             WHERE id = (SELECT j.id FROM jobs j
+                         WHERE j.status = 'queued'
+                           AND (SELECT COUNT(*) FROM jobs r
+                                WHERE r.status = 'running' AND r.provider_id = j.provider_id) < ?3
+                         ORDER BY j.id ASC LIMIT 1)
                AND (SELECT COUNT(*) FROM jobs WHERE status = 'running') < ?2
              RETURNING id",
-            params![timestamp_millis(), limit.max(1)],
+            params![now, limit.max(1), provider_limit.max(1)],
             |r| r.get(0),
         )
         .optional()?;
@@ -3115,13 +3221,30 @@ pub fn reap_stale_running(max_age: std::time::Duration) -> AppResult<usize> {
 }
 
 fn reap_stale_running_in(c: &Connection, max_age: std::time::Duration) -> AppResult<usize> {
+    // 有心跳的任务按心跳判断，长任务不会因为 started_at 太老被误回收
     let affected = c.execute(
         "UPDATE jobs SET status = 'interrupted', finished_at = ?1,
          error = COALESCE(error, '任务长时间未收尾，已标记为中断')
-         WHERE status = 'running' AND started_at IS NOT NULL AND started_at < ?2",
+         WHERE status = 'running'
+           AND COALESCE(heartbeat_at, started_at) IS NOT NULL
+           AND COALESCE(heartbeat_at, started_at) < ?2",
         params![timestamp_millis(), timestamp_millis_ago(max_age)],
     )?;
     Ok(affected)
+}
+
+/// 运行中任务心跳：worker 每 60s 刷新，reaper 以它判断任务是否真的卡死
+pub fn touch_job_heartbeat(id: i64) -> AppResult<bool> {
+    let c = conn()?;
+    touch_job_heartbeat_in(&c, id, timestamp_millis())
+}
+
+fn touch_job_heartbeat_in(c: &Connection, id: i64, at: String) -> AppResult<bool> {
+    let affected = c.execute(
+        "UPDATE jobs SET heartbeat_at = ?2 WHERE id = ?1 AND status = 'running'",
+        params![id, at],
+    )?;
+    Ok(affected > 0)
 }
 
 /// queued → canceled（立即生效，worker 不会再来取）。
@@ -3147,11 +3270,34 @@ pub fn requeue_job(id: i64) -> AppResult<bool> {
 fn requeue_job_in(c: &Connection, id: i64) -> AppResult<bool> {
     let affected = c.execute(
         "UPDATE jobs SET status = 'queued', error = NULL, images_json = '[]',
-         started_at = NULL, finished_at = NULL
+         started_at = NULL, finished_at = NULL, heartbeat_at = NULL
          WHERE id = ?1 AND status IN ('failed', 'canceled', 'interrupted')",
         params![id],
     )?;
     Ok(affected > 0)
+}
+
+/// 429 退避重试：running 直接回到 queued，并写入更新后的扩展参数（重试次数）
+pub fn requeue_running_job(id: i64, input_json: &str) -> AppResult<bool> {
+    let c = conn()?;
+    let affected = c.execute(
+        "UPDATE jobs SET status = 'queued', error = NULL, images_json = '[]',
+         started_at = NULL, finished_at = NULL, heartbeat_at = NULL, input_json = ?2
+         WHERE id = ?1 AND status = 'running'",
+        params![id, input_json],
+    )?;
+    Ok(affected > 0)
+}
+
+/// 待执行任务数：入队前做上限判断，避免队列无限堆积
+pub fn queued_job_count() -> AppResult<i64> {
+    let c = conn()?;
+    let n: i64 = c.query_row(
+        "SELECT COUNT(*) FROM jobs WHERE status = 'queued'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(n)
 }
 
 /// 启动时把上次残留的 running 标为 interrupted：不自动重跑，避免重启即扣费。
@@ -3336,6 +3482,15 @@ mod tests {
             edit_template_json: "",
             transform_template_json: "",
         }
+    }
+
+    #[test]
+    fn provider_timeout_clamped_to_5_600() {
+        assert_eq!(clamp_provider_timeout(0), 5);
+        assert_eq!(clamp_provider_timeout(4), 5);
+        assert_eq!(clamp_provider_timeout(60), 60);
+        assert_eq!(clamp_provider_timeout(600), 600);
+        assert_eq!(clamp_provider_timeout(100_000), 600);
     }
 
     #[test]
@@ -3534,16 +3689,16 @@ mod tests {
             op: "generate".into(),
         })
         .unwrap();
-        let history = list_history(10, 0, "", "", false).unwrap();
+        let history = list_history(10, 0, None, "", "", false).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].id, hid);
         assert_eq!(history[0].seed, Some(7));
         set_favorite(hid, true).unwrap();
-        assert!(list_history(10, 0, "", "", false).unwrap()[0].favorite);
+        assert!(list_history(10, 0, None, "", "", false).unwrap()[0].favorite);
         let plan = delete_history(hid).unwrap();
         assert_eq!(plan.file_path.as_deref(), Some("/tmp/x.png"));
         assert!(!plan.still_referenced, "无消息引用时应允许回收文件");
-        assert!(list_history(10, 0, "", "", false).unwrap().is_empty());
+        assert!(list_history(10, 0, None, "", "", false).unwrap().is_empty());
 
         // 迁移 007：派生图血统 —— 父图 + 放大子图，list_derived 以根为单位返回同族
         let parent = add_history(&HistoryRow {
@@ -4544,6 +4699,25 @@ mod tests {
         assert_eq!(list_model_caps_in(&c, 8).unwrap().len(), 1);
     }
 
+    /// E11：批量能力保存一次写入全部模型，替代逐条调用
+    #[test]
+    fn model_caps_batch_writes_all_entries() {
+        let mut c = mem_conn();
+        let entries = vec![
+            ("flux-pro".to_string(), r#"{"negative":false}"#.to_string()),
+            ("dall-e-3".to_string(), r#"{"edit":false}"#.to_string()),
+        ];
+        save_model_caps_batch_in(&mut c, 9, &entries).unwrap();
+        let stored = list_model_caps_in(&c, 9).unwrap();
+        assert_eq!(stored.len(), 2);
+        assert!(stored.iter().any(|(m, _)| m == "flux-pro"));
+        assert!(stored.iter().any(|(m, _)| m == "dall-e-3"));
+        // 覆盖写仍走 upsert，不产生重复行
+        let again = vec![("flux-pro".to_string(), r#"{"edit":true}"#.to_string())];
+        save_model_caps_batch_in(&mut c, 9, &again).unwrap();
+        assert_eq!(list_model_caps_in(&c, 9).unwrap().len(), 2);
+    }
+
     /// C2：v3 的 Key 字段类型错误必须在事务与 DELETE 之前被拒绝
     #[test]
     fn import_v3_rejects_bad_keys_before_touching_data() {
@@ -4601,7 +4775,7 @@ mod tests {
         let running = insert_job_in(&c, &new_job("running")).unwrap();
         let queued = insert_job_in(&c, &new_job("queued")).unwrap();
         assert_eq!(
-            claim_next_job_in(&c, 1).unwrap().map(|j| j.id),
+            claim_next_job_in(&c, 1, i64::MAX).unwrap().map(|j| j.id),
             Some(running)
         );
         assert_eq!(mark_running_interrupted_in(&c).unwrap(), 1);
@@ -4623,9 +4797,12 @@ mod tests {
         let id = insert_job_in(&c, &new_job("job")).unwrap();
         // 未启动时不能直接 finish（只有 running 才能收尾）
         assert!(!finish_job_in(&c, id, "done", "[]", None).unwrap());
-        assert_eq!(claim_next_job_in(&c, 1).unwrap().map(|j| j.id), Some(id));
+        assert_eq!(
+            claim_next_job_in(&c, 1, i64::MAX).unwrap().map(|j| j.id),
+            Some(id)
+        );
         // 已被领取的任务不能二次领取（worker 竞争）
-        assert!(claim_next_job_in(&c, 1).unwrap().is_none());
+        assert!(claim_next_job_in(&c, 1, i64::MAX).unwrap().is_none());
         assert!(finish_job_in(&c, id, "done", "[]", None).unwrap());
         // 终态不可再次迁移
         assert!(!finish_job_in(&c, id, "canceled", "[]", None).unwrap());
@@ -4653,9 +4830,9 @@ mod tests {
         let fresh = insert_job_in(&c, &new_job("fresh")).unwrap();
         receive_running(&c, stale);
         receive_running(&c, fresh);
-        // 把 stale 的开始时间改成 1 小时前
+        // 把 stale 的开始时间改成 1 小时前，并模拟心跳早已停止
         c.execute(
-            "UPDATE jobs SET started_at = ?2 WHERE id = ?1",
+            "UPDATE jobs SET started_at = ?2, heartbeat_at = NULL WHERE id = ?1",
             params![
                 stale,
                 timestamp_millis_ago(std::time::Duration::from_secs(3600))
@@ -4674,9 +4851,45 @@ mod tests {
         assert_eq!(get_job_in(&c, fresh).unwrap().unwrap().status, "running");
     }
 
+    /// B7：心跳仍在刷新的长任务不能被回收，即使 started_at 已经很旧
+    #[test]
+    fn reap_stale_running_keeps_heartbeat_alive() {
+        let c = mem_conn();
+        let long = insert_job_in(&c, &new_job("long")).unwrap();
+        receive_running(&c, long);
+        c.execute(
+            "UPDATE jobs SET started_at = ?2, heartbeat_at = ?3 WHERE id = ?1",
+            params![
+                long,
+                timestamp_millis_ago(std::time::Duration::from_secs(7200)),
+                timestamp_millis()
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            reap_stale_running_in(&c, std::time::Duration::from_secs(1800)).unwrap(),
+            0
+        );
+        assert_eq!(get_job_in(&c, long).unwrap().unwrap().status, "running");
+        // 心跳停了之后才会被回收
+        assert!(touch_job_heartbeat_in(
+            &c,
+            long,
+            timestamp_millis_ago(std::time::Duration::from_secs(3600))
+        )
+        .unwrap());
+        assert_eq!(
+            reap_stale_running_in(&c, std::time::Duration::from_secs(1800)).unwrap(),
+            1
+        );
+    }
+
     /// 领取下一条并确认它确实进入 running
     fn receive_running(c: &Connection, id: i64) {
-        assert_eq!(claim_next_job_in(c, 4).unwrap().map(|j| j.id), Some(id));
+        assert_eq!(
+            claim_next_job_in(c, 4, i64::MAX).unwrap().map(|j| j.id),
+            Some(id)
+        );
     }
 
     /// C4：失败任务重试回 queued，终态与运行中任务不能重试
@@ -4685,7 +4898,10 @@ mod tests {
         let c = mem_conn();
         let id = insert_job_in(&c, &new_job("job")).unwrap();
         assert!(!requeue_job_in(&c, id).unwrap(), "queued 任务无需重试");
-        assert_eq!(claim_next_job_in(&c, 1).unwrap().map(|j| j.id), Some(id));
+        assert_eq!(
+            claim_next_job_in(&c, 1, i64::MAX).unwrap().map(|j| j.id),
+            Some(id)
+        );
         assert!(!requeue_job_in(&c, id).unwrap(), "running 任务不能重试");
         assert!(finish_job_in(&c, id, "failed", "[]", Some("boom")).unwrap());
         assert!(requeue_job_in(&c, id).unwrap());
@@ -4705,7 +4921,9 @@ mod tests {
         let second = insert_job_in(&c, &new_job("second")).unwrap();
         assert!(cancel_queued_job_in(&c, first).unwrap());
         assert!(!cancel_queued_job_in(&c, first).unwrap(), "取消应幂等");
-        let next = claim_next_job_in(&c, 1).unwrap().expect("仍有排队任务");
+        let next = claim_next_job_in(&c, 1, i64::MAX)
+            .unwrap()
+            .expect("仍有排队任务");
         assert_eq!(next.id, second, "被取消的任务不能再被取到");
         let row = get_job_in(&c, first).unwrap().unwrap();
         assert_eq!(row.status, "canceled");
@@ -4718,17 +4936,22 @@ mod tests {
         let c = mem_conn();
         let first = insert_job_in(&c, &new_job("first")).unwrap();
         let second = insert_job_in(&c, &new_job("second")).unwrap();
-        assert_eq!(claim_next_job_in(&c, 2).unwrap().map(|j| j.id), Some(first));
         assert_eq!(
-            claim_next_job_in(&c, 2).unwrap().map(|j| j.id),
+            claim_next_job_in(&c, 2, i64::MAX).unwrap().map(|j| j.id),
+            Some(first)
+        );
+        assert_eq!(
+            claim_next_job_in(&c, 2, i64::MAX).unwrap().map(|j| j.id),
             Some(second)
         );
         // 已达上限 2，再领应为空
         insert_job_in(&c, &new_job("third")).unwrap();
-        assert!(claim_next_job_in(&c, 2).unwrap().is_none());
+        assert!(claim_next_job_in(&c, 2, i64::MAX).unwrap().is_none());
         // 完成一个后空出名额，且不会重复返回已领取的任务
         assert!(finish_job_in(&c, first, "done", "[]", None).unwrap());
-        let next = claim_next_job_in(&c, 2).unwrap().expect("应有排空任务");
+        let next = claim_next_job_in(&c, 2, i64::MAX)
+            .unwrap()
+            .expect("应有排空任务");
         assert_eq!(next.prompt, "third");
         assert_eq!(get_job_in(&c, first).unwrap().unwrap().status, "done");
     }
@@ -5131,31 +5354,31 @@ mod tests {
         let ids = |rows: Vec<HistoryRow>| rows.iter().map(|r| r.id).collect::<Vec<_>>();
         // id 1..5 对应插入顺序；favorite_only 按 id DESC 返回收藏项
         assert_eq!(
-            ids(list_history_in(&c, 10, 0, "", "", true).unwrap()),
+            ids(list_history_in(&c, 10, 0, None, "", "", true).unwrap()),
             vec![4, 3, 2]
         );
         // 与模型过滤组合
         assert_eq!(
-            ids(list_history_in(&c, 10, 0, "m-a", "", true).unwrap()),
+            ids(list_history_in(&c, 10, 0, None, "m-a", "", true).unwrap()),
             vec![4, 2]
         );
         // 与风格过滤组合
         assert_eq!(
-            ids(list_history_in(&c, 10, 0, "", "anime", true).unwrap()),
+            ids(list_history_in(&c, 10, 0, None, "", "anime", true).unwrap()),
             vec![3, 2]
         );
         // 分页顺序不变：收藏 4、3 之后是 2
         assert_eq!(
-            ids(list_history_in(&c, 2, 0, "", "", true).unwrap()),
+            ids(list_history_in(&c, 2, 0, None, "", "", true).unwrap()),
             vec![4, 3]
         );
         assert_eq!(
-            ids(list_history_in(&c, 2, 2, "", "", true).unwrap()),
+            ids(list_history_in(&c, 2, 2, None, "", "", true).unwrap()),
             vec![2]
         );
         // favorite_only=false 不改变全量列表
         assert_eq!(
-            ids(list_history_in(&c, 10, 0, "", "", false).unwrap()),
+            ids(list_history_in(&c, 10, 0, None, "", "", false).unwrap()),
             vec![5, 4, 3, 2, 1]
         );
     }
@@ -5173,10 +5396,57 @@ mod tests {
             .unwrap();
         }
         // SQLite 原生 LIMIT -1 表示不限；钳制后按 1 条返回
-        assert_eq!(list_history_in(&c, -1, 0, "", "", false).unwrap().len(), 1);
+        assert_eq!(
+            list_history_in(&c, -1, 0, None, "", "", false)
+                .unwrap()
+                .len(),
+            1
+        );
         // LIMIT 0 原本返回空页，钳制后至少 1 条，避免前端把空页当成「已到底」
-        assert_eq!(list_history_in(&c, 0, 0, "", "", false).unwrap().len(), 1);
+        assert_eq!(
+            list_history_in(&c, 0, 0, None, "", "", false)
+                .unwrap()
+                .len(),
+            1
+        );
         // 负数 offset 与 0 等价
-        assert_eq!(list_history_in(&c, 10, -5, "", "", false).unwrap().len(), 3);
+        assert_eq!(
+            list_history_in(&c, 10, -5, None, "", "", false)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    /// E2：画廊用游标翻页，删除首页记录后继续加载不跳项
+    #[test]
+    fn list_history_cursor_pagination_survives_deletes() {
+        let c = mem_conn();
+        for i in 0..5 {
+            c.execute(
+                "INSERT INTO history (prompt, model, provider_name, style, file_path, favorite, created_at, op)
+                 VALUES (?1, 'm', 'P', 's', ?2, 0, ?3, 'generate')",
+                params![format!("p{i}"), format!("/tmp/{i}.png"), i.to_string()],
+            )
+            .unwrap();
+        }
+        let ids = |rows: Vec<HistoryRow>| rows.iter().map(|r| r.id).collect::<Vec<_>>();
+        let first = ids(list_history_in(&c, 2, 0, None, "", "", false).unwrap());
+        assert_eq!(first, vec![5, 4]);
+        // 删掉已展示的记录，offset 会跳项；游标（id < 最后一条）不会
+        c.execute("DELETE FROM history WHERE id = 4", []).unwrap();
+        let next = ids(list_history_in(&c, 2, 0, Some(4), "", "", false).unwrap());
+        assert_eq!(next, vec![3, 2]);
+        let tail = ids(list_history_in(&c, 2, 0, Some(2), "", "", false).unwrap());
+        assert_eq!(tail, vec![1]);
+        // 新增记录不会插进已翻过的游标之后
+        c.execute(
+            "INSERT INTO history (prompt, model, provider_name, style, file_path, favorite, created_at, op)
+             VALUES ('new', 'm', 'P', 's', '/tmp/new.png', 0, '9', 'generate')",
+            [],
+        )
+        .unwrap();
+        let after = ids(list_history_in(&c, 2, 0, Some(2), "", "", false).unwrap());
+        assert_eq!(after, vec![1]);
     }
 }

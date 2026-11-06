@@ -9,6 +9,7 @@ mod key_pool;
 mod logging;
 mod media_gate;
 mod paths;
+mod redact;
 mod reference;
 mod storage;
 
@@ -80,8 +81,8 @@ pub fn run() {
             let data_dir = app
                 .path()
                 .app_data_dir()
-                .expect("failed to resolve app data dir");
-            std::fs::create_dir_all(&data_dir).expect("failed to create app data dir");
+                .map_err(|e| format!("无法确定应用数据目录: {e}"))?;
+            std::fs::create_dir_all(&data_dir).map_err(|e| format!("无法创建应用数据目录: {e}"))?;
             init_tracing(&data_dir);
             // 媒体根先于数据库初始化：图片落盘路径由它决定，数据库仍在 appData。
             // 引导文件损坏只回退默认目录，不影响启动。
@@ -108,6 +109,8 @@ pub fn run() {
             std::mem::drop(tauri::async_runtime::spawn_blocking(move || {
                 image_gc::run(&gc_root)
             }));
+            // 更新下载残留：超过 24h 的 .tmp/.pkg 清理掉，避免中断后占满缓存目录
+            commands::cleanup_stale_downloads(app.handle());
             // 日志保留：只清理超过 7 天的滚动文件，跳过当天；失败仅落日志
             let logs = logging::logs_dir(&data_dir);
             std::mem::drop(tauri::async_runtime::spawn_blocking(move || {
@@ -130,6 +133,7 @@ pub fn run() {
             commands::test_models,
             commands::get_model_caps,
             commands::set_model_caps,
+            commands::save_model_caps_batch,
             commands::test_connection,
             commands::generate_images,
             commands::cancel_generation,

@@ -150,6 +150,8 @@ function metaOf(board: CanvasBoardMeta): CanvasBoardMeta {
 let saveTimer: number | null = null;
 let savedKey: string | null = null;
 let inflight: Promise<void> | null = null;
+// 切板序号：快速连续点开多个画布时，只有最后一次请求的结果允许落到界面上
+let boardSeq = 0;
 const requestedThumbs = new Set<number>();
 
 interface CanvasState {
@@ -244,6 +246,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
       }
       await get().ensureLoaded();
       await get().flush();
+      // 新建会改变当前画布：让之前发出、还没返回的切板请求全部作废
+      boardSeq += 1;
       try {
         const board = await api.createCanvasBoard(trimmed);
         const data = parseCanvasData(board.dataJson);
@@ -273,9 +277,12 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
 
     selectBoard: async (id) => {
       if (get().activeId === id) return;
+      const seq = ++boardSeq;
       await get().flush();
       try {
         const board = await api.getCanvasBoard(id);
+        // 期间用户已经点了别的画布：丢弃这次过期响应，避免旧板内容覆盖新板
+        if (seq !== boardSeq) return;
         if (!board) {
           set((s) => ({ boards: s.boards.filter((b) => b.id !== id) }));
           if (get().activeId === id) resetToEmpty(get().boards);
@@ -300,7 +307,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
         });
         void get().loadThumbs(data.nodes.map((n) => n.historyId));
       } catch (e) {
-        toast(`打开画布失败：${String(e)}`, "error");
+        if (seq === boardSeq) {
+          toast(`打开画布失败：${String(e)}`, "error");
+        }
       }
     },
 
@@ -314,6 +323,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
 
     deleteBoard: async (id) => {
       await get().flush();
+      boardSeq += 1;
       try {
         await api.deleteCanvasBoard(id);
       } catch (e) {
@@ -447,23 +457,32 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
       inflight = (async () => {
         try {
           const saved = await api.saveCanvasBoard(id, name, dataJson);
-          savedKey = key;
-          set((cur) => ({
-            boards: cur.boards.map((b) =>
-              b.id === id
-                ? { ...b, name: saved.name, updatedAt: saved.updatedAt }
-                : b,
-            ),
-            saving: false,
-            savedAt: saved.updatedAt,
-            dirty:
-              snapshotKey(
-                cur.activeName,
-                cur.nodes,
-                cur.edges,
-                cur.viewport,
-              ) !== savedKey,
-          }));
+          set((cur) => {
+            // 保存期间已切到别的画布：只更新元数据，不把 savedKey / dirty
+            // 套到新板上（否则新板会被误判为「已保存」而丢改动）
+            const active = cur.activeId === id;
+            if (active) savedKey = key;
+            return {
+              boards: cur.boards.map((b) =>
+                b.id === id
+                  ? { ...b, name: saved.name, updatedAt: saved.updatedAt }
+                  : b,
+              ),
+              saving: false,
+              ...(active
+                ? {
+                    savedAt: saved.updatedAt,
+                    dirty:
+                      snapshotKey(
+                        cur.activeName,
+                        cur.nodes,
+                        cur.edges,
+                        cur.viewport,
+                      ) !== savedKey,
+                  }
+                : undefined),
+            };
+          });
         } catch (e) {
           set({ saving: false });
           toast(`画布保存失败：${String(e)}`, "error");

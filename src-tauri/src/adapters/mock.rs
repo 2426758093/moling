@@ -116,7 +116,10 @@ impl ImageAdapter for MockAdapter {
                         message,
                         status: 401,
                     },
-                    "quota" => AdapterError::QuotaExceeded { message },
+                    "quota" => AdapterError::QuotaExceeded {
+                        message,
+                        retry_after: None,
+                    },
                     "timeout" => AdapterError::Timeout { message },
                     "blocked" => AdapterError::ContentBlocked { message },
                     _ => AdapterError::Network { message },

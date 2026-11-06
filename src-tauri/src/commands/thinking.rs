@@ -304,17 +304,20 @@ pub async fn refine_prompt(
         crate::commands::CancelRegistration::new(&state, cancel_key.as_ref());
     let stream_id = input.request_id.as_deref();
     let conv_id = input.conversation_id;
+    let is_cancelled = || {
+        cancel_token
+            .as_ref()
+            .is_some_and(|t| t.load(std::sync::atomic::Ordering::SeqCst))
+    };
 
     let result = if config.kind == adapters::KIND_MOCK {
         let full = mock_refine_chunks(&input.raw);
         let chars: Vec<char> = full.chars().collect();
         let step = chars.len().div_ceil(MOCK_REFINE_SEGMENTS).max(1);
         for piece in chars.chunks(step) {
-            if cancel_token
-                .as_ref()
-                .is_some_and(|t| t.load(std::sync::atomic::Ordering::SeqCst))
-            {
-                return Err("思考优化已取消".into());
+            // B3：用户主动停止不是失败，按取消结果返回，前端静默恢复原文
+            if is_cancelled() {
+                return Ok(cancelled_refine_json(&input.raw));
             }
             if let Some(id) = stream_id {
                 emit_thinking_delta(&app, id, conv_id, &piece.iter().collect::<String>());
@@ -337,7 +340,19 @@ pub async fn refine_prompt(
         )
         .await
     };
+    // 取消可能发生在流结束的最后一刻，统一在这里收敛
+    if is_cancelled() {
+        return Ok(cancelled_refine_json(&input.raw));
+    }
     Ok(refine_result_json(&input.raw, result))
+}
+
+fn cancelled_refine_json(raw: &str) -> serde_json::Value {
+    serde_json::json!({
+        "refined": raw,
+        "used": false,
+        "cancelled": true,
+    })
 }
 
 /// 取消在途思考优化：置位注册表里的 token（幂等，未注册返回 false）
@@ -453,6 +468,16 @@ mod tests {
         assert_eq!(failed["used"], false);
         assert_eq!(failed["refined"], raw);
         assert_eq!(failed["error"]["message"], "boom");
+    }
+
+    /// B3：主动取消不是失败——不返回 error，只标记 cancelled，前端静默恢复原文
+    #[test]
+    fn cancelled_refine_marks_cancelled_without_error() {
+        let value = cancelled_refine_json("原始提示词");
+        assert_eq!(value["refined"], "原始提示词");
+        assert_eq!(value["used"], false);
+        assert_eq!(value["cancelled"], true);
+        assert!(value.get("error").is_none());
     }
 }
 
