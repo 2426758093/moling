@@ -120,6 +120,8 @@ fn settings_json() -> serde_json::Value {
         "queueConcurrency",
         "queueProviderConcurrency",
         "cacheRetentionDays",
+        "bodyIdleTimeoutSecs",
+        "bodyTotalTimeoutSecs",
         "defaultProviderId",
         "defaultParams",
     ] {

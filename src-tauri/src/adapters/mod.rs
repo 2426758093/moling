@@ -7,6 +7,7 @@ pub mod template;
 mod tests;
 
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -377,8 +378,8 @@ pub(crate) async fn download_image_bytes(
     let bytes = read_body_with_idle(
         resp,
         "下载图片",
-        BODY_IDLE_TIMEOUT,
-        BODY_TOTAL_TIMEOUT,
+        body_idle_timeout(),
+        body_total_timeout(),
         MAX_REMOTE_IMAGE_BYTES,
     )
     .await?;
@@ -511,8 +512,29 @@ pub fn classify_reqwest(err: &reqwest::Error) -> AdapterError {
     } else if err.is_connect() {
         AdapterError::Network { message }
     } else {
-        AdapterError::Other { message }
+        let hint = connection_reset_hint(&message).unwrap_or_default();
+        AdapterError::Other {
+            message: format!("{message}{hint}"),
+        }
     }
+}
+
+/// 连接在响应头之前被重置时的可执行提示。
+///
+/// Windows 10053/10054 常由代理或安全软件回收空闲 keep-alive 连接引起。
+/// 该错误发生时请求体可能已送达上游，不能自动重试（与计费安全策略一致），
+/// 只提示用户先确认是否已生成，再决定是否重发。
+fn connection_reset_hint(message: &str) -> Option<&'static str> {
+    let lower = message.to_ascii_lowercase();
+    let reset = lower.contains("os error 10054")
+        || lower.contains("os error 10053")
+        || lower.contains("connection reset")
+        || message.contains("强迫关闭");
+    reset.then_some(
+        "；连接在响应返回前被重置（常见于代理或安全软件回收空闲连接）。\
+         已为生成请求禁用空闲连接复用，请重新发起；\
+         若上游可能已处理，先在服务商后台确认再重试，避免重复计费",
+    )
 }
 
 /// 响应体解析失败时保留的字符数：够看出是 HTML 错误页、错误 JSON 还是压缩字节
@@ -524,11 +546,42 @@ const MAX_DECODED_BODY_BYTES: u64 = 64 * 1024 * 1024;
 /// 响应体空闲超时：连续这么久没有收到新数据才判定失败。
 /// 不能与「等待生成」的服务商超时共用：图片接口常返回 3–4MB base64，
 /// 慢链路上生成 40s + 下载 25s，总截止时间会把 HTTP 200 的响应体截断。
-const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// 两项均可由设置热更新，默认值见 `storage::DEFAULT_BODY_*`。
+static BODY_IDLE_TIMEOUT_SECS: AtomicU64 =
+    AtomicU64::new(crate::storage::DEFAULT_BODY_IDLE_TIMEOUT_SECS);
 /// 响应体总时长硬上限，避免持续滴流的异常链路长期占用生成槽位。
-const BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
+static BODY_TOTAL_TIMEOUT_SECS: AtomicU64 =
+    AtomicU64::new(crate::storage::DEFAULT_BODY_TOTAL_TIMEOUT_SECS);
 /// 未解压响应体上限（解压后另有 `MAX_DECODED_BODY_BYTES`）。
 const MAX_RAW_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// 启动 / 配置导入后从设置加载响应体超时。
+pub fn init_body_timeouts() {
+    let (idle, total) = crate::storage::body_timeout_secs();
+    apply_body_timeouts(idle, total);
+}
+
+/// 热更新响应体超时；调用方已完成取值范围与跨字段校验。
+pub fn apply_body_timeouts(idle_secs: u64, total_secs: u64) {
+    let (idle, total) = resolve_body_timeouts(idle_secs, total_secs);
+    BODY_IDLE_TIMEOUT_SECS.store(idle.as_secs(), Ordering::Relaxed);
+    BODY_TOTAL_TIMEOUT_SECS.store(total.as_secs(), Ordering::Relaxed);
+}
+
+/// 兜底：0 视为 1s，总时长不得小于空闲（与存储层脏值兜底同语义）。
+pub(crate) fn resolve_body_timeouts(idle_secs: u64, total_secs: u64) -> (Duration, Duration) {
+    let idle = idle_secs.max(1);
+    let total = total_secs.max(idle);
+    (Duration::from_secs(idle), Duration::from_secs(total))
+}
+
+fn body_idle_timeout() -> Duration {
+    Duration::from_secs(BODY_IDLE_TIMEOUT_SECS.load(Ordering::Relaxed))
+}
+
+fn body_total_timeout() -> Duration {
+    Duration::from_secs(BODY_TOTAL_TIMEOUT_SECS.load(Ordering::Relaxed))
+}
 
 /// 发送请求：服务商超时只约束「等到响应头」，不覆盖响应体下载。
 ///
@@ -661,8 +714,8 @@ pub async fn parse_json_body<T: serde::de::DeserializeOwned>(
     let bytes = read_body_with_idle(
         resp,
         api,
-        BODY_IDLE_TIMEOUT,
-        BODY_TOTAL_TIMEOUT,
+        body_idle_timeout(),
+        body_total_timeout(),
         MAX_RAW_BODY_BYTES,
     )
     .await?;

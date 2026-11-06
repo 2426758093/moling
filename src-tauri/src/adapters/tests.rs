@@ -428,6 +428,83 @@ fn serve_paced(
     port
 }
 
+/// 生成客户端不得复用空闲连接：代理/服务商常在更短时间内单方面关闭 keep-alive，
+/// 复用死连接会让下一次计费 POST 在写出请求体时直接收到 RST（os error 10054），
+/// 而流式 multipart 请求体无法被 hyper 安全重放。
+#[test]
+fn generation_client_does_not_reuse_idle_connections() {
+    use crate::adapters::http::{build_generation_client, ProxyConfig, MODE_DIRECT};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let accepts = Arc::new(AtomicUsize::new(0));
+    let port = serve_keepalive(accepts.clone());
+    let client = build_generation_client(
+        &ProxyConfig {
+            mode: MODE_DIRECT.into(),
+            ..Default::default()
+        },
+        "",
+    )
+    .unwrap();
+
+    block_on(async {
+        for _ in 0..2 {
+            let text = client
+                .get(format!("http://127.0.0.1:{port}/x"))
+                .send()
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap();
+            assert_eq!(text, "ok");
+        }
+    });
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while accepts.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        2,
+        "两次请求应各建一条连接，不能复用空闲连接"
+    );
+}
+
+/// 支持 keep-alive 的本地端点：每条连接可反复服务，用于观察客户端是否复用连接。
+fn serve_keepalive(accepts: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            accepts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::spawn(move || {
+                let mut request = Vec::new();
+                let mut buf = [0u8; 2048];
+                loop {
+                    let n = match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    request.extend_from_slice(&buf[..n]);
+                    while let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        request.drain(..pos + 4);
+                        let resp = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok";
+                        if stream.write_all(resp).is_err() || stream.flush().is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+    port
+}
+
 /// base64 大响应在慢链路上读几十秒是常态：等响应头的超时不能顺延成读 body 的总截止时间。
 /// 旧实现给整次请求设 `.timeout(60s)`，body 晚于该截止时间到达即报 operation timed out。
 #[test]
@@ -464,6 +541,37 @@ fn slow_body_is_not_cut_by_header_timeout() {
             .expect("body 不应继承等待响应头的超时")
     });
     assert_eq!(parsed["data"][0], "ok");
+}
+
+/// 运行时超时值的兜底：0 不能变成立即超时，总时长不得小于空闲。
+#[test]
+fn body_timeout_values_are_clamped() {
+    use crate::adapters::resolve_body_timeouts;
+
+    assert_eq!(
+        resolve_body_timeouts(30, 300),
+        (Duration::from_secs(30), Duration::from_secs(300))
+    );
+    assert_eq!(
+        resolve_body_timeouts(0, 0),
+        (Duration::from_secs(1), Duration::from_secs(1))
+    );
+    assert_eq!(
+        resolve_body_timeouts(30, 10),
+        (Duration::from_secs(30), Duration::from_secs(30))
+    );
+}
+
+/// Windows 10053/10054 这类「连接被重置」要给出可执行提示；
+/// 该错误发生在响应头之前，上游可能已处理，因此仍不进入自动重试白名单。
+#[test]
+fn reset_error_hint_is_actionable() {
+    use crate::adapters::connection_reset_hint;
+    let raw = "error sending request for url (...) <- client error (SendRequest) <- connection \
+               error <- 远程主机强迫关闭了一个现有的连接。 (os error 10054)";
+    assert!(connection_reset_hint(raw).is_some_and(|h| h.contains("重新发起")));
+    assert!(connection_reset_hint("connection reset by peer").is_some());
+    assert!(connection_reset_hint("dns error: failed to lookup address").is_none());
 }
 
 /// body 中途停滞要报「空闲超时」并带上已接收字节数，便于区分慢链路与上游中断。

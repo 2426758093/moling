@@ -93,6 +93,8 @@ pub fn run() {
             storage::warm_master_key();
             // 代理需在首个生成请求前生效；配置损坏只落日志，不阻断启动
             adapters::http::init_from_storage();
+            // 响应体读取超时同样来自设置，启动即生效
+            adapters::init_body_timeouts();
             // 队列：上次残留的 running 一律标 interrupted（不自动重跑），
             // 且默认暂停，等用户点「开始队列」后才执行。
             match storage::mark_running_interrupted() {

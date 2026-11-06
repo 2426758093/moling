@@ -19,6 +19,8 @@ const ALLOWED_SETTING_KEYS: &[&str] = &[
     "queueConcurrency",
     "queueProviderConcurrency",
     "cacheRetentionDays",
+    "bodyIdleTimeoutSecs",
+    "bodyTotalTimeoutSecs",
 ];
 
 fn check_setting_key(key: &str) -> Result<(), String> {
@@ -72,14 +74,60 @@ fn check_setting_value(key: &str, value: &str) -> Result<(), String> {
         {
             Err(format!("缓存保留天数取值非法（应为 1–365）: {value}"))
         }
+        "bodyIdleTimeoutSecs"
+            if !matches!(
+                value.trim().parse::<i64>(),
+                Ok(n) if (storage::MIN_BODY_IDLE_TIMEOUT_SECS
+                    ..=storage::MAX_BODY_IDLE_TIMEOUT_SECS)
+                    .contains(&n)
+            ) =>
+        {
+            Err(format!("无数据超时取值非法（应为 5–300）: {value}"))
+        }
+        "bodyTotalTimeoutSecs"
+            if !matches!(
+                value.trim().parse::<i64>(),
+                Ok(n) if (storage::MIN_BODY_TOTAL_TIMEOUT_SECS
+                    ..=storage::MAX_BODY_TOTAL_TIMEOUT_SECS)
+                    .contains(&n)
+            ) =>
+        {
+            Err(format!("响应体总超时取值非法（应为 30–1800）: {value}"))
+        }
         _ => Ok(()),
     }
+}
+
+/// 总超时小于无数据超时时，空闲阈值永远等不到，等于让总超时静默失效。
+fn check_body_timeout_pair(idle: u64, total: u64) -> Result<(), String> {
+    if total < idle {
+        return Err(format!(
+            "响应体总超时不能小于无数据超时（当前 {idle}s / {total}s）"
+        ));
+    }
+    Ok(())
 }
 
 #[tauri::command]
 pub async fn set_setting(key: String, value: String) -> Result<(), String> {
     check_setting_key(&key)?;
     check_setting_value(&key, &value)?;
+    if matches!(key.as_str(), "bodyIdleTimeoutSecs" | "bodyTotalTimeoutSecs") {
+        let secs: u64 = value
+            .trim()
+            .parse()
+            .map_err(|_| format!("超时取值非法: {value}"))?;
+        let (cur_idle, cur_total) = storage::body_timeout_secs();
+        let (idle, total) = if key == "bodyIdleTimeoutSecs" {
+            (secs, cur_total)
+        } else {
+            (cur_idle, secs)
+        };
+        check_body_timeout_pair(idle, total)?;
+        storage::set_setting(&key, &value)?;
+        crate::adapters::apply_body_timeouts(idle, total);
+        return Ok(());
+    }
     storage::set_setting(&key, &value)?;
     Ok(())
 }
@@ -159,6 +207,8 @@ mod tests {
         assert!(check_setting_key("queueConcurrency").is_ok());
         assert!(check_setting_key("queueProviderConcurrency").is_ok());
         assert!(check_setting_key("cacheRetentionDays").is_ok());
+        assert!(check_setting_key("bodyIdleTimeoutSecs").is_ok());
+        assert!(check_setting_key("bodyTotalTimeoutSecs").is_ok());
         assert!(check_setting_key("extraParams:1").is_err());
         assert!(check_setting_key("任意 key").is_err());
     }
@@ -252,6 +302,43 @@ mod tests {
                 "{bad} 应被拒绝"
             );
         }
+    }
+
+    /// 响应体读取超时只接受区间内的整数字符串
+    #[test]
+    fn body_timeout_value_validation() {
+        for ok in ["5", "30", "300", " 12 "] {
+            assert!(
+                check_setting_value("bodyIdleTimeoutSecs", ok).is_ok(),
+                "{ok} 应被接受"
+            );
+        }
+        for bad in ["4", "301", "0", "-1", "1.5", "", "thirty"] {
+            assert!(
+                check_setting_value("bodyIdleTimeoutSecs", bad).is_err(),
+                "{bad} 应被拒绝"
+            );
+        }
+        for ok in ["30", "300", "1800", " 60 "] {
+            assert!(
+                check_setting_value("bodyTotalTimeoutSecs", ok).is_ok(),
+                "{ok} 应被接受"
+            );
+        }
+        for bad in ["29", "1801", "0", "-1", "1.5", "", "thirty"] {
+            assert!(
+                check_setting_value("bodyTotalTimeoutSecs", bad).is_err(),
+                "{bad} 应被拒绝"
+            );
+        }
+    }
+
+    /// 总超时不能小于无数据超时，否则空闲阈值永远等不到
+    #[test]
+    fn body_timeout_pair_validation() {
+        assert!(check_body_timeout_pair(30, 300).is_ok());
+        assert!(check_body_timeout_pair(30, 30).is_ok());
+        assert!(check_body_timeout_pair(60, 59).is_err());
     }
 
     #[test]

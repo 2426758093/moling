@@ -1,5 +1,14 @@
 import { useEffect, useState } from "react";
 import { api, ProxyInputPayload, ProxyMode } from "../../lib/api";
+import {
+  BODY_IDLE_DEFAULT,
+  BODY_IDLE_MAX,
+  BODY_IDLE_MIN,
+  BODY_TOTAL_DEFAULT,
+  BODY_TOTAL_MAX,
+  BODY_TOTAL_MIN,
+  parseBodyTimeouts,
+} from "../../lib/bodyTimeouts";
 import { useProviderStore } from "../../stores/providerStore";
 import { Button } from "../ui/Button";
 import { Input } from "../ui/Field";
@@ -22,6 +31,8 @@ export default function NetworkSection() {
   const [password, setPassword] = useState<string | null>(null);
   const [noProxy, setNoProxy] = useState("");
   const [hasPassword, setHasPassword] = useState(false);
+  const [idleTimeout, setIdleTimeout] = useState(String(BODY_IDLE_DEFAULT));
+  const [totalTimeout, setTotalTimeout] = useState(String(BODY_TOTAL_DEFAULT));
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -36,6 +47,18 @@ export default function NetworkSection() {
         setHasPassword(cfg.hasPassword);
       })
       .catch((e) => setMsg(`读取代理设置失败：${String(e)}`));
+    api
+      .getSetting("bodyIdleTimeoutSecs")
+      .then((v) => {
+        if (v) setIdleTimeout(v);
+      })
+      .catch(() => undefined);
+    api
+      .getSetting("bodyTotalTimeoutSecs")
+      .then((v) => {
+        if (v) setTotalTimeout(v);
+      })
+      .catch(() => undefined);
   }, []);
 
   const payload = (): ProxyInputPayload => ({
@@ -50,9 +73,14 @@ export default function NetworkSection() {
     setBusy(true);
     setMsg("");
     try {
+      const timeouts = parseBodyTimeouts(idleTimeout, totalTimeout);
       const cfg = await api.saveProxyConfig(payload());
       setHasPassword(cfg.hasPassword);
       setPassword(null);
+      await api.setSetting("bodyIdleTimeoutSecs", String(timeouts.idle));
+      await api.setSetting("bodyTotalTimeoutSecs", String(timeouts.total));
+      setIdleTimeout(String(timeouts.idle));
+      setTotalTimeout(String(timeouts.total));
       setMsg("已保存并生效");
     } catch (e) {
       setMsg(`保存失败：${String(e)}`);
@@ -139,6 +167,37 @@ export default function NetworkSection() {
           </Row>
         </>
       )}
+
+      <Row
+        label="无数据超时"
+        hint={`连续 ${idleTimeout || "?"} 秒收不到新数据才判定失败（${BODY_IDLE_MIN}–${BODY_IDLE_MAX} 秒）`}
+      >
+        <Input
+          type="number"
+          min={BODY_IDLE_MIN}
+          max={BODY_IDLE_MAX}
+          value={idleTimeout}
+          onChange={(e) => setIdleTimeout(e.target.value)}
+          suffix="秒"
+          aria-label="响应体无数据超时"
+          widthClass="w-32"
+        />
+      </Row>
+      <Row
+        label="响应体总超时"
+        hint={`整段响应体下载的最长耗时，不能小于无数据超时（${BODY_TOTAL_MIN}–${BODY_TOTAL_MAX} 秒）`}
+      >
+        <Input
+          type="number"
+          min={BODY_TOTAL_MIN}
+          max={BODY_TOTAL_MAX}
+          value={totalTimeout}
+          onChange={(e) => setTotalTimeout(e.target.value)}
+          suffix="秒"
+          aria-label="响应体总超时"
+          widthClass="w-32"
+        />
+      </Row>
 
       <Row
         label="应用设置"

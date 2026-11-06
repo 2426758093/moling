@@ -82,7 +82,7 @@ pub async fn save_proxy_config(input: ProxyInput) -> Result<ProxyView, String> {
     let stored = load_stored()?;
     let (cfg, password) = resolve(&input, &stored)?;
     // 先构建成功再落库/替换：构建失败时旧客户端与旧设置都保持不变
-    let client = http::build_client(&cfg, &password)?;
+    let client = http::build_generation_client(&cfg, &password)?;
     storage::set_setting(
         http::PROXY_SETTING_KEY,
         &serde_json::to_string(&cfg).map_err(|e| e.to_string())?,

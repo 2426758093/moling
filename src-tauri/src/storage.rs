@@ -1117,12 +1117,22 @@ pub const BACKUP_SETTING_KEYS: &[&str] = &[
     "queueConcurrency",
     "queueProviderConcurrency",
     "cacheRetentionDays",
+    "bodyIdleTimeoutSecs",
+    "bodyTotalTimeoutSecs",
 ];
 
 /// 缓存（回收站）保留天数的合法区间与默认值
 pub const MIN_CACHE_RETENTION_DAYS: i64 = 1;
 pub const MAX_CACHE_RETENTION_DAYS: i64 = 365;
 pub const DEFAULT_CACHE_RETENTION_DAYS: i64 = 30;
+
+/// 响应体读取超时的合法区间与默认值（秒）
+pub const MIN_BODY_IDLE_TIMEOUT_SECS: i64 = 5;
+pub const MAX_BODY_IDLE_TIMEOUT_SECS: i64 = 300;
+pub const DEFAULT_BODY_IDLE_TIMEOUT_SECS: u64 = 30;
+pub const MIN_BODY_TOTAL_TIMEOUT_SECS: i64 = 30;
+pub const MAX_BODY_TOTAL_TIMEOUT_SECS: i64 = 1800;
+pub const DEFAULT_BODY_TOTAL_TIMEOUT_SECS: u64 = 300;
 
 /// 读缓存保留天数；未设置/脏值回退默认（启动清理不能因为设置损坏而停摆）
 pub fn cache_retention_days() -> i64 {
@@ -1145,6 +1155,46 @@ pub(crate) fn cache_retention_days_in(c: &Connection) -> i64 {
     .unwrap_or(DEFAULT_CACHE_RETENTION_DAYS)
 }
 
+/// 读响应体读取超时（无数据 / 总时长，秒）。
+/// 未设置、脏值或越界一律回退默认；总时长低于空闲时抬到空闲值，
+/// 避免配置损坏导致「空闲阈值永远等不到」。
+pub fn body_timeout_secs() -> (u64, u64) {
+    match conn() {
+        Ok(c) => body_timeout_secs_in(&c),
+        Err(_) => (
+            DEFAULT_BODY_IDLE_TIMEOUT_SECS,
+            DEFAULT_BODY_TOTAL_TIMEOUT_SECS,
+        ),
+    }
+}
+
+pub(crate) fn body_timeout_secs_in(c: &Connection) -> (u64, u64) {
+    let read = |key: &str, min: i64, max: i64| -> Option<u64> {
+        c.query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            params![key],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| (min..=max).contains(n))
+        .map(|n| n as u64)
+    };
+    let idle = read(
+        "bodyIdleTimeoutSecs",
+        MIN_BODY_IDLE_TIMEOUT_SECS,
+        MAX_BODY_IDLE_TIMEOUT_SECS,
+    )
+    .unwrap_or(DEFAULT_BODY_IDLE_TIMEOUT_SECS);
+    let total = read(
+        "bodyTotalTimeoutSecs",
+        MIN_BODY_TOTAL_TIMEOUT_SECS,
+        MAX_BODY_TOTAL_TIMEOUT_SECS,
+    )
+    .unwrap_or(DEFAULT_BODY_TOTAL_TIMEOUT_SECS);
+    (idle, total.max(idle))
+}
+
 /// 导入时允许写入的设置项。v1 只有旧版导出的两项；v2 增加主题与自定义模板。
 const IMPORT_SETTINGS_V1: &[&str] = &["defaultProviderId", "defaultParams"];
 const IMPORT_SETTINGS_V2: &[&str] = &[
@@ -1157,6 +1207,8 @@ const IMPORT_SETTINGS_V2: &[&str] = &[
     "queueConcurrency",
     "queueProviderConcurrency",
     "cacheRetentionDays",
+    "bodyIdleTimeoutSecs",
+    "bodyTotalTimeoutSecs",
 ];
 
 fn invalid_import(msg: &str) -> AppError {
@@ -1236,6 +1288,41 @@ fn validate_import_settings(
             return Err(invalid_import(
                 "导入文件中的缓存保留天数取值非法（应为 1–365）",
             ));
+        }
+    }
+    let idle = match settings.get("bodyIdleTimeoutSecs") {
+        None => None,
+        Some(v) => match v
+            .as_str()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .filter(|n| (MIN_BODY_IDLE_TIMEOUT_SECS..=MAX_BODY_IDLE_TIMEOUT_SECS).contains(n))
+        {
+            Some(n) => Some(n),
+            None => {
+                return Err(invalid_import(
+                    "导入文件中的无数据超时取值非法（应为 5–300）",
+                ))
+            }
+        },
+    };
+    let total = match settings.get("bodyTotalTimeoutSecs") {
+        None => None,
+        Some(v) => match v
+            .as_str()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .filter(|n| (MIN_BODY_TOTAL_TIMEOUT_SECS..=MAX_BODY_TOTAL_TIMEOUT_SECS).contains(n))
+        {
+            Some(n) => Some(n),
+            None => {
+                return Err(invalid_import(
+                    "导入文件中的响应体总超时取值非法（应为 30–1800）",
+                ))
+            }
+        },
+    };
+    if let (Some(idle), Some(total)) = (idle, total) {
+        if total < idle {
+            return Err(invalid_import("导入文件中的响应体总超时不能小于无数据超时"));
         }
     }
     Ok(())
@@ -3923,6 +4010,8 @@ mod tests {
                 "defaultProviderId": "9",
                 "theme": "dark",
                 "glassAppearance": "tinted",
+                "bodyIdleTimeoutSecs": "45",
+                "bodyTotalTimeoutSecs": "900",
                 "promptTemplates": r#"[{"id":"my","title":"我的模板","text":"a {subject}"}]"#,
                 "unknownKey": "ignored",
             },
@@ -3968,6 +4057,16 @@ mod tests {
             Some("tinted"),
             "玻璃质感随备份往返"
         );
+        assert_eq!(
+            setting_of(&c, "bodyIdleTimeoutSecs").as_deref(),
+            Some("45"),
+            "响应体无数据超时随备份往返"
+        );
+        assert_eq!(
+            setting_of(&c, "bodyTotalTimeoutSecs").as_deref(),
+            Some("900"),
+            "响应体总超时随备份往返"
+        );
 
         let raw = setting_of(&c, "thinkingConfig").expect("思考配置已导入");
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -4010,6 +4109,21 @@ mod tests {
             (
                 serde_json::json!({ "promptTemplates": "[{\"id\":\"a\"}]" }),
                 "自定义模板",
+            ),
+            (
+                serde_json::json!({ "bodyIdleTimeoutSecs": "4" }),
+                "无数据超时",
+            ),
+            (
+                serde_json::json!({ "bodyTotalTimeoutSecs": "1801" }),
+                "总超时",
+            ),
+            (
+                serde_json::json!({
+                    "bodyIdleTimeoutSecs": "60",
+                    "bodyTotalTimeoutSecs": "30"
+                }),
+                "不能小于",
             ),
         ];
         for (settings, needle) in bad_settings {
@@ -4502,6 +4616,45 @@ mod tests {
             .unwrap();
             assert_eq!(cache_retention_days_in(&c), expected, "raw={raw}");
         }
+    }
+
+    /// 响应体超时：缺省 30/300，合法值生效，脏值/越界回退默认，总时长不低于空闲
+    #[test]
+    fn body_timeout_secs_defaults_and_validates() {
+        let c = mem_conn();
+        assert_eq!(
+            body_timeout_secs_in(&c),
+            (
+                DEFAULT_BODY_IDLE_TIMEOUT_SECS,
+                DEFAULT_BODY_TOTAL_TIMEOUT_SECS
+            )
+        );
+        let set = |key: &str, value: &str| {
+            c.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
+            )
+            .unwrap();
+        };
+        set("bodyIdleTimeoutSecs", "45");
+        set("bodyTotalTimeoutSecs", "900");
+        assert_eq!(body_timeout_secs_in(&c), (45, 900));
+        for bad in ["4", "301", "abc"] {
+            set("bodyIdleTimeoutSecs", bad);
+            assert_eq!(
+                body_timeout_secs_in(&c),
+                (DEFAULT_BODY_IDLE_TIMEOUT_SECS, 900),
+                "idle={bad}"
+            );
+        }
+        set("bodyIdleTimeoutSecs", "45");
+        set("bodyTotalTimeoutSecs", "40");
+        assert_eq!(
+            body_timeout_secs_in(&c),
+            (45, 45),
+            "总超时低于空闲时应抬到空闲值"
+        );
     }
 
     /// 删除判定：被消息引用必须保留；无引用才允许回收；删行不影响判定自身的引用

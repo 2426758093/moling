@@ -99,7 +99,7 @@ pub(crate) fn current_client() -> Result<Arc<reqwest::Client>, String> {
     if let Some(client) = read_installed() {
         return Ok(client);
     }
-    let client = Arc::new(build_client(&ProxyConfig::default(), "")?);
+    let client = Arc::new(build_generation_client(&ProxyConfig::default(), "")?);
     install(client.clone());
     Ok(client)
 }
@@ -205,6 +205,23 @@ pub fn build_client(cfg: &ProxyConfig, password: &str) -> Result<reqwest::Client
         .map_err(|e| format!("HTTP 客户端构建失败: {e}"))
 }
 
+/// 生成客户端：代理配置与主客户端一致，但不保留空闲连接。
+///
+/// reqwest 默认把空闲连接留在池里 90s。服务商 / 代理 / NAT 常更早单方面关闭
+/// 连接且不通知客户端；下一次计费 POST 复用到这条死连接时，写出请求体就会
+/// 收到 RST（Windows os error 10054）。`/images/edits` 的请求体是流式
+/// multipart，hyper 无法安全重放，只能整次失败。生成请求间隔通常远大于连接
+/// 存活期，重开 TLS 的代价远小于一次失败/重复计费风险。
+pub fn build_generation_client(
+    cfg: &ProxyConfig,
+    password: &str,
+) -> Result<reqwest::Client, String> {
+    client_builder(cfg, password)?
+        .pool_max_idle_per_host(0)
+        .build()
+        .map_err(|e| format!("HTTP 客户端构建失败: {e}"))
+}
+
 /// 把 `host` 固定到指定地址，绕过系统 DNS；TLS 仍按原域名校验证书。
 /// 仅适用于受限网络下访问解析结果不可达的同名主机。
 pub fn build_client_pinned(
@@ -248,7 +265,7 @@ pub fn init_from_storage() {
             return;
         }
     };
-    match build_client(&cfg, &password) {
+    match build_generation_client(&cfg, &password) {
         Ok(client) => {
             install(Arc::new(client));
             tracing::warn!("已应用代理配置：{}", cfg.mode);

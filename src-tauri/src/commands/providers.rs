@@ -520,6 +520,7 @@ pub async fn import_config(app: tauri::AppHandle, data: serde_json::Value) -> Re
         })?;
     // 导入可能改了代理设置：按新配置重建客户端（失败时保留旧客户端并落日志）
     adapters::http::init_from_storage();
+    adapters::init_body_timeouts();
     tracing::warn!("配置导入完成（替换语义）：{count} 个服务商");
     Ok(())
 }
