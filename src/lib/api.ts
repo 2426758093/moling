@@ -746,7 +746,7 @@ export const EMPTY_PROVIDER: ProviderInput = {
   kind: "openai",
   modelsJson: "",
   defaultModel: "",
-  timeoutSecs: 60,
+  timeoutSecs: 600,
   templateUrl: "",
   templateBody: "",
   templateResponsePath: "",

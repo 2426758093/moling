@@ -105,14 +105,22 @@ fn is_retryable(err: &AdapterError) -> bool {
     matches!(err, AdapterError::Network { .. })
 }
 
-/// 超时提示：上游可能已生成并计费，引导用户先确认再重试
+/// 超时提示：上游可能已生成并计费，引导用户先确认再重试。
+/// 等待响应头超时多半是出图本身慢（60s 旧默认尤其常见），额外交代可调高超时；
+/// 响应体停滞则与生成时长无关，只保留计费提示。
 fn timeout_billing_hint(err: AdapterError) -> AdapterError {
     match err {
-        AdapterError::Timeout { message } => AdapterError::Timeout {
-            message: format!(
-                "{message}（请求可能已在上游生成并计费，请先到画廊或服务商后台确认后再重试）"
-            ),
-        },
+        AdapterError::Timeout { message } => {
+            let hint = if message.contains("等待服务商响应超时") {
+                "图片生成常需数分钟，可在「服务商管理」中调高「超时」；\
+                 请求可能已在上游生成并计费，请先到画廊或服务商后台确认后再重试"
+            } else {
+                "请求可能已在上游生成并计费，请先到画廊或服务商后台确认后再重试"
+            };
+            AdapterError::Timeout {
+                message: format!("{message}（{hint}）"),
+            }
+        }
         other => other,
     }
 }
@@ -1245,6 +1253,15 @@ mod tests {
             message: "x".into(),
         });
         assert!(err.message().contains("可能已在上游生成并计费"));
+        // 等待响应头超时要额外给出「可调高超时」的可执行建议
+        let header_wait = timeout_billing_hint(AdapterError::Timeout {
+            message: "/images/edits 等待服务商响应超时（60s）".into(),
+        });
+        assert!(
+            header_wait.message().contains("调高「超时」"),
+            "{header_wait:?}"
+        );
+        assert!(header_wait.message().contains("可能已在上游生成并计费"));
         let other = timeout_billing_hint(AdapterError::Other {
             message: "y".into(),
         });

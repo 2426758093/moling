@@ -340,6 +340,10 @@ fn append_chunk(out: &mut Vec<u8>, chunk: &[u8], max: usize) -> Result<(), Adapt
     Ok(())
 }
 
+/// 远程图片下载等待响应头的上限：与生成长请求无关，沿用旧的 60s 默认。
+/// 响应体另由 `read_body_with_idle` 按空闲 / 总时长约束。
+const DOWNLOAD_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// 下载远程图片并做安全校验（F-011）：状态码、体积上限、魔数。
 ///
 /// 不复用 `classify_http`：这里的 401/403 只表示图片链接不可访问，
@@ -352,7 +356,7 @@ pub(crate) async fn download_image_bytes(
     let request = http::image_client()
         .map_err(|e| AdapterError::Other { message: e })?
         .get(parsed);
-    let resp = send_with_timeout(request, timeout, "下载图片").await?;
+    let resp = send_with_timeout(request, timeout.min(DOWNLOAD_HEADER_TIMEOUT), "下载图片").await?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = read_error_text(resp).await;
@@ -596,9 +600,13 @@ pub(crate) async fn send_with_timeout(
     match tokio::time::timeout(timeout, request.send()).await {
         Ok(Ok(resp)) => Ok(resp),
         Ok(Err(e)) => Err(classify_reqwest(&e)),
-        Err(_) => Err(AdapterError::Timeout {
-            message: format!("{api} 等待服务商响应超时（{}s）", timeout.as_secs()),
-        }),
+        Err(_) => {
+            let message = format!("{api} 等待服务商响应超时（{}s）", timeout.as_secs());
+            // 这里必须落日志：超时不进重试、也不一定有 body 错误日志，
+            // 否则诊断包里完全看不到这条请求（用户只看到 UI 报错）。
+            tracing::warn!("{}", message);
+            Err(AdapterError::Timeout { message })
+        }
     }
 }
 

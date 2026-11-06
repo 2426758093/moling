@@ -543,6 +543,66 @@ fn slow_body_is_not_cut_by_header_timeout() {
     assert_eq!(parsed["data"][0], "ok");
 }
 
+/// 起一个只在 `delay` 之后才回响应头的端点：模拟生成完成后才返回的图片接口。
+fn serve_delayed_headers(delay: Duration, body: Vec<u8>) -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            match stream.read(&mut buf).unwrap_or(0) {
+                0 => break,
+                n => request.extend_from_slice(&buf[..n]),
+            }
+        }
+        std::thread::sleep(delay);
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(resp.as_bytes());
+        let _ = stream.write_all(&body);
+        let _ = stream.flush();
+    });
+    port
+}
+
+/// 等待响应头超时要报出接口与上限，便于从 UI / 诊断日志直接定位是哪条请求。
+#[test]
+fn header_wait_timeout_reports_api_and_limit() {
+    use crate::adapters::http::{build_client, ProxyConfig, MODE_DIRECT};
+    use crate::adapters::send_with_timeout;
+
+    let port = serve_delayed_headers(Duration::from_secs(3), b"{}".to_vec());
+    let client = build_client(
+        &ProxyConfig {
+            mode: MODE_DIRECT.into(),
+            ..Default::default()
+        },
+        "",
+    )
+    .unwrap();
+
+    let err = block_on(async {
+        send_with_timeout(
+            client.get(format!("http://127.0.0.1:{port}/x")),
+            Duration::from_secs(1),
+            "/images/edits",
+        )
+        .await
+        .unwrap_err()
+    });
+
+    let AdapterError::Timeout { message } = err else {
+        panic!("应报等待响应头超时，实际: {err:?}");
+    };
+    assert!(message.contains("/images/edits"), "{message}");
+    assert!(message.contains("1s"), "{message}");
+}
+
 /// 运行时超时值的兜底：0 不能变成立即超时，总时长不得小于空闲。
 #[test]
 fn body_timeout_values_are_clamped() {

@@ -294,6 +294,12 @@ impl OpenAiAdapter {
         std::time::Duration::from_secs(config.timeout_secs)
     }
 
+    /// 非生成端点的等待上限：默认超时已按图片生成放大到 600s，
+    /// 但拉取模型列表不应把设置页卡住十分钟。取用户配置与旧默认 60s 的较小值。
+    fn aux_timeout(config: &ProviderConfig) -> std::time::Duration {
+        Self::timeout(config).min(std::time::Duration::from_secs(60))
+    }
+
     /// 发送 /images/edits 表单；字段名可切换（image[] / image）
     async fn send_edits(
         config: &ProviderConfig,
@@ -452,7 +458,7 @@ impl ImageAdapter for OpenAiAdapter {
         Box::pin(async move {
             let resp = http_client()?
                 .get(format!("{}/models", Self::base(config)))
-                .timeout(Self::timeout(config))
+                .timeout(Self::aux_timeout(config))
                 .bearer_auth(&config.api_key)
                 .send()
                 .await

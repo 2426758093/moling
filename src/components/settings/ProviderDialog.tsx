@@ -543,8 +543,11 @@ export default function ProviderDialog({
           <Input
             label="超时（秒）"
             type="number"
+            min={5}
+            max={1800}
             value={form.timeoutSecs}
             onChange={(e) => patch({ timeoutSecs: Number(e.target.value) })}
+            hint="等待服务商返回响应的上限。图片生成（高画质 / 多参考图）常需 1–5 分钟，建议不低于 300 秒；客户端提前断开时上游可能仍在生成并计费"
           />
           {form.kind === "openai" && (
             <Textarea

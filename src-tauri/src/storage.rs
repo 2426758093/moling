@@ -363,6 +363,13 @@ const JOBS_HEARTBEAT_SQL: &str = "
         ALTER TABLE jobs ADD COLUMN heartbeat_at TEXT;
 ";
 
+/// 迁移 012：把旧版 60s 默认超时抬到 600s。60 是建表默认值，也是旧版前端新建
+/// 服务商时写入的值；图片接口在 60s 内经常还没返回响应头（生成未完成），
+/// 客户端先断开后上游仍会跑完并计费。用户显式设置成其它值的行保持不动。
+const PROVIDER_TIMEOUT_DEFAULT_SQL: &str = "
+        UPDATE providers SET timeout_secs = 600 WHERE timeout_secs = 60;
+";
+
 /// 迁移 010：画布工作区。只存 historyId 与布局，不存 dataUrl / base64；
 /// 画布引用本机 history，不参与配置备份。
 const CANVAS_SQL: &str = "
@@ -389,6 +396,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("009_prompt_assets", PROMPT_ASSETS_SQL),
     ("010_canvas", CANVAS_SQL),
     ("011_jobs_heartbeat", JOBS_HEARTBEAT_SQL),
+    ("012_provider_timeout_default", PROVIDER_TIMEOUT_DEFAULT_SQL),
 ];
 
 /// 当前 schema 版本 = 迁移条数
@@ -688,7 +696,11 @@ fn row_to_provider(row: &rusqlite::Row) -> rusqlite::Result<ProviderRow> {
 
 /// 服务商请求超时的合法区间（秒）：过小会截断正常出图，过大则像卡死
 pub const MIN_PROVIDER_TIMEOUT_SECS: u64 = 5;
-pub const MAX_PROVIDER_TIMEOUT_SECS: u64 = 600;
+pub const MAX_PROVIDER_TIMEOUT_SECS: u64 = 1800;
+/// 默认等待上限：与 OpenAI 官方 SDK 的 600s 默认一致。
+/// 图片接口是同步长请求（gpt-image 类模型实测中位约 195s、p95 约 280s），
+/// 旧的 60s 默认会在上游正常出图前掐断连接，而断开后上游仍会跑完并计费。
+pub const DEFAULT_PROVIDER_TIMEOUT_SECS: u64 = 600;
 
 /// 超时越界值静默夹到合法区间，避免 0s 必超时 / 10 万秒像卡死
 pub fn clamp_provider_timeout(secs: u64) -> u64 {
@@ -703,7 +715,7 @@ pub fn clamp_provider_timeout(secs: u64) -> u64 {
 pub fn save_provider(id: Option<i64>, draft: &ProviderDraft) -> AppResult<ProviderRow> {
     const MAX_CAS_ATTEMPTS: usize = 3;
     let empty_enc = encrypt_secret("")?;
-    // D10：超时只接受 5–600 秒，越界值静默夹住，避免 0s 必超时 / 10 万秒像卡死
+    // D10：超时只接受 5–1800 秒，越界值静默夹住，避免 0s 必超时 / 10 万秒像卡死
     let timeout_secs = clamp_provider_timeout(draft.timeout_secs);
     for attempt in 1..=MAX_CAS_ATTEMPTS {
         // 短锁只读：换 Key 时需要旧密文才能保留整组列表，解密放到锁外
@@ -1922,7 +1934,9 @@ fn import_config_in_prepared(
                 get("kind"),
                 get("modelsJson"),
                 get("defaultModel"),
-                p.get("timeoutSecs").and_then(|v| v.as_u64()).unwrap_or(60) as i64,
+                p.get("timeoutSecs")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(DEFAULT_PROVIDER_TIMEOUT_SECS) as i64,
                 get("templateUrl"),
                 get("templateBody"),
                 get("templateResponsePath"),
@@ -3572,12 +3586,51 @@ mod tests {
     }
 
     #[test]
-    fn provider_timeout_clamped_to_5_600() {
+    fn provider_timeout_clamped_to_5_1800() {
         assert_eq!(clamp_provider_timeout(0), 5);
         assert_eq!(clamp_provider_timeout(4), 5);
+        // 60 仍是合法取值：迁移只抬旧默认，用户显式保留的短超时不强行改
         assert_eq!(clamp_provider_timeout(60), 60);
         assert_eq!(clamp_provider_timeout(600), 600);
-        assert_eq!(clamp_provider_timeout(100_000), 600);
+        assert_eq!(clamp_provider_timeout(1800), 1800);
+        assert_eq!(clamp_provider_timeout(100_000), 1800);
+    }
+
+    /// 迁移 012：旧版默认 60s 的行抬到 600s，用户显式设置的其他值不动
+    #[test]
+    fn migration_012_lifts_legacy_provider_timeout() {
+        let mut c = Connection::open_in_memory().unwrap();
+        apply_migrations_with(&mut c, &MIGRATIONS[..11]).unwrap();
+        for (name, secs) in [("旧默认", 60), ("自定义", 120)] {
+            c.execute(
+                "INSERT INTO providers (name, base_url, api_key_enc, timeout_secs)
+                 VALUES (?1, '', '', ?2)",
+                params![name, secs],
+            )
+            .unwrap();
+        }
+
+        apply_migrations(&mut c).unwrap();
+        assert_eq!(user_version_of(&c), MIGRATIONS.len() as i64);
+        fn timeout_of(c: &Connection, name: &str) -> i64 {
+            c.query_row(
+                "SELECT timeout_secs FROM providers WHERE name = ?1",
+                params![name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        }
+        assert_eq!(timeout_of(&c, "旧默认"), 600);
+        assert_eq!(timeout_of(&c, "自定义"), 120);
+
+        // 幂等：重复执行不会把用户后来改回 60 的值再次抬走
+        c.execute(
+            "UPDATE providers SET timeout_secs = 60 WHERE name = '自定义'",
+            [],
+        )
+        .unwrap();
+        apply_migrations(&mut c).unwrap();
+        assert_eq!(timeout_of(&c, "自定义"), 60);
     }
 
     #[test]
