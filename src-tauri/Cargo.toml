@@ -1,6 +1,6 @@
 [package]
 name = "moling"
-version = "1.2.5"
+version = "1.2.6"
 description = "MoLing - AI drawing client for any API"
 authors = ["MoLing Contributors"]
 edition = "2021"
@@ -62,8 +62,10 @@ reqwest013 = { package = "reqwest", version = "0.13", default-features = false }
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
-codegen-units = 1
-lto = true
+# 发版速度 vs 包体：thin LTO + 多 codegen-unit 让链接不再单线程，
+# 2 核 runner 上构建时间接近减半，代价是安装包略大（strip / abort 仍保留）。
+codegen-units = 16
+lto = "thin"
 opt-level = 3
 panic = "abort"
 strip = true
