@@ -302,14 +302,11 @@ impl OpenAiAdapter {
         field: &str,
     ) -> Result<reqwest::Response, AdapterError> {
         let form = build_edit_form(body, images, field)?;
-        http_client()?
+        let request = http_client()?
             .post(format!("{}/images/edits", Self::base(config)))
-            .timeout(Self::timeout(config))
             .bearer_auth(&config.api_key)
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|e| classify_reqwest(&e))
+            .multipart(form);
+        super::send_with_timeout(request, Self::timeout(config), "/images/edits").await
     }
 
     /// 构造并发送 /images/edits 请求（编辑与变换共用同一端点）。
@@ -347,18 +344,16 @@ impl OpenAiAdapter {
                     })?,
             );
         }
-        let resp = http_client()?
+        let request = http_client()?
             .post(format!("{}/images/edits", Self::base(config)))
-            .timeout(Self::timeout(config))
             .bearer_auth(&config.api_key)
-            .multipart(form)
-            .send()
-            .await
-            .map_err(|e| classify_reqwest(&e))?;
+            .multipart(form);
+        let resp =
+            super::send_with_timeout(request, Self::timeout(config), "/images/edits").await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let retry_after = retry_after_secs(&resp);
-            let text = resp.text().await.unwrap_or_default();
+            let text = super::read_error_text(resp).await;
             let extra: &[&str] = if has_mask {
                 &["image", "mask"]
             } else {
@@ -505,14 +500,13 @@ impl ImageAdapter for OpenAiAdapter {
             }
             let (resp, endpoint, edit_field) = if req.images.is_empty() {
                 // 纯文生图：JSON 请求 /images/generations
-                let resp = http_client()?
+                let request = http_client()?
                     .post(format!("{}/images/generations", Self::base(config)))
-                    .timeout(Self::timeout(config))
                     .bearer_auth(&config.api_key)
-                    .json(&body)
-                    .send()
-                    .await
-                    .map_err(|e| classify_reqwest(&e))?;
+                    .json(&body);
+                let resp =
+                    super::send_with_timeout(request, Self::timeout(config), "/images/generations")
+                        .await?;
                 (resp, "/images/generations", None)
             } else {
                 // 参考图（图生图/编辑）：gpt-image 规范走 multipart /images/edits；
@@ -534,7 +528,7 @@ impl ImageAdapter for OpenAiAdapter {
                 // A7：部分中转只认单数 image 字段；400 不计费，允许回退一次
                 if resp.status() == reqwest::StatusCode::BAD_REQUEST && prepared.len() == 1 {
                     let status = resp.status();
-                    let text = resp.text().await.unwrap_or_default();
+                    let text = super::read_error_text(resp).await;
                     if suggests_singular_image_field(&text) {
                         tracing::warn!("服务商要求单数 image 字段，回退重试一次");
                         field = "image";
@@ -548,7 +542,7 @@ impl ImageAdapter for OpenAiAdapter {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let retry_after = retry_after_secs(&resp);
-                let text = resp.text().await.unwrap_or_default();
+                let text = super::read_error_text(resp).await;
                 return Err(match edit_field {
                     Some(field) => {
                         edit_error(status, &text, &req.model, &body, &[field], retry_after)

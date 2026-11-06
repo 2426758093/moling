@@ -8,7 +8,7 @@ mod tests;
 
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// provider kind 常量（serde/DB 中的字符串值冻结：mock/template/openai）
 pub const KIND_MOCK: &str = "mock";
@@ -332,7 +332,7 @@ pub(crate) fn safe_redirect_policy() -> reqwest::redirect::Policy {
 fn append_chunk(out: &mut Vec<u8>, chunk: &[u8], max: usize) -> Result<(), AdapterError> {
     if out.len() + chunk.len() > max {
         return Err(AdapterError::Other {
-            message: format!("图片体积超过上限 {} MB", max / 1024 / 1024),
+            message: format!("响应体超过上限 {} MB", max / 1024 / 1024),
         });
     }
     out.extend_from_slice(chunk);
@@ -348,16 +348,13 @@ pub(crate) async fn download_image_bytes(
     timeout: Duration,
 ) -> Result<Vec<u8>, AdapterError> {
     let parsed = validate_remote_url(url)?;
-    let mut resp = http::image_client()
+    let request = http::image_client()
         .map_err(|e| AdapterError::Other { message: e })?
-        .get(parsed)
-        .timeout(timeout)
-        .send()
-        .await
-        .map_err(|e| classify_reqwest(&e))?;
+        .get(parsed);
+    let resp = send_with_timeout(request, timeout, "下载图片").await?;
     if !resp.status().is_success() {
         let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
+        let text = read_error_text(resp).await;
         let truncated: String = crate::redact::redact_secrets(&text)
             .chars()
             .take(ERROR_BODY_TRUNCATE_LEN)
@@ -377,11 +374,14 @@ pub(crate) async fn download_image_bytes(
             ),
         });
     }
-    // 流式累加：没有 Content-Length 的超大响应也会在超过上限时立即中止
-    let mut bytes = Vec::new();
-    while let Some(chunk) = resp.chunk().await.map_err(|e| classify_reqwest(&e))? {
-        append_chunk(&mut bytes, &chunk, MAX_REMOTE_IMAGE_BYTES)?;
-    }
+    let bytes = read_body_with_idle(
+        resp,
+        "下载图片",
+        BODY_IDLE_TIMEOUT,
+        BODY_TOTAL_TIMEOUT,
+        MAX_REMOTE_IMAGE_BYTES,
+    )
+    .await?;
     validate_downloaded_image(&bytes, MAX_REMOTE_IMAGE_BYTES)?;
     Ok(bytes)
 }
@@ -521,6 +521,131 @@ const JSON_PREVIEW_CHARS: usize = 300;
 /// 解压后允许的最大字节数：防止被构造成压缩炸弹的响应撑爆内存
 const MAX_DECODED_BODY_BYTES: u64 = 64 * 1024 * 1024;
 
+/// 响应体空闲超时：连续这么久没有收到新数据才判定失败。
+/// 不能与「等待生成」的服务商超时共用：图片接口常返回 3–4MB base64，
+/// 慢链路上生成 40s + 下载 25s，总截止时间会把 HTTP 200 的响应体截断。
+const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// 响应体总时长硬上限，避免持续滴流的异常链路长期占用生成槽位。
+const BODY_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
+/// 未解压响应体上限（解压后另有 `MAX_DECODED_BODY_BYTES`）。
+const MAX_RAW_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// 发送请求：服务商超时只约束「等到响应头」，不覆盖响应体下载。
+///
+/// reqwest 的 `RequestBuilder::timeout` 是整次请求的总截止时间（含读完 body）。
+/// 图片接口的 base64 body 很大，若与生成时间共用同一个截止时间，会出现
+/// 「HTTP 200 已收到、读到一半 operation timed out」并已被上游计费的情况。
+pub(crate) async fn send_with_timeout(
+    request: reqwest::RequestBuilder,
+    timeout: Duration,
+    api: &str,
+) -> Result<reqwest::Response, AdapterError> {
+    match tokio::time::timeout(timeout, request.send()).await {
+        Ok(Ok(resp)) => Ok(resp),
+        Ok(Err(e)) => Err(classify_reqwest(&e)),
+        Err(_) => Err(AdapterError::Timeout {
+            message: format!("{api} 等待服务商响应超时（{}s）", timeout.as_secs()),
+        }),
+    }
+}
+
+/// 读取错误响应体：错误体很小，用固定短上限，避免无超时的 `resp.text()` 永久挂起。
+pub(crate) async fn read_error_text(resp: reqwest::Response) -> String {
+    match tokio::time::timeout(Duration::from_secs(30), resp.text()).await {
+        Ok(Ok(text)) => text,
+        _ => String::new(),
+    }
+}
+
+/// 按「空闲超时 + 总时长上限 + 体积上限」读取响应体。
+async fn read_body_with_idle(
+    mut resp: reqwest::Response,
+    api: &str,
+    idle: Duration,
+    total: Duration,
+    max: usize,
+) -> Result<Vec<u8>, AdapterError> {
+    let status = resp.status().as_u16();
+    let content_type = header_value(&resp, reqwest::header::CONTENT_TYPE);
+    let content_encoding = header_value(&resp, reqwest::header::CONTENT_ENCODING);
+    let content_length = header_value(&resp, reqwest::header::CONTENT_LENGTH);
+    let expected = resp.content_length().unwrap_or(0);
+    let started = Instant::now();
+    let mut bytes = Vec::with_capacity((expected as usize).min(8 * 1024 * 1024));
+
+    loop {
+        let elapsed = started.elapsed();
+        if elapsed >= total {
+            return Err(body_timeout(
+                api,
+                &format!("超过 {}s 总上限", total.as_secs()),
+                bytes.len(),
+                expected,
+                elapsed,
+                &response_meta(status, &content_type, &content_encoding, &content_length),
+            ));
+        }
+        let wait = idle.min(total - elapsed);
+        match tokio::time::timeout(wait, resp.chunk()).await {
+            Ok(Ok(Some(chunk))) => {
+                append_chunk(&mut bytes, &chunk, max)?;
+            }
+            Ok(Ok(None)) => break,
+            Ok(Err(e)) => {
+                let message = crate::redact::redact_secrets(&format!(
+                    "{api} 读取响应失败（{}，耗时 {:.1}s）: {}",
+                    response_meta(status, &content_type, &content_encoding, &content_length),
+                    started.elapsed().as_secs_f64(),
+                    reqwest_error_chain(&e),
+                ));
+                tracing::warn!("{}", message);
+                return Err(if e.is_timeout() {
+                    AdapterError::Timeout { message }
+                } else {
+                    AdapterError::Other { message }
+                });
+            }
+            Err(_) => {
+                let reason = if wait < idle {
+                    format!("超过 {}s 总上限", total.as_secs())
+                } else {
+                    format!("{}s 内未收到新数据", idle.as_secs())
+                };
+                return Err(body_timeout(
+                    api,
+                    &reason,
+                    bytes.len(),
+                    expected,
+                    started.elapsed(),
+                    &response_meta(status, &content_type, &content_encoding, &content_length),
+                ));
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+fn body_timeout(
+    api: &str,
+    reason: &str,
+    received: usize,
+    expected: u64,
+    elapsed: Duration,
+    meta: &str,
+) -> AdapterError {
+    let total = if expected > 0 {
+        expected.to_string()
+    } else {
+        "未知".to_string()
+    };
+    let message = format!(
+        "{api} 读取响应超时（{reason}，已接收 {received} / {total} 字节，耗时 {:.1}s）：{meta}",
+        elapsed.as_secs_f64()
+    );
+    tracing::warn!("{}", message);
+    AdapterError::Timeout { message }
+}
+
 /// 读取成功响应并按 JSON 解析。
 ///
 /// 不用 `Response::json()`，也不交给 reqwest 自动解压：链路（安全软件 / 透明代理 /
@@ -533,26 +658,14 @@ pub async fn parse_json_body<T: serde::de::DeserializeOwned>(
     let status = resp.status().as_u16();
     let content_type = header_value(&resp, reqwest::header::CONTENT_TYPE);
     let content_encoding = header_value(&resp, reqwest::header::CONTENT_ENCODING);
-    let content_length = header_value(&resp, reqwest::header::CONTENT_LENGTH);
-    let started = std::time::Instant::now();
-    let bytes = match resp.bytes().await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            // 读流失败原先只透出 "error decoding response body"，状态码 / 编码 / 耗时全丢失
-            let message = crate::redact::redact_secrets(&format!(
-                "{api} 读取响应失败（{}，耗时 {:.1}s）: {}",
-                response_meta(status, &content_type, &content_encoding, &content_length),
-                started.elapsed().as_secs_f64(),
-                reqwest_error_chain(&e),
-            ));
-            tracing::warn!("{}", message);
-            return Err(if e.is_timeout() {
-                AdapterError::Timeout { message }
-            } else {
-                AdapterError::Other { message }
-            });
-        }
-    };
+    let bytes = read_body_with_idle(
+        resp,
+        api,
+        BODY_IDLE_TIMEOUT,
+        BODY_TOTAL_TIMEOUT,
+        MAX_RAW_BODY_BYTES,
+    )
+    .await?;
     parse_json_bytes(api, status, &content_type, &content_encoding, &bytes)
 }
 
@@ -817,7 +930,11 @@ mod download_tests {
         let mut out = Vec::new();
         append_chunk(&mut out, &[0u8; 6], 10).unwrap();
         let err = append_chunk(&mut out, &[0u8; 6], 10).unwrap_err();
-        assert!(err.message().contains("体积超过上限"), "{}", err.message());
+        assert!(
+            err.message().contains("响应体超过上限"),
+            "{}",
+            err.message()
+        );
         assert_eq!(out.len(), 6, "超限分块不应被写入");
     }
 }

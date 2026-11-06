@@ -1,6 +1,7 @@
 use super::{
-    classify_http, classify_reqwest, download_image_bytes, http_client, parse_json_body,
-    AdapterError, EditRequest, GenerateRequest, ImageAdapter, ProviderConfig, TransformRequest,
+    classify_http, download_image_bytes, http_client, parse_json_body, read_error_text,
+    send_with_timeout, AdapterError, EditRequest, GenerateRequest, ImageAdapter, ProviderConfig,
+    TransformRequest,
 };
 use base64::Engine;
 
@@ -290,21 +291,22 @@ impl TemplateAdapter {
         body: &str,
         response_path: &str,
     ) -> Result<Vec<String>, AdapterError> {
-        let mut request = http_client()?
-            .post(url)
-            .timeout(std::time::Duration::from_secs(config.timeout_secs));
+        let mut request = http_client()?.post(url);
         if !config.api_key.is_empty() {
             request = request.bearer_auth(&config.api_key);
         }
-        let resp = request
+        let request = request
             .header("Content-Type", "application/json")
-            .body(body.to_string())
-            .send()
-            .await
-            .map_err(|e| classify_reqwest(&e))?;
+            .body(body.to_string());
+        let resp = send_with_timeout(
+            request,
+            std::time::Duration::from_secs(config.timeout_secs),
+            "模板请求",
+        )
+        .await?;
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            let text = read_error_text(resp).await;
             return Err(classify_http(status, &text));
         }
         // 与内置适配器同一条解析路径：关闭自动解压后仍能兜底处理压缩响应。

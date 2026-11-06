@@ -1,5 +1,6 @@
 use crate::adapters::{get_adapter, AdapterError, GenerateRequest, ProviderConfig};
 use base64::Engine;
+use std::time::Duration;
 
 fn mock_config() -> ProviderConfig {
     ProviderConfig {
@@ -387,4 +388,129 @@ fn parse_json_body_tolerates_content_encoding_mismatch() {
         });
         assert_eq!(parsed["data"][0], "ok", "{name}");
     }
+}
+
+/// 起一个只服务一次的端点：先发响应头和 `head`，等待 `gap` 后再发 `rest`。
+fn serve_paced(
+    headers: Vec<(&'static str, &'static str)>,
+    head: Vec<u8>,
+    rest: Vec<u8>,
+    gap: Duration,
+) -> u16 {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        let mut buf = [0u8; 1024];
+        while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+            match stream.read(&mut buf).unwrap_or(0) {
+                0 => break,
+                n => request.extend_from_slice(&buf[..n]),
+            }
+        }
+        let mut resp = String::from("HTTP/1.1 200 OK\r\n");
+        for (name, value) in headers {
+            resp.push_str(&format!("{name}: {value}\r\n"));
+        }
+        resp.push_str(&format!(
+            "Content-Length: {}\r\nConnection: close\r\n\r\n",
+            head.len() + rest.len()
+        ));
+        stream.write_all(resp.as_bytes()).unwrap();
+        stream.write_all(&head).unwrap();
+        stream.flush().unwrap();
+        std::thread::sleep(gap);
+        let _ = stream.write_all(&rest);
+        let _ = stream.flush();
+    });
+    port
+}
+
+/// base64 大响应在慢链路上读几十秒是常态：等响应头的超时不能顺延成读 body 的总截止时间。
+/// 旧实现给整次请求设 `.timeout(60s)`，body 晚于该截止时间到达即报 operation timed out。
+#[test]
+fn slow_body_is_not_cut_by_header_timeout() {
+    use crate::adapters::http::{build_client, ProxyConfig, MODE_DIRECT};
+    use crate::adapters::{parse_json_body, send_with_timeout};
+
+    let body = br#"{"data":["ok"]}"#.to_vec();
+    let port = serve_paced(
+        vec![("Content-Type", "application/json")],
+        Vec::new(),
+        body,
+        Duration::from_millis(1500),
+    );
+    let client = build_client(
+        &ProxyConfig {
+            mode: MODE_DIRECT.into(),
+            ..Default::default()
+        },
+        "",
+    )
+    .unwrap();
+
+    let parsed: serde_json::Value = block_on(async {
+        let resp = send_with_timeout(
+            client.get(format!("http://127.0.0.1:{port}/x")),
+            Duration::from_secs(1),
+            "/x",
+        )
+        .await
+        .expect("响应头应立即到达");
+        parse_json_body(resp, "/x")
+            .await
+            .expect("body 不应继承等待响应头的超时")
+    });
+    assert_eq!(parsed["data"][0], "ok");
+}
+
+/// body 中途停滞要报「空闲超时」并带上已接收字节数，便于区分慢链路与上游中断。
+#[test]
+fn stalled_body_reports_idle_timeout() {
+    use crate::adapters::http::{build_client, ProxyConfig, MODE_DIRECT};
+    use crate::adapters::{read_body_with_idle, send_with_timeout};
+
+    let mut head = vec![b'a'; 64];
+    let rest = head.split_off(10);
+    let port = serve_paced(
+        vec![("Content-Type", "application/json")],
+        head,
+        rest,
+        Duration::from_secs(3),
+    );
+    let client = build_client(
+        &ProxyConfig {
+            mode: MODE_DIRECT.into(),
+            ..Default::default()
+        },
+        "",
+    )
+    .unwrap();
+
+    let err = block_on(async {
+        let resp = send_with_timeout(
+            client.get(format!("http://127.0.0.1:{port}/x")),
+            Duration::from_secs(5),
+            "/x",
+        )
+        .await
+        .unwrap();
+        read_body_with_idle(
+            resp,
+            "/x",
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+            1024,
+        )
+        .await
+        .unwrap_err()
+    });
+
+    let AdapterError::Timeout { message } = err else {
+        panic!("应报超时，实际: {err:?}");
+    };
+    assert!(message.contains("未收到新数据"), "{message}");
+    assert!(message.contains("已接收 10 / 64"), "{message}");
 }
