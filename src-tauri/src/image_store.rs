@@ -255,6 +255,27 @@ pub fn save_b64_image(
     save_b64_into(app, "images", b64, name)
 }
 
+/// 落盘前的短暂重试：图片已经付费生成，几百毫秒的 IO 抖动不值得丢掉结果。
+/// 仍失败时由调用方把 base64 存入请求目录，等「尝试恢复」。
+pub fn save_b64_image_with_retry(
+    app: &tauri::AppHandle,
+    b64: &str,
+    name: &str,
+) -> AppResult<(String, String)> {
+    let mut last: Option<crate::error::AppError> = None;
+    for attempt in 0..3u64 {
+        match save_b64_image(app, b64, name) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                tracing::warn!("图片落盘第 {} 次失败: {e}", attempt + 1);
+                last = Some(e);
+                std::thread::sleep(std::time::Duration::from_millis(200 * (attempt + 1)));
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| crate::error::AppError::Other("图片落盘失败".into())))
+}
+
 /// 队列参考图目录：与画廊图分开放，清理画廊不会误删排队任务的参考图
 pub fn refs_dir(app: &tauri::AppHandle) -> AppResult<PathBuf> {
     let dir = media_root(app)?.join("refs");

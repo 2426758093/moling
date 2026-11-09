@@ -17,6 +17,7 @@ import { useScrollEdge } from "../hooks/useScrollEdge";
 import PageHeader from "./PageHeader";
 import SafeImg from "./SafeImg";
 import { Button } from "./ui/Button";
+import { ConfirmDialog } from "./ui/Dialog";
 import { Select } from "./ui/Select";
 import { IconButton } from "./ui/IconButton";
 import { Badge } from "./ui/Badge";
@@ -70,11 +71,16 @@ const STATUS_META = {
 
 const RETRYABLE: QueueStatus[] = ["failed", "canceled", "interrupted"];
 
+/// 可能已计费：默认禁止重跑，必须用户确认后带 force 重试
+const UNCONFIRMED_STATES = new Set(["unknown", "billed_unrecovered"]);
+const isBillingUnconfirmed = (job: QueueJob) =>
+  UNCONFIRMED_STATES.has(job.billingState ?? "");
+
 /// 并发档位只存数字，文案在渲染时插值，避免中文字面量与变量拼接
 const CONCURRENCY_VALUES = [1, 2, 3, 4];
 const PROVIDER_CONCURRENCY_VALUES = [1, 2];
 
-type Filter = "all" | "pending" | "done" | "issue";
+type Filter = "all" | "pending" | "done" | "issue" | "unconfirmed";
 
 /// 任务操作失败提示：渲染时把错误文本插值进去，不拼接中文字面量
 type FailKey = "取消失败：{{error}}" | "重试失败：{{error}}";
@@ -84,6 +90,7 @@ const FILTERS = [
   { id: "pending", label: "待处理" },
   { id: "done", label: "已完成" },
   { id: "issue", label: "异常" },
+  { id: "unconfirmed", label: "待确认" },
 ] as const satisfies readonly { id: Filter; label: string }[];
 
 function matchesFilter(job: QueueJob, filter: Filter) {
@@ -94,6 +101,8 @@ function matchesFilter(job: QueueJob, filter: Filter) {
       return job.status === "done";
     case "issue":
       return RETRYABLE.includes(job.status);
+    case "unconfirmed":
+      return isBillingUnconfirmed(job);
     default:
       return true;
   }
@@ -178,8 +187,10 @@ function JobRow({ job }: { job: QueueJob }) {
   const meta = STATUS_META[job.status] ?? STATUS_META.queued;
   const active = job.status === "running";
   const error = job.error ? parseAdapterError(job.error) : null;
+  const billingUnconfirmed = isBillingUnconfirmed(job);
   const [open, setOpen] = useState(active);
   const [errorOpen, setErrorOpen] = useState(false);
+  const [confirmRetry, setConfirmRetry] = useState(false);
   const motionTokens = useMotionTokens();
 
   // 429 退避倒计时：常驻秒表，退避结束时最多延迟 1 秒归零
@@ -192,6 +203,11 @@ function JobRow({ job }: { job: QueueJob }) {
 
   const run = (action: Promise<void>, failKey: FailKey) =>
     action.catch((e) => toast(t(failKey, { error: String(e) }), "error"));
+
+  const requestRetry = () => {
+    if (billingUnconfirmed) setConfirmRetry(true);
+    else run(retry(job.id), "重试失败：{{error}}");
+  };
 
   const copy = (text: string, label: string) => {
     void navigator.clipboard
@@ -231,6 +247,9 @@ function JobRow({ job }: { job: QueueJob }) {
           <span className="min-w-0 flex-1 truncate text-callout text-primary">
             {job.prompt}
           </span>
+          {billingUnconfirmed && (
+            <Badge tone="warning">{t("待确认")}</Badge>
+          )}
           {backoffLeft > 0 && (
             <Badge tone="warning">{t("限流 {{n}}s", { n: backoffLeft })}</Badge>
           )}
@@ -259,7 +278,7 @@ function JobRow({ job }: { job: QueueJob }) {
             label={t("重试任务")}
             size="sm"
             icon={<IconRotate size={13} />}
-            onClick={() => run(retry(job.id), "重试失败：{{error}}")}
+            onClick={requestRetry}
           />
         )}
       </div>
@@ -321,7 +340,10 @@ function JobRow({ job }: { job: QueueJob }) {
             </div>
           )}
 
-          {error && job.status === "failed" && (
+          {error &&
+            (job.status === "failed" ||
+              job.status === "canceled" ||
+              job.status === "interrupted") && (
             <div className="mt-2.5">
               <button
                 type="button"
@@ -358,6 +380,17 @@ function JobRow({ job }: { job: QueueJob }) {
           )}
         </div>
       )}
+      <ConfirmDialog
+        open={confirmRetry}
+        onOpenChange={setConfirmRetry}
+        title={t("确认重试这个任务？")}
+        description={t(
+          "该任务上次可能已被服务商受理并计费。重试会再次扣费，请先到服务商后台确认没有出图。",
+        )}
+        confirmLabel={t("仍然重试")}
+        danger
+        onConfirm={() => run(retry(job.id, true), "重试失败：{{error}}")}
+      />
     </motion.li>
   );
 }
@@ -392,11 +425,13 @@ export default function QueueView() {
       pending: 0,
       done: 0,
       issue: 0,
+      unconfirmed: 0,
     };
     for (const job of jobs) {
       if (matchesFilter(job, "pending")) result.pending += 1;
       if (matchesFilter(job, "done")) result.done += 1;
       if (matchesFilter(job, "issue")) result.issue += 1;
+      if (matchesFilter(job, "unconfirmed")) result.unconfirmed += 1;
     }
     return result;
   }, [jobs]);
@@ -411,7 +446,11 @@ export default function QueueView() {
   }));
 
   const finished = counts.done + counts.issue;
-  const interrupted = jobs.filter((j) => j.status === "interrupted").length;
+  // 「恢复中断」只恢复确定未计费的任务；待确认的必须逐条核对后再决定
+  const interrupted = jobs.filter(
+    (j) => j.status === "interrupted" && !isBillingUnconfirmed(j),
+  ).length;
+  const pendingBilling = counts.unconfirmed;
   const visible = useMemo(
     () => jobs.filter((job) => matchesFilter(job, filter)),
     [jobs, filter],
@@ -460,6 +499,15 @@ export default function QueueView() {
                 label={t("每服务商并发数")}
               />
             </div>
+            {pendingBilling > 0 && (
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => setFilter("unconfirmed")}
+              >
+                {t("待确认 {{n}}", { n: pendingBilling })}
+              </Button>
+            )}
             {interrupted > 0 && (
               <Button
                 size="sm"

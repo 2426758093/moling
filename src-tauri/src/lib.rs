@@ -1,6 +1,7 @@
 mod adapters;
 mod background;
 mod basic_edit;
+mod billing_journal;
 mod commands;
 mod error;
 mod image_gc;
@@ -105,6 +106,10 @@ pub fn run() {
                 Ok(n) => tracing::warn!("已将 {n} 个中断的队列任务标记为 interrupted"),
                 Err(e) => tracing::warn!("标记中断队列任务失败: {e}"),
             }
+            // 计费流水：原始响应落盘目录 + 启动恢复（在途请求一律转「结果未确认」，
+            // 绝不自动重发；只做本地解析，不联网）
+            billing_journal::init_requests_dir(data_dir.join("requests"));
+            billing_journal::recover_on_startup();
             let queue_state = std::sync::Arc::new(commands::QueueState::default());
             app.manage(queue_state.clone());
             commands::spawn_worker(app.handle().clone(), queue_state);
@@ -160,6 +165,11 @@ pub fn run() {
             commands::set_setting,
             commands::get_setting,
             commands::get_app_data_dir,
+            commands::list_image_requests,
+            commands::recover_image_request,
+            commands::recover_image_request_by_client,
+            commands::abandon_image_request,
+            commands::get_requests_dir,
             commands::export_config,
             commands::import_config,
             commands::get_logs_dir,

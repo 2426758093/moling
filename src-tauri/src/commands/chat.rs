@@ -21,6 +21,11 @@ pub struct AddMessageInput {
     pub params_json: Option<String>,
     #[serde(default)]
     pub created_at: Option<String>,
+    /// done | failed | unconfirmed；缺省 done，兼容旧前端
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 impl AddMessageInput {
@@ -38,6 +43,11 @@ impl AddMessageInput {
                 .created_at
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(storage::timestamp_millis),
+            status: self
+                .status
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "done".into()),
+            error: self.error,
         }
     }
 }

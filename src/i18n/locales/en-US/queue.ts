@@ -33,6 +33,8 @@ const queue = {
   全部: "All",
   待处理: "Pending",
   异常: "Issues",
+  待确认: "Unconfirmed",
+  "待确认 {{n}}": "Unconfirmed {{n}}",
 
   // JobRow
   "任务 #{{id}} 详情": "Job #{{id}} details",
@@ -48,6 +50,10 @@ const queue = {
   复制失败: "Copy failed",
   "已落盘 {{done}} / {{total}} 张": "Saved {{done}} / {{total}} images",
   "正在请求图片…": "Requesting images…",
+  "确认重试这个任务？": "Retry this job anyway?",
+  "该任务上次可能已被服务商受理并计费。重试会再次扣费，请先到服务商后台确认没有出图。":
+    "This job may already have been accepted and billed. Retrying charges you again; confirm in your provider console that no image was produced first.",
+  仍然重试: "Retry anyway",
 
   // 失败提示
   "加载队列失败：{{error}}": "Couldn't load queue: {{error}}",

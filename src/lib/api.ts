@@ -55,12 +55,20 @@ export interface ModelCaps {
 
 export type AdapterError =
   | { type: "auth_invalid"; message: string; status?: number }
-  | { type: "quota_exceeded"; message: string }
+  | { type: "quota_exceeded"; message: string; retry_after?: number }
   | { type: "timeout"; message: string }
   | { type: "content_blocked"; message: string }
   | { type: "network"; message: string }
   | { type: "unsupported"; message: string }
+  | { type: "upstream"; message: string; status?: number }
+  | { type: "body_interrupted"; message: string }
+  | { type: "unconfirmed"; message: string; request_id?: string; artifact?: string }
   | { type: "other"; message: string };
+
+/** 可能已计费：重试前必须让用户先对账，否则会重复扣费 */
+export function isUnconfirmedError(e: AdapterError): boolean {
+  return e.type === "unconfirmed" || e.type === "upstream" || e.type === "body_interrupted";
+}
 
 export function parseAdapterError(raw: string): AdapterError {
   try {
@@ -84,6 +92,10 @@ export function adapterErrorTitle(e: AdapterError): string {
       return i18n.t("内容审核拦截");
     case "unsupported":
       return i18n.t("该服务商不支持此操作");
+    case "unconfirmed":
+    case "upstream":
+    case "body_interrupted":
+      return i18n.t("结果未确认");
     default:
       return i18n.t("请求失败");
   }
@@ -138,8 +150,38 @@ export interface StorageStats {
   database: DirStat;
 }
 
-export interface MediaMigrationReport {
-  from: string;
+/** 一次 HTTP 尝试的计费流水（敏感字段 prompt/param_hash 不在 IPC 中输出） */
+export interface ImageRequestItem {
+  id: number;
+  groupId: string;
+  clientRequestId: string;
+  entry: string;
+  op: string;
+  jobId: number | null;
+  providerId: number;
+  providerName: string;
+  model: string;
+  endpoint: string;
+  attempt: number;
+  state: string;
+  httpStatus: number | null;
+  providerRequestId: string;
+  imageCount: number;
+  artifactsJson: string;
+  rawPath: string;
+  errorJson: string | null;
+  createdAt: string;
+  sentAt: string | null;
+  billedAt: string | null;
+  finishedAt: string | null;
+}
+
+export interface RecoverOutcome {
+  recovered: number;
+  failed: number;
+}
+
+export interface MediaMigrationReport {  from: string;
   to: string;
   filesCopied: number;
   bytesCopied: number;
@@ -208,6 +250,8 @@ export interface QueueJob {
   finishedAt: string | null;
   /** 扩展参数 JSON：{referencePaths, references}，空串表示无参考图 */
   inputJson: string;
+  /** 待确认计费状态：unknown / billed_unrecovered 时默认禁止重跑 */
+  billingState?: string;
 }
 
 export interface EnqueueJobInput {
@@ -580,6 +624,16 @@ export const api = {
   getLogsDir: () => invoke<string>("get_logs_dir"),
   /** 导出脱敏诊断包（近 7 天日志 + 元信息），返回 zip 绝对路径 */
   exportDiagnostics: () => invoke<string>("export_diagnostics"),
+  /** 计费请求流水：只读，用于对账与「不重新生成」的恢复 */
+  listImageRequests: (pendingOnly = false) =>
+    invoke<ImageRequestItem[]>("list_image_requests", { pendingOnly }),
+  recoverImageRequest: (id: number) =>
+    invoke<RecoverOutcome>("recover_image_request", { id }),
+  recoverImageRequestByClient: (clientRequestId: string) =>
+    invoke<RecoverOutcome>("recover_image_request_by_client", { clientRequestId }),
+  abandonImageRequest: (id: number) =>
+    invoke<void>("abandon_image_request", { id }),
+  getRequestsDir: () => invoke<string>("get_requests_dir"),
   getUpdateStatus: () => invoke<UpdateStatus>("get_update_status"),
   /** 下载更新包（自动选线路 + 多线程），完成后等待 installUpdate */
   downloadUpdate: () => invoke<void>("download_update"),
@@ -637,7 +691,8 @@ export const api = {
       providerConcurrency: number;
     }>("list_jobs"),
   cancelQueueJob: (id: number) => invoke<void>("cancel_queue_job", { id }),
-  retryQueueJob: (id: number) => invoke<void>("retry_queue_job", { id }),
+  retryQueueJob: (id: number, force = false) =>
+    invoke<void>("retry_queue_job", { id, force }),
   /** 恢复全部中断任务并启动队列，返回恢复数量 */
   requeueInterruptedJobs: () => invoke<number>("requeue_interrupted_jobs"),
   resumeQueue: () => invoke<{ paused: boolean }>("resume_queue"),
@@ -758,6 +813,10 @@ export interface ChatMessage {
   imagesJson: string;
   paramsJson: string;
   createdAt: string;
+  /** done | stopped | failed | unconfirmed；旧库缺省 done */
+  status?: string;
+  /** 失败轮的 AdapterError JSON；重启后据此恢复错误样式 */
+  error?: string | null;
 }
 
 export interface NewMessage {
@@ -768,6 +827,8 @@ export interface NewMessage {
   imagesJson: string;
   paramsJson: string;
   createdAt: string;
+  status?: string;
+  error?: string;
 }
 
 export const EMPTY_PROVIDER: ProviderInput = {

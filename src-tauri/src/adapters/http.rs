@@ -179,6 +179,8 @@ fn client_builder(cfg: &ProxyConfig, password: &str) -> Result<reqwest::ClientBu
     let mut builder = reqwest::Client::builder()
         // 连接超时与请求总超时分离：连不上要尽快失败，慢生成由请求级超时管
         .connect_timeout(std::time::Duration::from_secs(10))
+        // 生图常要等 3–5 分钟才有响应头：靠 TCP keepalive 防止代理/NAT 把空闲连接回收
+        .tcp_keepalive(std::time::Duration::from_secs(30))
         .default_headers(default_headers);
     match cfg.mode.as_str() {
         MODE_DIRECT => builder = builder.no_proxy(),

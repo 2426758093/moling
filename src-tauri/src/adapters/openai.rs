@@ -279,7 +279,7 @@ struct ImageResponse {
     data: Vec<ImageEntry>,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, Debug)]
 struct ImageEntry {
     b64_json: Option<String>,
     url: Option<String>,
@@ -300,18 +300,25 @@ impl OpenAiAdapter {
         Self::timeout(config).min(std::time::Duration::from_secs(60))
     }
 
-    /// 发送 /images/edits 表单；字段名可切换（image[] / image）
+    /// 发送 /images/edits 表单；字段名可切换（image[] / image）。
+    /// `X-Client-Request-Id` 只对 OpenAI 兼容通道发送：用于服务商后台对账，
+    /// 严格网关若不接受可在这里统一关闭。
     async fn send_edits(
         config: &ProviderConfig,
         body: &serde_json::Value,
         images: &[(Vec<u8>, &'static str, &'static str)],
         field: &str,
+        ctx: Option<&crate::billing_journal::AttemptCtx>,
     ) -> Result<reqwest::Response, AdapterError> {
         let form = build_edit_form(body, images, field)?;
-        let request = http_client()?
+        let mut request = http_client()?
             .post(format!("{}/images/edits", Self::base(config)))
             .bearer_auth(&config.api_key)
             .multipart(form);
+        if let Some(ctx) = ctx {
+            request = request.header("X-Client-Request-Id", ctx.client_request_id());
+            ctx.mark_sent();
+        }
         super::send_with_timeout(request, Self::timeout(config), "/images/edits").await
     }
 
@@ -323,6 +330,7 @@ impl OpenAiAdapter {
         image_bytes: Vec<u8>,
         mask_bytes: Option<Vec<u8>>,
         size: Option<String>,
+        ctx: Option<&crate::billing_journal::AttemptCtx>,
     ) -> Result<ImageResponse, AdapterError> {
         let mut body = serde_json::json!({ "model": model, "prompt": prompt });
         // RA-02：编辑分支同样吸附到服务商支持的尺寸档位，与 generate 保持一致
@@ -350,10 +358,14 @@ impl OpenAiAdapter {
                     })?,
             );
         }
-        let request = http_client()?
+        let mut request = http_client()?
             .post(format!("{}/images/edits", Self::base(config)))
             .bearer_auth(&config.api_key)
             .multipart(form);
+        if let Some(ctx) = ctx {
+            request = request.header("X-Client-Request-Id", ctx.client_request_id());
+            ctx.mark_sent();
+        }
         let resp =
             super::send_with_timeout(request, Self::timeout(config), "/images/edits").await?;
         if !resp.status().is_success() {
@@ -367,30 +379,19 @@ impl OpenAiAdapter {
             };
             return Err(edit_error(status, &text, model, &body, extra, retry_after));
         }
-        super::parse_json_body(resp, "/images/edits").await
+        super::parse_json_body_with_ctx(resp, "/images/edits", ctx).await
     }
 
     async fn first_image_b64(
         parsed: ImageResponse,
         timeout: std::time::Duration,
     ) -> Result<String, AdapterError> {
-        let entry = parsed.data.first().ok_or_else(|| AdapterError::Other {
-            message: "API 未返回图片".into(),
-        })?;
+        let entry = first_image(&parsed)?;
         Self::fetch_image_b64(entry, timeout).await
     }
 
-    /// F-012：服务商返回 200 但 data 为空时，上抛可读错误而不是成功返回 0 张图
-    fn ensure_generated(out: Vec<String>) -> Result<Vec<String>, AdapterError> {
-        if out.is_empty() {
-            return Err(AdapterError::Other {
-                message: "API 未返回图片".into(),
-            });
-        }
-        Ok(out)
-    }
-
-    /// 下载图片 URL（RA-05：必须带服务商超时，避免下载阶段无限挂起）
+    /// 取回单张图片：b64 直接返回，URL 走「只重试下载」的下载器。
+    /// 下载失败时 URL 由调用方记入请求流水的产物清单，恢复入口可再取。
     async fn fetch_image_b64(
         entry: &ImageEntry,
         timeout: std::time::Duration,
@@ -400,13 +401,58 @@ impl OpenAiAdapter {
         }
         if let Some(url) = &entry.url {
             // F-011：统一走带状态码 / 体积上限 / 魔数校验的下载函数
-            let bytes = download_image_bytes(url, timeout).await?;
+            let bytes = download_with_retry(url, timeout).await?;
             return Ok(base64::engine::general_purpose::STANDARD.encode(&bytes));
         }
         Err(AdapterError::Other {
             message: "API 返回的图片缺少 b64_json 与 url 字段".into(),
         })
     }
+}
+
+/// 取第一张图；200 但 `data` 为空同样算「已计费无产物」，由上层按计费分类处理。
+fn first_image(parsed: &ImageResponse) -> Result<&ImageEntry, AdapterError> {
+    parsed.data.first().ok_or_else(|| AdapterError::Other {
+        message: "API 未返回图片".into(),
+    })
+}
+
+/// 只有瞬时故障才值得重试下载：建连失败、超时、5xx。
+pub(crate) fn retryable_download_error(e: &AdapterError) -> bool {
+    matches!(
+        e,
+        AdapterError::Network { .. } | AdapterError::Timeout { .. } | AdapterError::Upstream { .. }
+    )
+}
+
+/// 只重试「下载」：生成已经计费，重新发请求等于再付一次钱。
+/// 仅对瞬时故障（建连/超时/5xx）重试 ≤3 次，其余错误立即返回。
+pub(crate) async fn download_with_retry(
+    url: &str,
+    timeout: std::time::Duration,
+) -> Result<Vec<u8>, AdapterError> {
+    let mut last: Option<AdapterError> = None;
+    for attempt in 0..3u64 {
+        match download_image_bytes(url, timeout).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(e) if retryable_download_error(&e) => {
+                tracing::warn!(
+                    "图片下载第 {} 次失败（不重新生成，仅重试下载）: {}",
+                    attempt + 1,
+                    e.message()
+                );
+                last = Some(e);
+                if attempt < 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1000 * (attempt + 1)))
+                        .await;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or(AdapterError::Other {
+        message: "图片下载失败".into(),
+    }))
 }
 
 /// 无原生超分端点时，用指令化编辑表达放大：faithful 保真、detail 加细节。
@@ -483,98 +529,16 @@ impl ImageAdapter for OpenAiAdapter {
         config: &'a ProviderConfig,
         req: &'a GenerateRequest,
     ) -> super::BoxFuture<'a, Result<Vec<String>, AdapterError>> {
-        Box::pin(async move {
-            let mut body = serde_json::to_value(GenerationBody {
-                model: req.model.clone(),
-                prompt: prompt_with_negative(&req.prompt, req.negative_prompt.as_deref()),
-                // count 映射为 OpenAI n 参数；多图返回在下方按 data 数组逐项解析
-                n: req.count.max(1),
-                size: size_for_model(&req.model, req.width, req.height),
-                quality: map_quality(&req.model, req.quality.as_deref()),
-                response_format: supports_response_format(&req.model)
-                    .then(|| "b64_json".to_string()),
-            })
-            .map_err(|e| AdapterError::Other {
-                message: e.to_string(),
-            })?;
-            merge_extra_params(&mut body, config);
-            // 透传参数也可能塞回 response_format；能力过滤必须放在合并之后
-            if !supports_response_format(&req.model) {
-                if let Some(obj) = body.as_object_mut() {
-                    obj.remove("response_format");
-                }
-            }
-            let (resp, endpoint, edit_field) = if req.images.is_empty() {
-                // 纯文生图：JSON 请求 /images/generations
-                let request = http_client()?
-                    .post(format!("{}/images/generations", Self::base(config)))
-                    .bearer_auth(&config.api_key)
-                    .json(&body);
-                let resp =
-                    super::send_with_timeout(request, Self::timeout(config), "/images/generations")
-                        .await?;
-                (resp, "/images/generations", None)
-            } else {
-                // 参考图（图生图/编辑）：gpt-image 规范走 multipart /images/edits；
-                // RA-01：数字型 n 等标量统一转文本；response_format 由 edit_form_fields 剔除。
-                let mut prepared = Vec::with_capacity(req.images.len());
-                for img_b64 in &req.images {
-                    let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(img_b64)
-                        .map_err(|e| AdapterError::Other {
-                            message: format!("参考图 base64 解码失败: {}", e),
-                        })?;
-                    // A8：解码校验 + 体积/像素上限；A2：MIME 按真实格式上报
-                    let bytes = normalize_edit_image(bytes)?;
-                    let (ext, mime) = crate::image_store::sniff_image_mime(&bytes);
-                    prepared.push((bytes, ext, mime));
-                }
-                let mut field = "image[]";
-                let mut resp = Self::send_edits(config, &body, &prepared, field).await?;
-                // A7：部分中转只认单数 image 字段；400 不计费，允许回退一次
-                if resp.status() == reqwest::StatusCode::BAD_REQUEST && prepared.len() == 1 {
-                    let status = resp.status();
-                    let text = super::read_error_text(resp).await;
-                    if suggests_singular_image_field(&text) {
-                        tracing::warn!("服务商要求单数 image 字段，回退重试一次");
-                        field = "image";
-                        resp = Self::send_edits(config, &body, &prepared, field).await?;
-                    } else {
-                        return Err(edit_error(status, &text, &req.model, &body, &[field], None));
-                    }
-                }
-                (resp, "/images/edits", Some(field))
-            };
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let retry_after = retry_after_secs(&resp);
-                let text = super::read_error_text(resp).await;
-                return Err(match edit_field {
-                    Some(field) => {
-                        edit_error(status, &text, &req.model, &body, &[field], retry_after)
-                    }
-                    None => {
-                        // 只记录字段名，不记录值（可能含密钥/超长提示词）
-                        let fields = body
-                            .as_object()
-                            .map(|obj| obj.keys().cloned().collect::<Vec<_>>())
-                            .unwrap_or_default();
-                        enrich_400(
-                            classify_http_with_retry_after(status, &text, retry_after),
-                            endpoint,
-                            &req.model,
-                            fields,
-                        )
-                    }
-                });
-            }
-            let parsed: ImageResponse = super::parse_json_body(resp, endpoint).await?;
-            let mut out = Vec::new();
-            for entry in &parsed.data {
-                out.push(Self::fetch_image_b64(entry, Self::timeout(config)).await?);
-            }
-            Self::ensure_generated(out)
-        })
+        Box::pin(async move { Self::generate_impl(config, req, None).await })
+    }
+
+    fn generate_journaled<'a>(
+        &'a self,
+        config: &'a ProviderConfig,
+        req: &'a GenerateRequest,
+        ctx: Option<&'a crate::billing_journal::AttemptCtx>,
+    ) -> super::BoxFuture<'a, Result<Vec<String>, AdapterError>> {
+        Box::pin(async move { Self::generate_impl(config, req, ctx).await })
     }
 
     fn edit<'a>(
@@ -582,33 +546,16 @@ impl ImageAdapter for OpenAiAdapter {
         config: &'a ProviderConfig,
         req: &'a EditRequest,
     ) -> super::BoxFuture<'a, Result<String, AdapterError>> {
-        Box::pin(async move {
-            let image_bytes = base64::engine::general_purpose::STANDARD
-                .decode(&req.image_b64)
-                .map_err(|e| AdapterError::Other {
-                    message: format!("图片 base64 解码失败: {}", e),
-                })?;
-            let mask_bytes = match &req.mask_b64 {
-                Some(mask_b64) => Some(
-                    base64::engine::general_purpose::STANDARD
-                        .decode(mask_b64)
-                        .map_err(|e| AdapterError::Other {
-                            message: format!("蒙版 base64 解码失败: {}", e),
-                        })?,
-                ),
-                None => None,
-            };
-            let parsed = Self::post_edit(
-                config,
-                &req.model,
-                &prompt_with_negative(&req.prompt, req.negative_prompt.as_deref()),
-                image_bytes,
-                mask_bytes,
-                size_for_model(&req.model, req.width, req.height),
-            )
-            .await?;
-            Self::first_image_b64(parsed, Self::timeout(config)).await
-        })
+        Box::pin(async move { Self::edit_impl(config, req, None).await })
+    }
+
+    fn edit_journaled<'a>(
+        &'a self,
+        config: &'a ProviderConfig,
+        req: &'a EditRequest,
+        ctx: Option<&'a crate::billing_journal::AttemptCtx>,
+    ) -> super::BoxFuture<'a, Result<String, AdapterError>> {
+        Box::pin(async move { Self::edit_impl(config, req, ctx).await })
     }
 
     fn transform<'a>(
@@ -616,18 +563,195 @@ impl ImageAdapter for OpenAiAdapter {
         config: &'a ProviderConfig,
         req: &'a TransformRequest,
     ) -> super::BoxFuture<'a, Result<String, AdapterError>> {
-        Box::pin(async move {
-            let image_bytes = base64::engine::general_purpose::STANDARD
-                .decode(&req.image_b64)
-                .map_err(|e| AdapterError::Other {
-                    message: format!("图片 base64 解码失败: {}", e),
-                })?;
-            let size = scaled_size(&image_bytes, req.scale);
-            let prompt = transform_prompt(&req.mode, req.scale, &req.prompt);
-            let parsed =
-                Self::post_edit(config, &req.model, &prompt, image_bytes, None, size).await?;
-            Self::first_image_b64(parsed, Self::timeout(config)).await
+        Box::pin(async move { Self::transform_impl(config, req, None).await })
+    }
+
+    fn transform_journaled<'a>(
+        &'a self,
+        config: &'a ProviderConfig,
+        req: &'a TransformRequest,
+        ctx: Option<&'a crate::billing_journal::AttemptCtx>,
+    ) -> super::BoxFuture<'a, Result<String, AdapterError>> {
+        Box::pin(async move { Self::transform_impl(config, req, ctx).await })
+    }
+}
+
+impl OpenAiAdapter {
+    async fn generate_impl(
+        config: &ProviderConfig,
+        req: &GenerateRequest,
+        ctx: Option<&crate::billing_journal::AttemptCtx>,
+    ) -> Result<Vec<String>, AdapterError> {
+        let mut body = serde_json::to_value(GenerationBody {
+            model: req.model.clone(),
+            prompt: prompt_with_negative(&req.prompt, req.negative_prompt.as_deref()),
+            // count 映射为 OpenAI n 参数；多图返回在下方按 data 数组逐项解析
+            n: req.count.max(1),
+            size: size_for_model(&req.model, req.width, req.height),
+            quality: map_quality(&req.model, req.quality.as_deref()),
+            response_format: supports_response_format(&req.model).then(|| "b64_json".to_string()),
         })
+        .map_err(|e| AdapterError::Other {
+            message: e.to_string(),
+        })?;
+        merge_extra_params(&mut body, config);
+        // 透传参数也可能塞回 response_format；能力过滤必须放在合并之后
+        if !supports_response_format(&req.model) {
+            if let Some(obj) = body.as_object_mut() {
+                obj.remove("response_format");
+            }
+        }
+        let (resp, endpoint, edit_field) = if req.images.is_empty() {
+            // 纯文生图：JSON 请求 /images/generations
+            let mut request = http_client()?
+                .post(format!("{}/images/generations", Self::base(config)))
+                .bearer_auth(&config.api_key)
+                .json(&body);
+            if let Some(ctx) = ctx {
+                request = request.header("X-Client-Request-Id", ctx.client_request_id());
+                ctx.mark_sent();
+            }
+            let resp =
+                super::send_with_timeout(request, Self::timeout(config), "/images/generations")
+                    .await?;
+            (resp, "/images/generations", None)
+        } else {
+            // 参考图（图生图/编辑）：gpt-image 规范走 multipart /images/edits；
+            // RA-01：数字型 n 等标量统一转文本；response_format 由 edit_form_fields 剔除。
+            let mut prepared = Vec::with_capacity(req.images.len());
+            for img_b64 in &req.images {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(img_b64)
+                    .map_err(|e| AdapterError::Other {
+                        message: format!("参考图 base64 解码失败: {}", e),
+                    })?;
+                // A8：解码校验 + 体积/像素上限；A2：MIME 按真实格式上报
+                let bytes = normalize_edit_image(bytes)?;
+                let (ext, mime) = crate::image_store::sniff_image_mime(&bytes);
+                prepared.push((bytes, ext, mime));
+            }
+            let mut field = "image[]";
+            let mut resp = Self::send_edits(config, &body, &prepared, field, ctx).await?;
+            // A7：部分中转只认单数 image 字段；400 不计费，允许回退一次
+            if resp.status() == reqwest::StatusCode::BAD_REQUEST && prepared.len() == 1 {
+                let status = resp.status();
+                let text = super::read_error_text(resp).await;
+                if suggests_singular_image_field(&text) {
+                    tracing::warn!("服务商要求单数 image 字段，回退重试一次");
+                    field = "image";
+                    resp = Self::send_edits(config, &body, &prepared, field, ctx).await?;
+                } else {
+                    return Err(edit_error(status, &text, &req.model, &body, &[field], None));
+                }
+            }
+            (resp, "/images/edits", Some(field))
+        };
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let retry_after = retry_after_secs(&resp);
+            let text = super::read_error_text(resp).await;
+            return Err(match edit_field {
+                Some(field) => edit_error(status, &text, &req.model, &body, &[field], retry_after),
+                None => {
+                    // 只记录字段名，不记录值（可能含密钥/超长提示词）
+                    let fields = body
+                        .as_object()
+                        .map(|obj| obj.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    enrich_400(
+                        classify_http_with_retry_after(status, &text, retry_after),
+                        endpoint,
+                        &req.model,
+                        fields,
+                    )
+                }
+            });
+        }
+        let status = resp.status().as_u16();
+        // 先落「已受理」，再读 body：读超时/坏 JSON 同样已计费
+        let parsed: ImageResponse = super::parse_json_body_with_ctx(resp, endpoint, ctx).await?;
+        if let Some(ctx) = ctx {
+            ctx.mark_billed(status, Some(parsed.data.len() as u32));
+        }
+        // 逐张取图：单张失败只丢该张（与 Cherry Studio 一致），全部失败才报错
+        let mut out = Vec::new();
+        let mut last_err: Option<AdapterError> = None;
+        for entry in &parsed.data {
+            match Self::fetch_image_b64(entry, Self::timeout(config)).await {
+                Ok(b64) => out.push(b64),
+                Err(e) => {
+                    tracing::warn!("第 {} 张图片取回失败: {}", out.len() + 1, e.message());
+                    if let (Some(ctx), Some(url)) = (ctx, entry.url.as_deref()) {
+                        // 保留 URL 供「只重试下载」的恢复流程使用
+                        ctx.note_artifact(url);
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        if out.is_empty() {
+            return Err(last_err.unwrap_or(AdapterError::Other {
+                message: "API 未返回图片".into(),
+            }));
+        }
+        if last_err.is_some() {
+            tracing::warn!(
+                "本次返回 {} 张，仅成功取回 {} 张",
+                parsed.data.len(),
+                out.len()
+            );
+        }
+        Ok(out)
+    }
+
+    async fn edit_impl(
+        config: &ProviderConfig,
+        req: &EditRequest,
+        ctx: Option<&crate::billing_journal::AttemptCtx>,
+    ) -> Result<String, AdapterError> {
+        let image_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&req.image_b64)
+            .map_err(|e| AdapterError::Other {
+                message: format!("图片 base64 解码失败: {}", e),
+            })?;
+        let mask_bytes = match &req.mask_b64 {
+            Some(mask_b64) => Some(
+                base64::engine::general_purpose::STANDARD
+                    .decode(mask_b64)
+                    .map_err(|e| AdapterError::Other {
+                        message: format!("蒙版 base64 解码失败: {}", e),
+                    })?,
+            ),
+            None => None,
+        };
+        let parsed = Self::post_edit(
+            config,
+            &req.model,
+            &prompt_with_negative(&req.prompt, req.negative_prompt.as_deref()),
+            image_bytes,
+            mask_bytes,
+            size_for_model(&req.model, req.width, req.height),
+            ctx,
+        )
+        .await?;
+        Self::first_image_b64(parsed, Self::timeout(config)).await
+    }
+
+    async fn transform_impl(
+        config: &ProviderConfig,
+        req: &TransformRequest,
+        ctx: Option<&crate::billing_journal::AttemptCtx>,
+    ) -> Result<String, AdapterError> {
+        let image_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&req.image_b64)
+            .map_err(|e| AdapterError::Other {
+                message: format!("图片 base64 解码失败: {}", e),
+            })?;
+        let size = scaled_size(&image_bytes, req.scale);
+        let prompt = transform_prompt(&req.mode, req.scale, &req.prompt);
+        let parsed =
+            Self::post_edit(config, &req.model, &prompt, image_bytes, None, size, ctx).await?;
+        Self::first_image_b64(parsed, Self::timeout(config)).await
     }
 }
 
@@ -791,14 +915,18 @@ mod tests {
         assert!(!suggests_singular_image_field("content policy violation"));
     }
 
-    /// F-012：空结果必须报错，非空结果原样透传
+    /// F-012：空结果必须报错，非空结果可取到首张
     #[test]
     fn empty_generation_result_reports_error() {
-        let err = OpenAiAdapter::ensure_generated(vec![]).unwrap_err();
+        let empty = ImageResponse { data: vec![] };
+        let err = first_image(&empty).unwrap_err();
         assert!(err.message().contains("未返回图片"), "{}", err.message());
-        assert_eq!(
-            OpenAiAdapter::ensure_generated(vec!["QUJD".into()]).unwrap(),
-            vec!["QUJD".to_string()]
-        );
+        let one = ImageResponse {
+            data: vec![ImageEntry {
+                b64_json: Some("QUJD".into()),
+                url: None,
+            }],
+        };
+        assert_eq!(first_image(&one).unwrap().b64_json.as_deref(), Some("QUJD"));
     }
 }

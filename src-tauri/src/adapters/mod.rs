@@ -122,6 +122,24 @@ pub enum AdapterError {
     Unsupported {
         message: String,
     },
+    /// 上游 5xx / 408 / 409 / 425：请求可能已被受理并计费，不可自动重放
+    Upstream {
+        message: String,
+        #[serde(default)]
+        status: u16,
+    },
+    /// 请求体发出后连接中断 / 读响应失败：无法判断上游是否已计费
+    BodyInterrupted {
+        message: String,
+    },
+    /// 结果未确认：可能已计费但拿不到产物；带请求 id 供对账
+    Unconfirmed {
+        message: String,
+        #[serde(default)]
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact: Option<String>,
+    },
     Other {
         message: String,
     },
@@ -136,6 +154,9 @@ impl AdapterError {
             | AdapterError::ContentBlocked { message }
             | AdapterError::Network { message }
             | AdapterError::Unsupported { message }
+            | AdapterError::Upstream { message, .. }
+            | AdapterError::BodyInterrupted { message }
+            | AdapterError::Unconfirmed { message, .. }
             | AdapterError::Other { message } => message,
         }
     }
@@ -167,6 +188,24 @@ pub trait ImageAdapter: Send + Sync {
         config: &'a ProviderConfig,
         req: &'a EditRequest,
     ) -> BoxFuture<'a, Result<String, AdapterError>>;
+    /// 带计费流水的生成入口。默认实现忽略上下文，适配器可按需覆盖
+    /// （OpenAI 兼容适配器用它实现「200 先记证据、逐张容错」）。
+    fn generate_journaled<'a>(
+        &'a self,
+        config: &'a ProviderConfig,
+        req: &'a GenerateRequest,
+        _ctx: Option<&'a crate::billing_journal::AttemptCtx>,
+    ) -> BoxFuture<'a, Result<Vec<String>, AdapterError>> {
+        self.generate(config, req)
+    }
+    fn edit_journaled<'a>(
+        &'a self,
+        config: &'a ProviderConfig,
+        req: &'a EditRequest,
+        _ctx: Option<&'a crate::billing_journal::AttemptCtx>,
+    ) -> BoxFuture<'a, Result<String, AdapterError>> {
+        self.edit(config, req)
+    }
     /// 高清放大 / 风格转换；默认明确报「不支持」，避免被 UI 误当成网络错误
     fn transform<'a>(
         &'a self,
@@ -178,6 +217,15 @@ pub trait ImageAdapter: Send + Sync {
                 message: "该服务商不支持高清放大与风格转换".into(),
             })
         })
+    }
+    /// 带计费流水的放大 / 换风格入口（与 generate_journaled 同语义）
+    fn transform_journaled<'a>(
+        &'a self,
+        config: &'a ProviderConfig,
+        req: &'a TransformRequest,
+        _ctx: Option<&'a crate::billing_journal::AttemptCtx>,
+    ) -> BoxFuture<'a, Result<String, AdapterError>> {
+        self.transform(config, req)
     }
 }
 
@@ -364,8 +412,15 @@ pub(crate) async fn download_image_bytes(
             .chars()
             .take(ERROR_BODY_TRUNCATE_LEN)
             .collect();
-        return Err(AdapterError::Other {
-            message: format!("下载图片失败 HTTP {status}: {truncated}"),
+        let message = format!("下载图片失败 HTTP {status}: {truncated}");
+        // 5xx 是瞬时故障：交给下载器重试（只重下载，绝不重新生成）
+        return Err(if status.is_server_error() {
+            AdapterError::Upstream {
+                message,
+                status: status.as_u16(),
+            }
+        } else {
+            AdapterError::Other { message }
         });
     }
     if resp
@@ -421,6 +476,12 @@ pub fn classify_http_with_retry_after(
         }
     } else if status.as_u16() == 400 && is_content_policy_block(body) {
         AdapterError::ContentBlocked { message: truncated }
+    } else if matches!(status.as_u16(), 408 | 409 | 425) || status.is_server_error() {
+        // 5xx / 请求冲突：上游可能已受理，按「可能已计费」处理，绝不自动重放
+        AdapterError::Upstream {
+            message: format!("HTTP {}: {}", status, truncated),
+            status: status.as_u16(),
+        }
     } else {
         AdapterError::Other {
             message: format!("HTTP {}: {}", status, truncated),
@@ -511,13 +572,16 @@ pub fn classify_reqwest(err: &reqwest::Error) -> AdapterError {
     // 只取顶层 Display 会丢底层原因（如 connection closed），排障时无法区分
     // 连接重置 / 证书 / DNS，因此带上 source 链。
     let message = crate::redact::redact_secrets(&reqwest_error_chain(err));
-    if err.is_timeout() {
-        AdapterError::Timeout { message }
-    } else if err.is_connect() {
+    // 建连失败（含连接超时）说明请求从未送达，是唯一可以安全重试的一类。
+    // 必须放在 is_timeout 之前：连接超时同样是 timeout，但语义完全不同。
+    if err.is_connect() {
         AdapterError::Network { message }
+    } else if err.is_timeout() {
+        AdapterError::Timeout { message }
     } else {
         let hint = connection_reset_hint(&message).unwrap_or_default();
-        AdapterError::Other {
+        // 非建连、非超时：请求体可能已经发出，结果未知
+        AdapterError::BodyInterrupted {
             message: format!("{message}{hint}"),
         }
     }
@@ -663,7 +727,7 @@ async fn read_body_with_idle(
                 return Err(if e.is_timeout() {
                     AdapterError::Timeout { message }
                 } else {
-                    AdapterError::Other { message }
+                    AdapterError::BodyInterrupted { message }
                 });
             }
             Err(_) => {
@@ -716,9 +780,36 @@ pub async fn parse_json_body<T: serde::de::DeserializeOwned>(
     resp: reqwest::Response,
     api: &str,
 ) -> Result<T, AdapterError> {
+    parse_json_body_with_ctx(resp, api, None).await
+}
+
+/// 带计费流水的响应解析：2xx 先落「已受理」，原始字节先落盘再解析。
+///
+/// 顺序是刻意的：只要 200 到手就已经计费，任何后续失败都必须留下证据，
+/// 而不是等解析成功才记录。
+pub async fn parse_json_body_with_ctx<T: serde::de::DeserializeOwned>(
+    resp: reqwest::Response,
+    api: &str,
+    ctx: Option<&crate::billing_journal::AttemptCtx>,
+) -> Result<T, AdapterError> {
     let status = resp.status().as_u16();
     let content_type = header_value(&resp, reqwest::header::CONTENT_TYPE);
     let content_encoding = header_value(&resp, reqwest::header::CONTENT_ENCODING);
+    if let Some(ctx) = ctx {
+        let request_id = ["x-request-id", "x-oneapi-request-id", "request-id"]
+            .iter()
+            .find_map(|name| {
+                resp.headers()
+                    .get(*name)
+                    .and_then(|v| v.to_str().ok())
+                    .filter(|v| !v.is_empty())
+            })
+            .unwrap_or_default();
+        ctx.capture_request_id(request_id);
+        if resp.status().is_success() {
+            ctx.mark_billed(status, None);
+        }
+    }
     let bytes = read_body_with_idle(
         resp,
         api,
@@ -727,6 +818,9 @@ pub async fn parse_json_body<T: serde::de::DeserializeOwned>(
         MAX_RAW_BODY_BYTES,
     )
     .await?;
+    if let Some(ctx) = ctx {
+        ctx.stash_raw(&bytes);
+    }
     parse_json_bytes(api, status, &content_type, &content_encoding, &bytes)
 }
 

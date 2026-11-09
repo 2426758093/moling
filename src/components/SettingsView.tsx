@@ -17,6 +17,7 @@ import ThinkingSection from "./settings/ThinkingSection";
 import AboutSection from "./settings/AboutSection";
 import NetworkSection from "./settings/NetworkSection";
 import StorageSection from "./settings/StorageSection";
+import RequestsSection from "./settings/RequestsSection";
 import { Button } from "./ui/Button";
 import { Input } from "./ui/Field";
 import { Section, Row } from "./ui/List";
@@ -60,6 +61,7 @@ type SettingsSection =
   | "generation"
   | "network"
   | "storage"
+  | "requests"
   | "diagnostics"
   | "about"
   | "shortcuts";
@@ -70,6 +72,7 @@ const SECTIONS = [
   { id: "generation", label: "生成" },
   { id: "network", label: "网络" },
   { id: "storage", label: "存储" },
+  { id: "requests", label: "请求记录" },
   { id: "diagnostics", label: "诊断" },
   { id: "about", label: "关于" },
   { id: "shortcuts", label: "快捷键" },
@@ -640,6 +643,8 @@ export default function SettingsView() {
                 </Section>
               </>
             )}
+
+            {section === "requests" && <RequestsSection />}
 
             {section === "diagnostics" && (
               <Section

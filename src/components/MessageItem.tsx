@@ -2,12 +2,13 @@ import { memo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { motion, AnimatePresence } from "framer-motion";
 import { DisplayMessage, useChatStore } from "../stores/chatStore";
-import { adapterErrorTitle } from "../lib/api";
+import { api, adapterErrorTitle, isUnconfirmedError } from "../lib/api";
 import { DUR, EASE } from "../lib/motion";
 import { toast } from "../lib/notify";
 import ImageCard from "./ImageCard";
 import SafeImg from "./SafeImg";
 import { Button } from "./ui/Button";
+import { ConfirmDialog } from "./ui/Dialog";
 import { IconButton } from "./ui/IconButton";
 import { IconAlert, IconBrain, IconChevron, IconCopy, IconEdit } from "./Icons";
 
@@ -90,6 +91,43 @@ export default memo(function MessageItem({
   const sending = useChatStore((s) => s.sending);
   const retryLast = useChatStore((s) => s.retryLast);
   const setDraftPrompt = useChatStore((s) => s.setDraftPrompt);
+  // 可能已计费的失败：重试会再次扣费，必须先确认
+  const [confirmRetry, setConfirmRetry] = useState(false);
+  const [recovering, setRecovering] = useState(false);
+  const unconfirmed =
+    message.status === "error" && message.error
+      ? isUnconfirmedError(message.error)
+      : false;
+  const requestId =
+    message.error?.type === "unconfirmed" ? message.error.request_id : undefined;
+
+  const requestRetry = () => {
+    if (unconfirmed) setConfirmRetry(true);
+    else void retryLast(message.id);
+  };
+
+  const recover = async () => {
+    if (!requestId) return;
+    setRecovering(true);
+    try {
+      const out = await api.recoverImageRequestByClient(requestId);
+      toast(
+        t("已恢复 {{n}} 张到画廊", { n: out.recovered }) +
+          (out.failed ? t("（{{n}} 张仍失败）", { n: out.failed }) : ""),
+      );
+      await useChatStore.getState().loadConversations();
+    } catch (e) {
+      toast(
+        t("恢复失败：{{error}}", {
+          error: String(e).replace(/^Error:\s*/, ""),
+        }),
+        "error",
+      );
+    } finally {
+      setRecovering(false);
+    }
+  };
+
   // 占位只在生成中有效；终态即使数据异常带有 pendingImages 也不渲染骨架
   const showPending = message.status === "generating";
   const pendingCount = showPending ? message.pendingImages : 0;
@@ -213,17 +251,59 @@ export default memo(function MessageItem({
                   <div className="mt-0.5 max-h-24 overflow-y-auto break-all text-tertiary">
                     {message.error.message}
                   </div>
+                  {unconfirmed && (
+                    <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-tertiary">
+                      <span>{t("可能已计费，重试会再次扣费")}</span>
+                      {requestId && (
+                        <button
+                          className="pressable font-mono text-[11px] underline decoration-dotted"
+                          onClick={() => {
+                            void navigator.clipboard
+                              .writeText(requestId)
+                              .then(() => toast(t("已复制请求 ID")))
+                              .catch(() => toast(t("复制失败"), "error"));
+                          }}
+                          title={t("复制请求 ID（对账用）")}
+                        >
+                          {requestId}
+                        </button>
+                      )}
+                    </div>
+                  )}
                 </div>
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  onClick={() => void retryLast(message.id)}
-                  disabled={sending}
-                >
-                  {t("重试")}
-                </Button>
+                <div className="flex shrink-0 flex-col gap-1">
+                  {unconfirmed && requestId && (
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => void recover()}
+                      disabled={recovering}
+                    >
+                      {recovering ? t("恢复中…") : t("尝试恢复")}
+                    </Button>
+                  )}
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={requestRetry}
+                    disabled={sending}
+                  >
+                    {t("重试")}
+                  </Button>
+                </div>
               </motion.div>
             )}
+            <ConfirmDialog
+              open={confirmRetry}
+              onOpenChange={setConfirmRetry}
+              title={t("确认重新生成？")}
+              description={t(
+                "这次请求可能已在服务商侧计费。重新生成会再次扣费，请先到服务商后台确认没有出图。",
+              )}
+              confirmLabel={t("仍然重新生成")}
+              danger
+              onConfirm={() => void retryLast(message.id)}
+            />
           </div>
         )}
       </div>

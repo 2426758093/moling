@@ -13,6 +13,10 @@ use std::sync::{Mutex, OnceLock};
 
 static DB: OnceLock<Mutex<Connection>> = OnceLock::new();
 
+/// 测试期间串行化全局 DB 初始化：OnceLock 只能 init 一次，多个测试模块会争抢
+#[cfg(test)]
+pub(crate) static TEST_DB_LOCK: Mutex<()> = Mutex::new(());
+
 /// keyring 服务名/账号（跨版本冻结，勿改）
 const MASTER_KEY_SERVICE: &str = "moling";
 const MASTER_KEY_USER: &str = "master-key";
@@ -384,6 +388,48 @@ const CANVAS_SQL: &str = "
             ON canvas_boards(updated_at DESC);
 ";
 
+/// 迁移 013：「已扣费却没图」防护。记录每次计费请求的意图与结果，
+/// 使断线/超时/崩溃后能区分「确定没扣费」与「可能已扣费」；raw 响应体
+/// 先落盘再解析，供本地恢复。`messages.status/error` 让失败轮次重启后不再
+/// 显示成「已完成的空回复」。
+const IMAGE_REQUESTS_SQL: &str = "
+        CREATE TABLE IF NOT EXISTS image_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id TEXT NOT NULL,
+            client_request_id TEXT NOT NULL,
+            entry TEXT NOT NULL,
+            op TEXT NOT NULL DEFAULT 'generate',
+            job_id INTEGER,
+            provider_id INTEGER NOT NULL,
+            provider_name TEXT NOT NULL DEFAULT '',
+            model TEXT NOT NULL DEFAULT '',
+            prompt TEXT NOT NULL DEFAULT '',
+            endpoint TEXT NOT NULL DEFAULT '',
+            attempt INTEGER NOT NULL DEFAULT 1,
+            state TEXT NOT NULL DEFAULT 'created',
+            http_status INTEGER,
+            provider_request_id TEXT NOT NULL DEFAULT '',
+            param_hash TEXT NOT NULL DEFAULT '',
+            image_count INTEGER NOT NULL DEFAULT 1,
+            artifacts_json TEXT NOT NULL DEFAULT '[]',
+            raw_path TEXT NOT NULL DEFAULT '',
+            error_json TEXT,
+            created_at TEXT NOT NULL,
+            sent_at TEXT,
+            billed_at TEXT,
+            finished_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_image_requests_state
+            ON image_requests(state, id);
+        CREATE INDEX IF NOT EXISTS idx_image_requests_group
+            ON image_requests(group_id);
+        CREATE INDEX IF NOT EXISTS idx_image_requests_fingerprint
+            ON image_requests(param_hash, state);
+        ALTER TABLE jobs ADD COLUMN billing_state TEXT NOT NULL DEFAULT '';
+        ALTER TABLE messages ADD COLUMN status TEXT NOT NULL DEFAULT 'done';
+        ALTER TABLE messages ADD COLUMN error TEXT;
+";
+
 const MIGRATIONS: &[(&str, &str)] = &[
     ("001_tables", SCHEMA_SQL),
     ("002_indexes", INDEXES_SQL),
@@ -397,6 +443,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("010_canvas", CANVAS_SQL),
     ("011_jobs_heartbeat", JOBS_HEARTBEAT_SQL),
     ("012_provider_timeout_default", PROVIDER_TIMEOUT_DEFAULT_SQL),
+    ("013_image_requests", IMAGE_REQUESTS_SQL),
 ];
 
 /// 当前 schema 版本 = 迁移条数
@@ -536,7 +583,7 @@ pub fn is_corruption(e: &AppError) -> bool {
     }
 }
 
-fn conn() -> AppResult<std::sync::MutexGuard<'static, Connection>> {
+pub(crate) fn conn() -> AppResult<std::sync::MutexGuard<'static, Connection>> {
     DB.get()
         .ok_or_else(|| AppError::Other("storage not initialized".into()))?
         .lock()
@@ -1145,10 +1192,10 @@ pub const DEFAULT_CACHE_RETENTION_DAYS: i64 = 30;
 /// 响应体读取超时的合法区间与默认值（秒）
 pub const MIN_BODY_IDLE_TIMEOUT_SECS: i64 = 5;
 pub const MAX_BODY_IDLE_TIMEOUT_SECS: i64 = 300;
-pub const DEFAULT_BODY_IDLE_TIMEOUT_SECS: u64 = 30;
+pub const DEFAULT_BODY_IDLE_TIMEOUT_SECS: u64 = 60;
 pub const MIN_BODY_TOTAL_TIMEOUT_SECS: i64 = 30;
 pub const MAX_BODY_TOTAL_TIMEOUT_SECS: i64 = 1800;
-pub const DEFAULT_BODY_TOTAL_TIMEOUT_SECS: u64 = 300;
+pub const DEFAULT_BODY_TOTAL_TIMEOUT_SECS: u64 = 600;
 
 /// 读缓存保留天数；未设置/脏值回退默认（启动清理不能因为设置损坏而停摆）
 pub fn cache_retention_days() -> i64 {
@@ -2982,6 +3029,15 @@ pub struct MessageRow {
     pub images_json: String,
     pub params_json: String,
     pub created_at: String,
+    /// done | failed | unconfirmed；旧库/旧前端缺省按 done 处理
+    #[serde(default = "default_message_status")]
+    pub status: String,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+fn default_message_status() -> String {
+    "done".to_string()
 }
 
 pub fn create_conversation(title: &str) -> AppResult<i64> {
@@ -3050,7 +3106,7 @@ pub fn add_message(m: &MessageRow) -> AppResult<i64> {
     let c = conn()?;
     c.execute(
         "INSERT INTO messages (conversation_id, role, content, refined_content, images_json,
-         params_json, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+         params_json, created_at, status, error) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
         params![
             m.conversation_id,
             m.role,
@@ -3058,7 +3114,13 @@ pub fn add_message(m: &MessageRow) -> AppResult<i64> {
             m.refined_content,
             m.images_json,
             m.params_json,
-            m.created_at
+            m.created_at,
+            if m.status.is_empty() {
+                "done"
+            } else {
+                &m.status
+            },
+            m.error,
         ],
     )?;
     Ok(c.last_insert_rowid())
@@ -3089,7 +3151,7 @@ pub(crate) fn list_messages_in(
     let before = before_id.filter(|id| *id > 0);
     let mut stmt = c.prepare(
         "SELECT id, conversation_id, role, content, refined_content, images_json,
-         params_json, created_at FROM messages
+         params_json, created_at, status, error FROM messages
          WHERE conversation_id = ?1 AND (?2 IS NULL OR id < ?2)
          ORDER BY id DESC LIMIT ?3",
     )?;
@@ -3105,6 +3167,11 @@ pub(crate) fn list_messages_in(
                 images_json: r.get(5)?,
                 params_json: r.get(6)?,
                 created_at: r.get(7)?,
+                status: r
+                    .get::<_, Option<String>>(8)?
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(default_message_status),
+                error: r.get(9)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()
@@ -3141,7 +3208,7 @@ pub const JOB_TERMINAL_STATUSES: &[&str] = &["done", "failed", "canceled", "inte
 
 const JOB_COLUMNS: &str = "id, status, provider_id, provider_name, model, prompt, \
      negative_prompt, style, width, height, guidance, steps, seed, count, job_key, \
-     images_json, error, created_at, started_at, finished_at, input_json";
+     images_json, error, created_at, started_at, finished_at, input_json, billing_state";
 
 /// 队列任务。`images_json` 只存 `[{historyId,path}]`，绝不存 base64。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3170,6 +3237,9 @@ pub struct JobRow {
     pub finished_at: Option<String>,
     /// 列里没有的扩展参数（参考图路径 / 角色），空串表示没有
     pub input_json: String,
+    /// 计费状态：`unknown` / `billed_unrecovered` 表示结果未确认，重试前需人工确认
+    #[serde(default)]
+    pub billing_state: String,
 }
 
 /// 入队参数快照（入队后不再与聊天输入联动）
@@ -3212,6 +3282,7 @@ fn job_from_row(row: &rusqlite::Row) -> rusqlite::Result<JobRow> {
         started_at: row.get(18)?,
         finished_at: row.get(19)?,
         input_json: row.get(20)?,
+        billing_state: row.get(21)?,
     })
 }
 
@@ -3426,31 +3497,48 @@ fn cancel_queued_job_in(c: &Connection, id: i64) -> AppResult<bool> {
 }
 
 /// 失败/取消/中断的任务重新入队（清空上次的错误与结果）。
-pub fn requeue_job(id: i64) -> AppResult<bool> {
+/// 结果未确认（可能已计费）的任务默认拒绝，需用户显式 `force` 才重发。
+pub fn requeue_job(id: i64, force: bool) -> AppResult<bool> {
     let c = conn()?;
-    requeue_job_in(&c, id)
+    requeue_job_in(&c, id, force)
 }
 
 /// 用户显式恢复全部中断任务；启动时仍不自动重跑，避免重复扣费。
+/// `unknown` / `billed_unrecovered` 的任务不在此列，必须逐条确认。
 pub fn requeue_interrupted_jobs() -> AppResult<usize> {
     let c = conn()?;
     let affected = c.execute(
         "UPDATE jobs SET status = 'queued', error = NULL, images_json = '[]',
-         started_at = NULL, finished_at = NULL, heartbeat_at = NULL
-         WHERE status = 'interrupted'",
+         started_at = NULL, finished_at = NULL, heartbeat_at = NULL, billing_state = ''
+         WHERE status = 'interrupted'
+           AND COALESCE(billing_state, '') NOT IN ('unknown', 'billed_unrecovered')",
         [],
     )?;
     Ok(affected)
 }
 
-fn requeue_job_in(c: &Connection, id: i64) -> AppResult<bool> {
-    let affected = c.execute(
+fn requeue_job_in(c: &Connection, id: i64, force: bool) -> AppResult<bool> {
+    let guard = if force {
+        ""
+    } else {
+        " AND COALESCE(billing_state, '') NOT IN ('unknown', 'billed_unrecovered')"
+    };
+    let sql = format!(
         "UPDATE jobs SET status = 'queued', error = NULL, images_json = '[]',
-         started_at = NULL, finished_at = NULL, heartbeat_at = NULL
-         WHERE id = ?1 AND status IN ('failed', 'canceled', 'interrupted')",
-        params![id],
-    )?;
+         started_at = NULL, finished_at = NULL, heartbeat_at = NULL, billing_state = ''
+         WHERE id = ?1 AND status IN ('failed', 'canceled', 'interrupted'){guard}"
+    );
+    let affected = c.execute(&sql, params![id])?;
     Ok(affected > 0)
+}
+
+/// 写入任务的计费状态（`unknown` / `billed_unrecovered` 会阻止自动重试）
+pub fn set_job_billing_state(id: i64, state: &str) -> AppResult<()> {
+    conn()?.execute(
+        "UPDATE jobs SET billing_state = ?2 WHERE id = ?1",
+        params![id, state],
+    )?;
+    Ok(())
 }
 
 /// 429 退避重试：running 直接回到 queued，并写入更新后的扩展参数（重试次数）
@@ -3708,6 +3796,38 @@ mod tests {
         assert_eq!(timeout_of(&c, "自定义"), 60);
     }
 
+    /// 迁移 013：新增计费流水表、任务计费状态与消息失败态；可重复执行
+    #[test]
+    fn migration_013_adds_request_journal() {
+        let mut c = Connection::open_in_memory().unwrap();
+        apply_migrations_with(&mut c, &MIGRATIONS[..12]).unwrap();
+        apply_migrations(&mut c).unwrap();
+        assert_eq!(user_version_of(&c), MIGRATIONS.len() as i64);
+        assert!(index_exists(&c, "idx_image_requests_state"));
+        assert!(index_exists(&c, "idx_image_requests_group"));
+        assert!(index_exists(&c, "idx_image_requests_fingerprint"));
+
+        fn has_column(c: &Connection, table: &str, column: &str) -> bool {
+            let mut stmt = c
+                .prepare(&format!("PRAGMA table_info({table})"))
+                .expect("table_info");
+            let names = stmt
+                .query_map([], |r| r.get::<_, String>(1))
+                .expect("column names");
+            let names: Vec<String> = names.flatten().collect();
+            names.iter().any(|n| n == column)
+        }
+        assert!(has_column(&c, "image_requests", "client_request_id"));
+        assert!(has_column(&c, "image_requests", "param_hash"));
+        assert!(has_column(&c, "jobs", "billing_state"));
+        assert!(has_column(&c, "messages", "status"));
+        assert!(has_column(&c, "messages", "error"));
+
+        // 幂等：已是最新版本时再次执行不报错
+        apply_migrations(&mut c).unwrap();
+        assert_eq!(user_version_of(&c), MIGRATIONS.len() as i64);
+    }
+
     #[test]
     fn mask_key_is_utf8_safe() {
         assert_eq!(mask_key("sk-test-1234567890"), "sk-t...7890");
@@ -3752,10 +3872,15 @@ mod tests {
     #[test]
     fn storage_roundtrip_key_safety_and_import_tx() {
         let _guard = ENV_LOCK.lock().unwrap();
+        // 全局 DB 可能已被其它测试模块先初始化，此时沿用对方的连接
+        let _db_guard = TEST_DB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var(MASTER_KEY_ENV, "aa".repeat(32));
         let dir = test_dir();
-        let _ = std::fs::remove_dir_all(&dir);
-        init(dir.clone()).expect("init storage");
+        let owns_db = DB.get().is_none();
+        if owns_db {
+            let _ = std::fs::remove_dir_all(&dir);
+            init(dir.clone()).expect("init storage");
+        }
 
         let secret = "sk-test-1234567890";
         let row =
@@ -3969,7 +4094,9 @@ mod tests {
         assert!(list_providers().unwrap().is_empty());
 
         std::env::remove_var(MASTER_KEY_ENV);
-        let _ = std::fs::remove_dir_all(&dir);
+        if owns_db {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// P0-2：缺 providers 数组必须在任何 DELETE 之前拒绝，表内旧数据保持不变
@@ -5193,20 +5320,50 @@ mod tests {
     fn retry_requeues_failed() {
         let c = mem_conn();
         let id = insert_job_in(&c, &new_job("job")).unwrap();
-        assert!(!requeue_job_in(&c, id).unwrap(), "queued 任务无需重试");
+        assert!(
+            !requeue_job_in(&c, id, false).unwrap(),
+            "queued 任务无需重试"
+        );
         assert_eq!(
             claim_next_job_in(&c, 1, i64::MAX).unwrap().map(|j| j.id),
             Some(id)
         );
-        assert!(!requeue_job_in(&c, id).unwrap(), "running 任务不能重试");
+        assert!(
+            !requeue_job_in(&c, id, false).unwrap(),
+            "running 任务不能重试"
+        );
         assert!(finish_job_in(&c, id, "failed", "[]", Some("boom")).unwrap());
-        assert!(requeue_job_in(&c, id).unwrap());
+        assert!(requeue_job_in(&c, id, false).unwrap());
         let row = get_job_in(&c, id).unwrap().unwrap();
         assert_eq!(row.status, "queued");
         assert!(row.error.is_none());
         assert_eq!(row.images_json, "[]");
         assert!(row.started_at.is_none());
         assert!(row.finished_at.is_none());
+        assert_eq!(row.billing_state, "");
+    }
+
+    /// 结果未确认的任务默认拒绝重试，只有 force 才能重新计费
+    #[test]
+    fn retry_rejects_unconfirmed_billing_without_force() {
+        let c = mem_conn();
+        let id = insert_job_in(&c, &new_job("job")).unwrap();
+        claim_next_job_in(&c, 1, i64::MAX).unwrap();
+        finish_job_in(&c, id, "failed", "[]", Some("timeout")).unwrap();
+        c.execute(
+            "UPDATE jobs SET billing_state = 'unknown' WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+        assert!(
+            !requeue_job_in(&c, id, false).unwrap(),
+            "待确认任务不得自动重试"
+        );
+        assert_eq!(get_job_in(&c, id).unwrap().unwrap().status, "failed");
+        assert!(requeue_job_in(&c, id, true).unwrap());
+        let row = get_job_in(&c, id).unwrap().unwrap();
+        assert_eq!(row.status, "queued");
+        assert_eq!(row.billing_state, "", "重试即开启新一轮，计费状态要清空");
     }
 
     /// C4：取消排队任务立即生效，worker 之后取不到它

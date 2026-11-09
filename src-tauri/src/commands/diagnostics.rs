@@ -47,6 +47,7 @@ fn write_bundle(out: &Path, data_dir: &Path, app_version: &str) -> AppResult<()>
         ("meta.json".into(), pretty(&meta_json(app_version))?),
         ("providers.json".into(), pretty(&providers_json())?),
         ("settings.json".into(), pretty(&settings_json())?),
+        ("requests.json".into(), pretty(&requests_json())?),
     ];
     let mut total = 0u64;
     for path in logging::recent_logs(&logging::logs_dir(data_dir), now) {
@@ -107,6 +108,59 @@ fn providers_json() -> serde_json::Value {
         })
         .collect();
     serde_json::json!({ "providers": list })
+}
+
+/// 请求流水快照：只给对账字段，不含提示词、图片、产物 URL 与 Key。
+/// rawFile 只保留文件名与体积，便于判断「响应是否已经落过盘」。
+fn requests_json() -> serde_json::Value {
+    let rows = crate::billing_journal::list_recent(200).unwrap_or_default();
+    let list: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            let raw_file = Path::new(&r.raw_path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let raw_size = std::fs::metadata(&r.raw_path).map(|m| m.len()).unwrap_or(0);
+            let error = r
+                .error_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(scrub_summary));
+            serde_json::json!({
+                "id": r.id,
+                "state": r.state,
+                "entry": r.entry,
+                "op": r.op,
+                "providerName": r.provider_name,
+                "endpoint": r.endpoint,
+                "attempt": r.attempt,
+                "httpStatus": r.http_status,
+                "clientRequestId": r.client_request_id,
+                "providerRequestId": r.provider_request_id,
+                "imageCount": r.image_count,
+                "fingerprint": r.param_hash.chars().take(12).collect::<String>(),
+                "createdAt": r.created_at,
+                "finishedAt": r.finished_at,
+                "rawFile": raw_file,
+                "rawSize": raw_size,
+                "error": error,
+            })
+        })
+        .collect();
+    serde_json::json!({ "requests": list })
+}
+
+/// 错误摘要只留可读文本：先脱敏 Key，再把带协议的链接整体替换掉。
+/// 下载失败的错误里常带图片 URL，诊断包不应包含产物地址。
+fn scrub_summary(text: &str) -> String {
+    let redacted = crate::redact::redact_secrets(text);
+    let joined = redacted
+        .split_whitespace()
+        .map(|w| if w.contains("://") { "[url]" } else { w })
+        .collect::<Vec<_>>()
+        .join(" ");
+    joined.chars().take(300).collect()
 }
 
 /// 明确排除 promptTemplates（含用户提示词）与 thinkingConfig（含密钥密文）；
@@ -207,7 +261,15 @@ mod tests {
             let entry = archive.by_index(i).unwrap();
             names.push(entry.name().unwrap().to_string());
         }
-        assert_eq!(names, vec!["meta.json", "providers.json", "settings.json"]);
+        assert_eq!(
+            names,
+            vec![
+                "meta.json",
+                "providers.json",
+                "settings.json",
+                "requests.json"
+            ]
+        );
         for forbidden in ["images/", "a.png", "moling.db", "moling.log"] {
             assert!(
                 names.iter().all(|n| !n.contains(forbidden)),
@@ -234,5 +296,18 @@ mod tests {
         for field in ["apiKey", "apiKeys", "apiKeyMasked", "api_key_enc"] {
             assert!(!json.contains(field), "服务商快照不应包含 {field}");
         }
+    }
+
+    /// 请求流水的错误摘要必须抹掉 URL 与 Key（诊断包会随 zips 外发）
+    #[test]
+    fn request_error_summary_drops_urls_and_keys() {
+        let out = scrub_summary(
+            "下载失败 https://cdn.example.com/a.png?token=abcd1234 api_key=sk-live-0123456789abcdef",
+        );
+        assert!(!out.contains("https://"), "{out}");
+        assert!(!out.contains("cdn.example.com"), "{out}");
+        assert!(!out.contains("sk-live-0123456789abcdef"), "{out}");
+        assert!(out.contains("下载失败"));
+        assert!(out.chars().count() <= 300);
     }
 }

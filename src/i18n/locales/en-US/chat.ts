@@ -26,6 +26,24 @@ const chat = {
   "正在绘制 · 剩余 {{n}} 张": "Drawing · {{n}} left",
   绘制中: "Drawing",
   已停止生成: "Generation stopped",
+  "已停止等待，结果已保存": "Stopped waiting; result saved",
+  "已停止等待，结果已保存到画廊": "Stopped waiting; result saved to gallery",
+  "已停止等待，但结果未确认，请先到服务商后台核对是否计费":
+    "Stopped waiting, but the result is unconfirmed. Check your provider console for charges first",
+  结果未确认: "Result unconfirmed",
+  "可能已计费，重试会再次扣费":
+    "May already be charged; retrying will charge again",
+  "已复制请求 ID": "Request ID copied",
+  "复制请求 ID（对账用）": "Copy request ID (for reconciliation)",
+  尝试恢复: "Try recover",
+  "恢复中…": "Recovering…",
+  "已恢复 {{n}} 张到画廊": "Recovered {{n}} image(s) to gallery",
+  "（{{n}} 张仍失败）": " ({{n}} still failed)",
+  "恢复失败：{{error}}": "Recovery failed: {{error}}",
+  "确认重新生成？": "Regenerate anyway?",
+  "这次请求可能已在服务商侧计费。重新生成会再次扣费，请先到服务商后台确认没有出图。":
+    "This request may already have been billed. Regenerating will charge you again; confirm in your provider console that no image was produced first.",
+  仍然重新生成: "Regenerate anyway",
 
   // ImageCard
   下载失败: "Download failed",

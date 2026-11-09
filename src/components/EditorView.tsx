@@ -3,7 +3,7 @@ import { motion, useReducedMotion } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import { useAppStore } from "../stores/appStore";
 import { useProviderStore } from "../stores/providerStore";
-import { api, parseAdapterError, adapterErrorTitle } from "../lib/api";
+import { api, parseAdapterError, adapterErrorTitle, isUnconfirmedError, AdapterError } from "../lib/api";
 import { deliverEditResult } from "../lib/deliverEditResult";
 import { toast } from "../lib/notify";
 import { DUR, EASE } from "../lib/motion";
@@ -11,6 +11,7 @@ import { Button } from "./ui/Button";
 import { IconButton } from "./ui/IconButton";
 import { Input } from "./ui/Field";
 import { Slider } from "./ui/Slider";
+import { ConfirmDialog } from "./ui/Dialog";
 import { ToolbarGroup, ToolbarSeparator } from "./ui/Toolbar";
 import { IconBrush, IconClose, IconEraser } from "./Icons";
 import SafeImg from "./SafeImg";
@@ -34,6 +35,9 @@ export default function EditorView() {
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [lastError, setLastError] = useState<AdapterError | null>(null);
+  const [confirmRetry, setConfirmRetry] = useState(false);
+  const [recovering, setRecovering] = useState(false);
   const [resultUrl, setResultUrl] = useState<string | null>(null);
   // 智能蒙版：设置关闭或模型不可用时整块入口隐藏，行为回到纯手动画笔
   const [smartReady, setSmartReady] = useState(false);
@@ -95,8 +99,13 @@ export default function EditorView() {
 
   const inline = canvasInline && source.host === "canvas";
 
-  const submit = async () => {
+  const submit = async (force = false) => {
     if (!image || !source) return;
+    // 上一次结果未确认：再点一次就会重新计费，必须先让用户确认
+    if (lastError && isUnconfirmedError(lastError) && !force) {
+      setConfirmRetry(true);
+      return;
+    }
     const isErase = source.mode === "erase";
     if (!isErase && !prompt.trim()) {
       toast(t("请输入重绘描述"), "error");
@@ -144,8 +153,10 @@ export default function EditorView() {
       setResultUrl(out.dataUrl);
       const displayPrompt = isErase ? t("（AI 消除）") : prompt;
       await deliverEditResult(source, out, displayPrompt);
+      setLastError(null);
     } catch (e) {
       const parsed = parseAdapterError(String(e));
+      setLastError(parsed);
       setError(
         t("{{title}}：{{message}}", {
           title: adapterErrorTitle(parsed),
@@ -154,6 +165,30 @@ export default function EditorView() {
       );
     } finally {
       setBusy(false);
+    }
+  };
+
+  const unconfirmed = lastError !== null && isUnconfirmedError(lastError);
+  const requestId =
+    lastError?.type === "unconfirmed" ? lastError.request_id : undefined;
+
+  const recover = async () => {
+    if (!requestId) return;
+    setRecovering(true);
+    try {
+      const outcome = await api.recoverImageRequestByClient(requestId);
+      const suffix =
+        outcome.failed > 0 ? t("（{{n}} 张仍失败）", { n: outcome.failed }) : "";
+      toast(
+        t("已恢复 {{n}} 张到画廊", { n: outcome.recovered }) + suffix,
+        outcome.failed > 0 ? "error" : "info",
+      );
+      setLastError(null);
+      setError(null);
+    } catch (e) {
+      toast(t("恢复失败：{{error}}", { error: String(e) }), "error");
+    } finally {
+      setRecovering(false);
     }
   };
 
@@ -367,11 +402,51 @@ export default function EditorView() {
       {error && (
         <div
           role="alert"
-          className="shrink-0 border-t border-danger/25 bg-danger/10 px-6 py-2 text-footnote text-danger"
+          className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-t border-danger/25 bg-danger/10 px-6 py-2 text-footnote text-danger"
         >
-          {error}
+          <span className="min-w-0 flex-1">{error}</span>
+          {unconfirmed && (
+            <span className="text-warning">{t("可能已计费，重试会再次扣费")}</span>
+          )}
+          {requestId && (
+            <button
+              type="button"
+              onClick={() => {
+                void navigator.clipboard
+                  .writeText(requestId)
+                  .then(() => toast(t("已复制请求 ID")))
+                  .catch(() => toast(t("复制失败"), "error"));
+              }}
+              className="break-all text-left transition-colors hover:text-primary"
+              title={t("复制请求 ID（对账用）")}
+            >
+              {t("请求 ID：{{id}}", { id: requestId })}
+            </button>
+          )}
+          {requestId && (
+            <Button
+              size="sm"
+              variant="ghost"
+              loading={recovering}
+              onClick={() => void recover()}
+            >
+              {t("尝试恢复")}
+            </Button>
+          )}
         </div>
       )}
+
+      <ConfirmDialog
+        open={confirmRetry}
+        onOpenChange={setConfirmRetry}
+        title={t("确认重新生成？")}
+        description={t(
+          "这次请求可能已在服务商侧计费。重新生成会再次扣费，请先到服务商后台确认没有出图。",
+        )}
+        confirmLabel={t("仍然重新生成")}
+        danger
+        onConfirm={() => void submit(true)}
+      />
     </motion.div>
   );
 }

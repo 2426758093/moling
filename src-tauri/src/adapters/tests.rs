@@ -320,6 +320,71 @@ fn serve_once(headers: Vec<(&'static str, &'static str)>, body: Vec<u8>) -> u16 
     port
 }
 
+/// 200 但响应体是 HTML（网关错误页）：必须按「解析失败」报错，
+/// 上层已先记 billed，因此会落到「已计费未取回」而不是被当成未发送。
+#[test]
+fn html_body_on_200_is_parse_failure() {
+    let err = crate::adapters::parse_json_bytes::<serde_json::Value>(
+        "/images/generations",
+        200,
+        "text/html",
+        "",
+        b"<html><body>502 Bad Gateway</body></html>",
+    )
+    .unwrap_err();
+    assert!(
+        err.message().contains("响应解析失败"),
+        "HTML 200 应报解析失败: {}",
+        err.message()
+    );
+}
+
+/// 下载重试只覆盖瞬时故障：连接/超时/5xx 重试，鉴权/配额/解析错误立即放弃。
+/// （本机回环被下载器的 SSRF 防护拦截，这里直接验证判定函数。）
+#[test]
+fn download_retry_only_covers_transient_errors() {
+    use crate::adapters::AdapterError;
+    let transient = [
+        AdapterError::Network {
+            message: "reset".into(),
+        },
+        AdapterError::Timeout {
+            message: "slow".into(),
+        },
+        AdapterError::Upstream {
+            message: "503".into(),
+            status: 503,
+        },
+    ];
+    for err in &transient {
+        assert!(
+            crate::adapters::openai::retryable_download_error(err),
+            "{}",
+            err.message()
+        );
+    }
+    let permanent = [
+        AdapterError::AuthInvalid {
+            message: "401".into(),
+            status: 401,
+        },
+        AdapterError::QuotaExceeded {
+            message: "429".into(),
+            retry_after: None,
+        },
+        AdapterError::Other {
+            message: "404".into(),
+        },
+    ];
+    for err in &permanent {
+        assert!(
+            !crate::adapters::openai::retryable_download_error(err),
+            "{}",
+            err.message()
+        );
+    }
+}
+
 /// 端到端：真实 HTTP 链路下，链路压缩与响应头不一致时仍要解析成功。
 /// 旧实现依赖 reqwest 自动解压，遇到「头写 gzip、body 已明文」只会报 decoding 错误。
 #[test]

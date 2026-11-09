@@ -110,6 +110,37 @@ const settings = {
   导入成功: "Imported",
   "导入失败：{{error}}": "Import failed: {{error}}",
 
+  // 请求记录
+  请求记录: "Request records",
+  "只列出可能已计费但没有取回图片的请求。恢复只读取本地缓存或重新下载图片地址，不会再次调用生成接口、不会重新扣费。":
+    "Only requests that may have been billed without retrieving images are listed. Recovery reads local caches or re-downloads image URLs; it never calls the generation API again or charges you twice.",
+  打开缓存目录: "Open cache folder",
+  没有待确认的请求: "No unconfirmed requests",
+  "生成失败且结果未确认时，这里会出现可恢复的记录":
+    "Recoverable records appear here when a generation fails with an unconfirmed result",
+  变换: "Transform",
+  已计费未取回: "Billed, not retrieved",
+  部分已保存: "Partially saved",
+  "加载请求记录失败：{{error}}": "Couldn't load request records: {{error}}",
+  "时间：{{time}}": "Time: {{time}}",
+  "服务商：{{name}}": "Provider: {{name}}",
+  "模型：{{model}}": "Model: {{model}}",
+  "入口：{{entry}}": "Entry: {{entry}}",
+  "张数：{{n}}": "Images: {{n}}",
+  "状态：{{state}}": "State: {{state}}",
+  "HTTP 状态：{{status}}": "HTTP status: {{status}}",
+  "请求 ID：{{id}}": "Request ID: {{id}}",
+  对账信息已复制: "Reconciliation info copied",
+  "（{{n}} 张仍失败）": "({{n}} still failed)",
+  已标记为确认无结果: "Marked as confirmed with no result",
+  "标记失败：{{error}}": "Couldn't mark record: {{error}}",
+  复制对账信息: "Copy reconciliation info",
+  标记已确认无结果: "Mark as no result",
+  "标记为已确认无结果？": "Mark as confirmed with no result?",
+  "仅用于让这条记录不再出现在待确认列表，不会影响服务商的计费记录。请先到服务商后台确认确实没有出图。":
+    "This only removes the record from the pending list; it does not affect the provider's billing. Confirm in the provider console that no image was produced first.",
+  标记为已确认: "Mark as confirmed",
+
   // 诊断
   诊断日志: "Diagnostic logs",
   "诊断包包含近 7 天日志、应用版本与系统信息、服务商元信息与设置项；不含图片、提示词与任何 API Key。日志里可能带上游返回的错误信息，分享前请自行确认。":

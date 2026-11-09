@@ -33,7 +33,7 @@ interface QueueStore {
   setConcurrency: (n: number) => Promise<void>;
   setProviderConcurrency: (n: number) => Promise<void>;
   cancel: (id: number) => Promise<void>;
-  retry: (id: number) => Promise<void>;
+  retry: (id: number, force?: boolean) => Promise<void>;
   clearFinished: () => Promise<void>;
 }
 
@@ -186,8 +186,8 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
     await api.cancelQueueJob(id);
   },
 
-  retry: async (id) => {
-    await api.retryQueueJob(id);
+  retry: async (id, force = false) => {
+    await api.retryQueueJob(id, force);
   },
 
   clearFinished: async () => {

@@ -7,6 +7,7 @@
 //! - 取消 queued 立即置 canceled；取消 running 只置取消标记，由 worker 收尾。
 //! - 结果只写 history（画廊可见），不生成聊天消息，避免两套状态互相打架。
 
+use crate::billing_journal;
 use crate::commands::image::{
     generate_core, is_cancelled, normalize_generation, normalize_quality, CancelRegistration,
     GenerateCommandInput, GenerationRegistry, MAX_REFERENCE_IMAGES,
@@ -304,6 +305,23 @@ fn finish_or_force(
     }
 }
 
+/// 可能已计费的失败：落 jobs.billing_state，界面标「待确认」且默认禁止重跑。
+fn unconfirmed_billing_state(err_json: &str) -> Option<&'static str> {
+    let value: serde_json::Value = serde_json::from_str(err_json).ok()?;
+    if value.get("type")?.as_str()? != "unconfirmed" {
+        return None;
+    }
+    let message = value
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default();
+    Some(if message.contains("本地保存失败") {
+        billing_journal::STATE_BILLED_UNRECOVERED
+    } else {
+        billing_journal::STATE_UNKNOWN
+    })
+}
+
 /// 从适配器错误 JSON 中识别 429；返回值外层 Some 表示是限流，内层是 Retry-After
 fn quota_retry_after(err_json: &str) -> Option<Option<u64>> {
     let value: serde_json::Value = serde_json::from_str(err_json).ok()?;
@@ -380,7 +398,8 @@ async fn run_job(app: &tauri::AppHandle, job: &JobRow) -> Result<(), String> {
 
     let progress_app = app.clone();
     let progress_id = job.id;
-    let result = generate_core(app, &input, token.clone(), move |done, total| {
+    let scope = super::image::GenerateScope::queue(job.id);
+    let result = generate_core(app, &input, &scope, token.clone(), move |done, total| {
         let _ = progress_app.emit(
             "queue:progress",
             serde_json::json!({ "id": progress_id, "done": done, "total": total }),
@@ -422,6 +441,12 @@ async fn run_job(app: &tauri::AppHandle, job: &JobRow) -> Result<(), String> {
             finish_or_force(job.id, status, &images_json, warning.as_deref())?;
         }
         Err(e) => {
+            // 已受理但结果未确认：记待确认状态，默认重试会被 storage 层拒绝
+            if let Some(state) = unconfirmed_billing_state(&e) {
+                if let Err(err) = storage::set_job_billing_state(job.id, state) {
+                    tracing::warn!("写入任务 #{} 计费状态失败: {err}", job.id);
+                }
+            }
             if is_cancelled(&token) {
                 finish_or_force(job.id, "canceled", "[]", None)?;
             } else if let Some(requested) = quota_retry_after(&e) {
@@ -601,14 +626,28 @@ pub async fn cancel_queue_job(app: tauri::AppHandle, id: i64) -> Result<(), Stri
     Ok(())
 }
 
-/// 失败/取消/中断的任务重新入队
+/// 失败/取消/中断的任务重新入队。
+/// 结果未确认（可能已计费）的任务必须 `force=true` 才允许重发。
 #[tauri::command]
 pub async fn retry_queue_job(
     app: tauri::AppHandle,
     state: tauri::State<'_, SharedQueue>,
     id: i64,
+    force: Option<bool>,
 ) -> Result<(), String> {
-    if storage::requeue_job(id)? {
+    let force = force.unwrap_or(false);
+    if !force {
+        if let Some(job) = storage::get_job(id)? {
+            if matches!(job.billing_state.as_str(), "unknown" | "billed_unrecovered") {
+                return Err(
+                    "该任务上次结果未确认（可能已计费）。请先在「请求记录」核对服务商后台，\
+                     确认没有出图后再强制重试"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    if storage::requeue_job(id, force)? {
         emit_job(&app, id);
         state.wake();
     }

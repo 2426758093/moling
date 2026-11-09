@@ -1,7 +1,9 @@
 use crate::adapters::{self, AdapterError, EditRequest, GenerateRequest, TransformRequest};
+use crate::billing_journal::{self, AttemptCtx, AttemptSpec, BillingClass};
 use crate::image_store::{self, SAFE_NAME_MAX_CHARS};
 use crate::key_pool;
 use crate::storage;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
 use tauri::Emitter;
 
@@ -256,10 +258,11 @@ pub async fn generate_images(
     // RA-06：注册取消 token（不传 jobId 时不注册，行为与旧版完全一致）；
     // _registration 守卫在函数退出（含出错提前返回）时自动移除 token。
     let (_registration, cancel_token) = CancelRegistration::new(&state, input.job_id.as_ref());
+    let scope = GenerateScope::chat(input.job_id.as_deref());
     let progress_app = app.clone();
     let job_id = input.job_id.clone();
     let requested = normalize_count(input.count);
-    let outcome = generate_core(&app, &input, cancel_token, move |done, total| {
+    let outcome = generate_core(&app, &input, &scope, cancel_token, move |done, total| {
         // 事件发不出去（窗口已关）不影响生成
         if let Some(payload) = progress_payload(job_id.as_deref(), done, total, requested) {
             let _ = progress_app.emit("image:progress", payload);
@@ -297,11 +300,94 @@ async fn ensure_thumb_async(path: String) {
     .await;
 }
 
+/// 一次生成动作的归属：聊天（前端 jobId）或队列（jobs.id）。
+/// 同一次用户动作里的多次 HTTP 尝试共享 group_id，便于对账时归组。
+pub(crate) struct GenerateScope {
+    pub entry: &'static str,
+    pub group_id: String,
+    pub job_id: Option<i64>,
+}
+
+impl GenerateScope {
+    pub(crate) fn chat(job_id: Option<&str>) -> Self {
+        Self {
+            entry: "chat",
+            group_id: job_id
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("chat-{}", storage::timestamp_millis())),
+            job_id: None,
+        }
+    }
+
+    pub(crate) fn queue(job_id: i64) -> Self {
+        Self {
+            entry: "queue",
+            group_id: format!("queue-{job_id}-{}", storage::timestamp_millis()),
+            job_id: Some(job_id),
+        }
+    }
+}
+
+/// 请求指纹：参数完全相同且仍在途，几乎只可能是连点/重复提交。
+fn param_fingerprint(input: &GenerateCommandInput, req: &GenerateRequest) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    let mut hasher = DefaultHasher::new();
+    input.provider_id.hash(&mut hasher);
+    req.model.hash(&mut hasher);
+    req.prompt.hash(&mut hasher);
+    req.negative_prompt.hash(&mut hasher);
+    req.width.hash(&mut hasher);
+    req.height.hash(&mut hasher);
+    req.quality.hash(&mut hasher);
+    req.guidance.map(f32::to_bits).hash(&mut hasher);
+    req.steps.hash(&mut hasher);
+    req.seed.hash(&mut hasher);
+    req.count.hash(&mut hasher);
+    for img in &req.images {
+        img.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
+}
+
+fn request_endpoint(req: &GenerateRequest) -> &'static str {
+    if req.images.is_empty() {
+        "/images/generations"
+    } else {
+        "/images/edits"
+    }
+}
+
+/// 把「可能需要用户确认」的失败包装成 `Unconfirmed`：前端据此提示先对账再重试。
+fn billing_error(ctx: &AttemptCtx, err: AdapterError, class: BillingClass) -> AdapterError {
+    match class {
+        BillingClass::NotBilled => timeout_billing_hint(err),
+        BillingClass::PossiblyBilled | BillingClass::BilledUnrecovered => {
+            let slow_hint = match &err {
+                AdapterError::Timeout { message } if message.contains("等待服务商响应超时") => {
+                    "图片生成常需数分钟，可在「服务商管理」中调高「超时」；"
+                }
+                _ => "",
+            };
+            let tail = if class == BillingClass::BilledUnrecovered {
+                "服务商已受理并计费，但图片未能取回；可稍后在「请求记录」里尝试恢复，不要直接重新生成"
+            } else {
+                "请求可能已在上游生成并计费，请先到画廊或服务商后台确认后再重试"
+            };
+            AdapterError::Unconfirmed {
+                message: format!("{}{}（{tail}）", err.message(), slow_hint),
+                request_id: ctx.client_request_id().to_string(),
+                artifact: None,
+            }
+        }
+    }
+}
+
 /// 生成 + 逐张落盘/入库的核心流程；取消 token 由调用方注册与回收。
 /// `on_progress(done, total)` 在每张图落盘入库后调用一次（队列据此发进度事件）。
 pub(crate) async fn generate_core<F>(
     app: &tauri::AppHandle,
     input: &GenerateCommandInput,
+    scope: &GenerateScope,
     cancel_token: Option<CancelToken>,
     mut on_progress: F,
 ) -> Result<GenerateOutcome, String>
@@ -361,11 +447,15 @@ where
         references: references.to_vec(),
     };
 
-    // 失败自动重试：仅 Network/Timeout 重试一次（RA-04）；
-    // 401/403 视为该 Key 不可用，切到下一个 Key（生成请求被拒不会计费）
+    let param_hash = param_fingerprint(input, &req);
+    let endpoint = request_endpoint(&req);
+
+    // 失败自动重试：只有「肯定未计费」的建连失败才重试一次（RA-04）；
+    // 401/403 视为该 Key 不可用，切到下一个 Key（请求被拒不会计费）。
+    // 其余失败（超时 / 断连 / 5xx / 解析失败）可能已在上游生成并计费，一律不重发。
     let mut cancelled = false;
     let mut last_err: Option<AdapterError> = None;
-    let mut images: Option<Vec<String>> = None;
+    let mut generated: Option<(AttemptCtx, Vec<String>)> = None;
     'keys: for candidate in &candidates {
         let config = &candidate.config;
         let adapter = match adapters::get_adapter(&config.kind) {
@@ -378,14 +468,33 @@ where
                 cancelled = true;
                 break 'keys;
             }
-            match adapter.generate(config, &req).await {
+            // 先落请求意图再发送：连 DB 都写不进去就不发计费请求（fail-closed）
+            let ctx = match AttemptCtx::begin(&AttemptSpec {
+                group_id: &scope.group_id,
+                entry: scope.entry,
+                op: "generate",
+                job_id: scope.job_id,
+                provider_id: input.provider_id,
+                provider_name: &row.name,
+                model: &input.model,
+                prompt: &full_prompt,
+                endpoint,
+                attempt: attempt + 1,
+                param_hash: &param_hash,
+                image_count: count,
+            }) {
+                Ok(ctx) => ctx,
+                Err(e) => return Err(e.to_string()),
+            };
+            match adapter.generate_journaled(config, &req, Some(&ctx)).await {
                 Ok(imgs) => {
                     key_pool::note_success(input.provider_id, candidate.index);
-                    images = Some(imgs);
+                    generated = Some((ctx, imgs));
                     break 'keys;
                 }
                 Err(e) if key_pool::is_auth(&e) => {
                     key_pool::note_auth_failure(input.provider_id, candidate.index, &e);
+                    ctx.finish(billing_journal::STATE_FAILED, Some(&e), &[]);
                     tracing::warn!(
                         "服务商「{}」第 {} 个 Key 鉴权失败，尝试下一个 Key",
                         row.name,
@@ -395,9 +504,24 @@ where
                     break;
                 }
                 Err(e) => {
-                    // RA-04：只有瞬时错误才重试；生成非幂等且计费，
-                    // 配额/内容拦截/其他错误重试可能造成重复扣费，一律直接返回。
-                    if attempt + 1 < GENERATE_MAX_ATTEMPTS && is_retryable(&e) {
+                    let class = billing_journal::classify_billing(&e, ctx.is_billed());
+                    ctx.finish(
+                        match class {
+                            BillingClass::NotBilled => billing_journal::STATE_FAILED,
+                            BillingClass::PossiblyBilled => billing_journal::STATE_UNKNOWN,
+                            BillingClass::BilledUnrecovered => {
+                                billing_journal::STATE_BILLED_UNRECOVERED
+                            }
+                        },
+                        Some(&e),
+                        &[],
+                    );
+                    // 可能已计费：绝不自动重发，交给用户对账后决定
+                    if class != BillingClass::NotBilled {
+                        return Err(adapters::adapter_error_json(billing_error(&ctx, e, class)));
+                    }
+                    let retry = is_retryable(&e) && attempt + 1 < GENERATE_MAX_ATTEMPTS;
+                    if retry {
                         tracing::warn!(
                             "generate_images 第 {} 次尝试失败，准备重试: {}",
                             attempt + 1,
@@ -421,20 +545,19 @@ where
     let now = storage::timestamp_millis();
     let mut out = Vec::new();
     let mut failed: Vec<FailedImage> = Vec::new();
-    if let Some(images) = images {
+    if let Some((ctx, images)) = generated {
         let total = images.len();
+        // 请求已发出就以拿回产物为先：停止只影响展示与最终标记，
+        // 不再丢弃服务商已经返回（并且已经计费）的图片。
+        cancelled = is_cancelled(&cancel_token);
+        let mut saved_paths: Vec<String> = Vec::with_capacity(total);
         for (i, b64) in images.iter().enumerate() {
-            // 每张图落盘/入库前检查取消：已取消则立即跳出，返回已生成结果
-            if is_cancelled(&cancel_token) {
-                cancelled = true;
-                break;
-            }
             // B4：单张失败只记录明细，不丢掉已成功的其它图片
             let seed_val = Some(input.seed.map(|s| s as i64).unwrap_or_else(rand::random));
             let persisted = (|| -> Result<(String, String, i64), String> {
                 let name = image_store::unique_name("", &now, i);
-                let (path, data_url) =
-                    image_store::save_b64_image(app, b64, &name).map_err(|e| e.to_string())?;
+                let (path, data_url) = image_store::save_b64_image_with_retry(app, b64, &name)
+                    .map_err(|e| e.to_string())?;
                 let id = storage::add_history(&storage::HistoryRow {
                     id: 0,
                     prompt: full_prompt.clone(),
@@ -460,6 +583,7 @@ where
                 Ok((path, data_url, id)) => {
                     // 生成即建缩略图：画廊首屏只传缩略图，避免每页几十 MB 的原图 base64
                     ensure_thumb_async(path.clone()).await;
+                    saved_paths.push(path.clone());
                     out.push(GeneratedImage {
                         history_id: id,
                         data_url,
@@ -472,6 +596,12 @@ where
                 }
                 Err(reason) => {
                     tracing::warn!("第 {} 张图片保存失败: {reason}", i + 1);
+                    // 保底：把图片本体留在请求目录，恢复入口不需要重新生成
+                    if let Some(stashed) =
+                        billing_journal::stash_b64_artifact(ctx.client_request_id(), i, b64)
+                    {
+                        ctx.note_artifact(&stashed);
+                    }
                     failed.push(FailedImage {
                         index: i + 1,
                         reason,
@@ -479,20 +609,45 @@ where
                 }
             }
         }
+        let state = if out.is_empty() {
+            billing_journal::STATE_BILLED_UNRECOVERED
+        } else if failed.is_empty() {
+            billing_journal::STATE_SUCCEEDED
+        } else {
+            billing_journal::STATE_PARTIAL
+        };
+        let save_error = failed.first().map(|f| AdapterError::Other {
+            message: format!("第 {} 张：{}", f.index, f.reason),
+        });
+        ctx.finish(state, save_error.as_ref(), &saved_paths);
+        if state == billing_journal::STATE_SUCCEEDED {
+            ctx.discard_raw();
+            return Ok(GenerateOutcome {
+                images: out,
+                failed,
+                cancelled,
+            });
+        }
+        if out.is_empty() {
+            // 已计费但一个字节都没落库：给出可恢复的错误，而不是普通失败
+            let reason = failed
+                .iter()
+                .map(|f| format!("第 {} 张：{}", f.index, f.reason))
+                .collect::<Vec<_>>()
+                .join("；");
+            return Err(adapters::adapter_error_json(AdapterError::Unconfirmed {
+                message: format!(
+                    "图片已生成但本地保存失败：{reason}（原图已缓存，可在「请求记录」中恢复）"
+                ),
+                request_id: ctx.client_request_id().to_string(),
+                artifact: None,
+            }));
+        }
     } else if !cancelled {
         // 未取消却没有图片：只可能是所有 Key 均鉴权失败或重试耗尽
         return Err(adapters::adapter_error_json(
             last_err.expect("无图片且未取消必有错误"),
         ));
-    }
-    // 全部失败时按错误返回，避免前端看到“成功但 0 张”的误导状态
-    if out.is_empty() && !cancelled && !failed.is_empty() {
-        let reason = failed
-            .iter()
-            .map(|f| format!("第 {} 张：{}", f.index, f.reason))
-            .collect::<Vec<_>>()
-            .join("；");
-        return Err(format!("图片保存失败：{reason}"));
     }
     Ok(GenerateOutcome {
         images: out,
@@ -537,31 +692,109 @@ fn normalize_edit_op(op: Option<&str>, erase: bool) -> &'static str {
     }
 }
 
+/// 编辑类请求的对账信息（一次用户动作一条 group）。
+struct EditJournal<'a> {
+    group_id: &'a str,
+    entry: &'a str,
+    op: &'a str,
+    param_hash: &'a str,
+    provider_name: &'a str,
+    model: &'a str,
+    prompt: &'a str,
+}
+
 /// 编辑类请求的公共执行段：Key 轮换 + 单次调用（编辑计费，鉴权失败不重发）。
-async fn run_edit(provider_id: i64, req: &EditRequest) -> Result<String, String> {
+/// 成功时把 `AttemptCtx` 交给调用方：图片落盘入库后再写终态与产物路径。
+async fn run_edit(
+    provider_id: i64,
+    req: &EditRequest,
+    journal: &EditJournal<'_>,
+) -> Result<(AttemptCtx, String), String> {
     let candidates = key_pool::candidates(provider_id)?;
     if candidates.is_empty() {
         return Err("该服务商还没有配置 API Key".to_string());
     }
-    let mut b64 = None;
     let mut last_err: Option<AdapterError> = None;
     for candidate in &candidates {
         let adapter =
             adapters::get_adapter(&candidate.config.kind).map_err(adapters::adapter_error_json)?;
-        match adapter.edit(&candidate.config, req).await {
+        // 先落请求意图再发送：没有流水就不发计费请求
+        let ctx = AttemptCtx::begin(&AttemptSpec {
+            group_id: journal.group_id,
+            entry: journal.entry,
+            op: journal.op,
+            job_id: None,
+            provider_id,
+            provider_name: journal.provider_name,
+            model: journal.model,
+            prompt: journal.prompt,
+            endpoint: "/images/edits",
+            attempt: candidate.index as u32 + 1,
+            param_hash: journal.param_hash,
+            image_count: 1,
+        })
+        .map_err(|e| e.to_string())?;
+        match adapter
+            .edit_journaled(&candidate.config, req, Some(&ctx))
+            .await
+        {
             Ok(result) => {
                 key_pool::note_success(provider_id, candidate.index);
-                b64 = Some(result);
-                break;
+                return Ok((ctx, result));
             }
             Err(e) if key_pool::is_auth(&e) => {
                 key_pool::note_auth_failure(provider_id, candidate.index, &e);
+                ctx.finish(billing_journal::STATE_FAILED, Some(&e), &[]);
                 last_err = Some(e);
             }
-            Err(e) => return Err(adapters::adapter_error_json(timeout_billing_hint(e))),
+            Err(e) => {
+                let class = billing_journal::classify_billing(&e, ctx.is_billed());
+                ctx.finish(
+                    match class {
+                        BillingClass::NotBilled => billing_journal::STATE_FAILED,
+                        BillingClass::PossiblyBilled => billing_journal::STATE_UNKNOWN,
+                        BillingClass::BilledUnrecovered => {
+                            billing_journal::STATE_BILLED_UNRECOVERED
+                        }
+                    },
+                    Some(&e),
+                    &[],
+                );
+                return Err(adapters::adapter_error_json(billing_error(&ctx, e, class)));
+            }
         }
     }
-    b64.ok_or_else(|| adapters::adapter_error_json(last_err.expect("候选列表非空时必有结果或错误")))
+    Err(adapters::adapter_error_json(
+        last_err.expect("候选列表非空时必有结果或错误"),
+    ))
+}
+
+/// 图片落盘 / 入库失败但请求已计费：留底并给出可恢复错误，绝不丢图。
+fn billed_save_error(ctx: &AttemptCtx, b64: &str, reason: String) -> String {
+    if let Some(stashed) = billing_journal::stash_b64_artifact(ctx.client_request_id(), 0, b64) {
+        ctx.note_artifact(&stashed);
+    }
+    let err = AdapterError::Other {
+        message: reason.clone(),
+    };
+    ctx.finish(billing_journal::STATE_BILLED_UNRECOVERED, Some(&err), &[]);
+    adapters::adapter_error_json(AdapterError::Unconfirmed {
+        message: format!(
+            "图片已生成但本地保存失败：{reason}（原图已缓存，可在「请求记录」中恢复）"
+        ),
+        request_id: ctx.client_request_id().to_string(),
+        artifact: None,
+    })
+}
+
+/// 指纹：参数 + 输入图内容；用于阻止连点造成的重复计费。
+fn edit_fingerprint(parts: &[&str]) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    let mut hasher = DefaultHasher::new();
+    for part in parts {
+        part.hash(&mut hasher);
+    }
+    format!("{:016x}", hasher.finish())
 }
 
 #[tauri::command]
@@ -599,14 +832,42 @@ pub async fn edit_image(
         width: input.width,
         height: input.height,
     };
-    let b64 = run_edit(input.provider_id, &req).await?;
     let now = storage::timestamp_millis();
     let op = normalize_edit_op(input.op.as_deref(), erase);
+    let group_id = format!("edit-{now}");
+    let param_hash = edit_fingerprint(&[
+        &input.provider_id.to_string(),
+        &input.model,
+        &req.prompt,
+        req.negative_prompt.as_deref().unwrap_or(""),
+        &req.image_b64,
+        req.mask_b64.as_deref().unwrap_or(""),
+        op,
+        &input.width.to_string(),
+        &input.height.to_string(),
+    ]);
+    let (ctx, b64) = run_edit(
+        input.provider_id,
+        &req,
+        &EditJournal {
+            group_id: &group_id,
+            entry: "edit",
+            op,
+            param_hash: &param_hash,
+            provider_name: &row.name,
+            model: &input.model,
+            prompt: &input.prompt,
+        },
+    )
+    .await?;
     // 统一命名：edit_ 前缀 + 纳秒 + 随机尾（旧版只到毫秒，同毫秒多张编辑会互相覆盖）
     let name = image_store::unique_name("edit_", &now, 0);
-    let (path, data_url) = image_store::save_b64_image(&app, &b64, &name)?;
+    let (path, data_url) = match image_store::save_b64_image_with_retry(&app, &b64, &name) {
+        Ok(v) => v,
+        Err(e) => return Err(billed_save_error(&ctx, &b64, e.to_string())),
+    };
     ensure_thumb_async(path.clone()).await;
-    let id = storage::add_history(&storage::HistoryRow {
+    let id = match storage::add_history(&storage::HistoryRow {
         id: 0,
         prompt: input.prompt.clone(),
         negative_prompt: input.negative_prompt.clone().unwrap_or_default(),
@@ -623,7 +884,16 @@ pub async fn edit_image(
         created_at: now,
         parent_id: input.parent_id,
         op: op.to_string(),
-    })?;
+    }) {
+        Ok(id) => id,
+        Err(e) => return Err(billed_save_error(&ctx, &b64, e.to_string())),
+    };
+    ctx.finish(
+        billing_journal::STATE_SUCCEEDED,
+        None,
+        std::slice::from_ref(&path),
+    );
+    ctx.discard_raw();
     Ok(serde_json::json!({
         "historyId": id,
         "dataUrl": data_url,
@@ -691,25 +961,69 @@ pub async fn transform_image(
         scale,
         mode: mode.to_string(),
     };
-    let mut b64 = None;
+    let mut journaled: Option<(AttemptCtx, String)> = None;
     let mut last_err: Option<AdapterError> = None;
+    let now = storage::timestamp_millis();
+    let group_id = format!("transform-{now}");
+    let param_hash = edit_fingerprint(&[
+        &input.provider_id.to_string(),
+        &input.model,
+        &style,
+        op,
+        mode,
+        &scale.to_string(),
+        &req.image_b64,
+    ]);
     for candidate in &candidates {
         let adapter =
             adapters::get_adapter(&candidate.config.kind).map_err(adapters::adapter_error_json)?;
-        match adapter.transform(&candidate.config, &req).await {
+        let ctx = AttemptCtx::begin(&AttemptSpec {
+            group_id: &group_id,
+            entry: "transform",
+            op,
+            job_id: None,
+            provider_id: input.provider_id,
+            provider_name: &row.name,
+            model: &input.model,
+            prompt: &style,
+            endpoint: "/images/edits",
+            attempt: candidate.index as u32 + 1,
+            param_hash: &param_hash,
+            image_count: 1,
+        })
+        .map_err(|e| e.to_string())?;
+        match adapter
+            .transform_journaled(&candidate.config, &req, Some(&ctx))
+            .await
+        {
             Ok(result) => {
                 key_pool::note_success(input.provider_id, candidate.index);
-                b64 = Some(result);
+                journaled = Some((ctx, result));
                 break;
             }
             Err(e) if key_pool::is_auth(&e) => {
                 key_pool::note_auth_failure(input.provider_id, candidate.index, &e);
+                ctx.finish(billing_journal::STATE_FAILED, Some(&e), &[]);
                 last_err = Some(e);
             }
-            Err(e) => return Err(adapters::adapter_error_json(timeout_billing_hint(e))),
+            Err(e) => {
+                let class = billing_journal::classify_billing(&e, ctx.is_billed());
+                ctx.finish(
+                    match class {
+                        BillingClass::NotBilled => billing_journal::STATE_FAILED,
+                        BillingClass::PossiblyBilled => billing_journal::STATE_UNKNOWN,
+                        BillingClass::BilledUnrecovered => {
+                            billing_journal::STATE_BILLED_UNRECOVERED
+                        }
+                    },
+                    Some(&e),
+                    &[],
+                );
+                return Err(adapters::adapter_error_json(billing_error(&ctx, e, class)));
+            }
         }
     }
-    let b64 = b64.ok_or_else(|| {
+    let (ctx, b64) = journaled.ok_or_else(|| {
         adapters::adapter_error_json(last_err.expect("候选列表非空时必有结果或错误"))
     })?;
 
@@ -717,10 +1031,12 @@ pub async fn transform_image(
         Some(pid) => storage::history_row(pid)?,
         None => None,
     };
-    let now = storage::timestamp_millis();
     let prefix = if op == "style" { "style_" } else { "up_" };
     let name = image_store::unique_name(prefix, &now, 0);
-    let (path, data_url) = image_store::save_b64_image(&app, &b64, &name)?;
+    let (path, data_url) = match image_store::save_b64_image_with_retry(&app, &b64, &name) {
+        Ok(v) => v,
+        Err(e) => return Err(billed_save_error(&ctx, &b64, e.to_string())),
+    };
     ensure_thumb_async(path.clone()).await;
     let (width, height) = decoded_size(&b64);
     let prompt = if op == "style" {
@@ -732,7 +1048,7 @@ pub async fn transform_image(
             .filter(|p| !p.trim().is_empty())
             .unwrap_or_else(|| format!("高清放大 {scale}x"))
     };
-    let id = storage::add_history(&storage::HistoryRow {
+    let id = match storage::add_history(&storage::HistoryRow {
         id: 0,
         prompt,
         negative_prompt: parent
@@ -752,7 +1068,16 @@ pub async fn transform_image(
         created_at: now,
         parent_id: input.parent_id,
         op: op.to_string(),
-    })?;
+    }) {
+        Ok(id) => id,
+        Err(e) => return Err(billed_save_error(&ctx, &b64, e.to_string())),
+    };
+    ctx.finish(
+        billing_journal::STATE_SUCCEEDED,
+        None,
+        std::slice::from_ref(&path),
+    );
+    ctx.discard_raw();
     Ok(serde_json::json!({
         "historyId": id,
         "dataUrl": data_url,
@@ -923,7 +1248,7 @@ pub async fn replace_background(
     }
     let (base_w, base_h) = (base.width(), base.height());
 
-    let (b64, provider_name, model, history_prompt) = match input.kind.as_str() {
+    let (b64, provider_name, model, history_prompt, journal_ctx) = match input.kind.as_str() {
         "solid" => {
             let color = background::parse_hex(&input.color)?;
             let out = background::composite(
@@ -937,6 +1262,7 @@ pub async fn replace_background(
                 "本地合成".to_string(),
                 String::new(),
                 format!("换背景：纯色 {}", input.color.trim()),
+                None,
             )
         }
         "gradient" => {
@@ -961,6 +1287,7 @@ pub async fn replace_background(
                     input.color_from.trim(),
                     input.color_to.trim()
                 ),
+                None,
             )
         }
         "ai" => {
@@ -987,18 +1314,49 @@ pub async fn replace_background(
                 width: base_w,
                 height: base_h,
             };
-            let b64 = run_edit(provider_id, &req).await?;
-            (b64, row.name.clone(), model, format!("换背景：{desc}"))
+            let group_id = format!("background-{}", storage::timestamp_millis());
+            let param_hash = edit_fingerprint(&[
+                &provider_id.to_string(),
+                &model,
+                &desc,
+                &req.image_b64,
+                &mask_raw,
+            ]);
+            let (ctx, b64) = run_edit(
+                provider_id,
+                &req,
+                &EditJournal {
+                    group_id: &group_id,
+                    entry: "background",
+                    op: "background",
+                    param_hash: &param_hash,
+                    provider_name: &row.name,
+                    model: &model,
+                    prompt: &desc,
+                },
+            )
+            .await?;
+            (
+                b64,
+                row.name.clone(),
+                model,
+                format!("换背景：{desc}"),
+                Some(ctx),
+            )
         }
         other => return Err(format!("未知的背景类型: {other}")),
     };
 
     let now = storage::timestamp_millis();
     let name = image_store::unique_name("bg_", &now, 0);
-    let (path, data_url) = image_store::save_b64_image(&app, &b64, &name)?;
+    let (path, data_url) = match &journal_ctx {
+        Some(ctx) => image_store::save_b64_image_with_retry(&app, &b64, &name)
+            .map_err(|e| billed_save_error(ctx, &b64, e.to_string()))?,
+        None => image_store::save_b64_image(&app, &b64, &name).map_err(|e| e.to_string())?,
+    };
     ensure_thumb_async(path.clone()).await;
     let (width, height) = decoded_size(&b64);
-    let id = storage::add_history(&storage::HistoryRow {
+    let id = match storage::add_history(&storage::HistoryRow {
         id: 0,
         prompt: history_prompt,
         negative_prompt: input.negative_prompt.clone().unwrap_or_default(),
@@ -1015,7 +1373,21 @@ pub async fn replace_background(
         created_at: now,
         parent_id: input.parent_id,
         op: "background".to_string(),
-    })?;
+    }) {
+        Ok(id) => id,
+        Err(e) => match &journal_ctx {
+            Some(ctx) => return Err(billed_save_error(ctx, &b64, e.to_string())),
+            None => return Err(e.to_string()),
+        },
+    };
+    if let Some(ctx) = &journal_ctx {
+        ctx.finish(
+            billing_journal::STATE_SUCCEEDED,
+            None,
+            std::slice::from_ref(&path),
+        );
+        ctx.discard_raw();
+    }
     Ok(serde_json::json!({
         "historyId": id,
         "dataUrl": data_url,

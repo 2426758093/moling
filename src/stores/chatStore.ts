@@ -6,6 +6,7 @@ import {
   ChatMessage,
   Conversation,
   ImageProgress,
+  isUnconfirmedError,
   parseAdapterError,
 } from "../lib/api";
 import i18n from "../i18n";
@@ -147,6 +148,13 @@ function toDisplay(m: ChatMessage): DisplayMessage {
   } catch {
     // 忽略损坏数据
   }
+  // 失败/未确认的轮次重启后仍要显示为失败，而不是「已完成的空回复」
+  const status: DisplayMessage["status"] =
+    m.status === "stopped"
+      ? "stopped"
+      : m.status === "failed" || m.status === "unconfirmed"
+        ? "error"
+        : "done";
   return {
     id: m.id,
     role: m.role as "user" | "assistant",
@@ -156,9 +164,16 @@ function toDisplay(m: ChatMessage): DisplayMessage {
     attachments,
     images,
     pendingImages: 0,
-    status: "done",
-    error: null,
+    status,
+    error: m.error ? parseAdapterError(m.error) : null,
   };
+}
+
+/** 落库状态：停止保存为 stopped，可能已计费的失败保存为 unconfirmed */
+function persistedStatus(m: DisplayMessage | undefined): string {
+  if (!m || m.status === "done" || m.status === "generating") return "done";
+  if (m.status === "stopped") return "stopped";
+  return m.error?.type === "unconfirmed" ? "unconfirmed" : "failed";
 }
 
 let sendSeq = 0;
@@ -220,7 +235,10 @@ export const useChatStore = create<ChatState>((set, get) => {
       images: ChatImage[],
       markError = true,
     ): Promise<boolean> => {
-      const finalMsg = get().messages.find((m) => m.id === assistantLocalId);
+      // 已切到别的会话时消息不在当前列表里，退回快照，避免内容/状态丢失
+      const finalMsg =
+        get().messages.find((m) => m.id === assistantLocalId) ??
+        (activeGeneration === myGeneration ? myGeneration?.message : undefined);
       let persisted: { id: number; imagesJson: string };
       try {
         persisted = await api.addMessage({
@@ -233,6 +251,8 @@ export const useChatStore = create<ChatState>((set, get) => {
           ),
           paramsJson: JSON.stringify(useAppStore.getState().prefs),
           createdAt: nowTimestamp(),
+          status: persistedStatus(finalMsg),
+          error: finalMsg?.error ? JSON.stringify(finalMsg.error) : undefined,
         });
       } catch (e) {
         if (isCurrent() && markError) {
@@ -373,7 +393,14 @@ export const useChatStore = create<ChatState>((set, get) => {
           jobId,
         });
         cancelled = Boolean(resp.cancelled);
-        if (!isCurrent()) return;
+        // 已停止等待且用户又发了新消息：旧流程不能再写消息列表，
+        // 但后端已经落库的图片仍需告知用户去画廊取
+        if (!isCurrent()) {
+          if ((resp.images?.length ?? 0) > 0) {
+            toast(i18n.t("已停止等待，结果已保存到画廊"));
+          }
+          return;
+        }
         for (const img of resp.images ?? []) {
           images.push({
             historyId: img.historyId,
@@ -417,16 +444,25 @@ export const useChatStore = create<ChatState>((set, get) => {
         );
       }
 
-      // 3. 停止/取消语义：已生成的图片保留并照常持久化，assistant 消息标记 stopped
+      // 3. 停止/取消语义：已生成的图片保留并照常持久化，assistant 消息标记 stopped。
+      //    若这次请求以「可能已计费」结束，即使已停止也要如实提示结果未确认。
       if (cancelled || get().stopRequested) {
+        const unconfirmed = genError && isUnconfirmedError(genError) ? genError : null;
         updateAssistant({
-          status: "stopped",
-          error: null,
+          status: unconfirmed ? "error" : "stopped",
+          error: unconfirmed,
           pendingImages: 0,
           // 一张都没生成时也落一条消息，否则这条提问在历史里没有任何回复痕迹
-          ...(images.length === 0 ? { content: CANCELED_MESSAGE } : undefined),
+          ...(images.length === 0 && !unconfirmed
+            ? { content: CANCELED_MESSAGE }
+            : undefined),
         });
         await persistAssistant(images, false);
+        if (unconfirmed) {
+          toast(i18n.t("已停止等待，但结果未确认，请先到服务商后台核对是否计费"), "error");
+        } else if (images.length > 0) {
+          toast(i18n.t("已停止等待，结果已保存"));
+        }
         finalize();
         return;
       }
