@@ -13,14 +13,18 @@ const ALLOWED_SETTING_KEYS: &[&str] = &[
     "defaultProviderId",
     "defaultParams",
     "promptTemplates",
+    "stylePresets",
     "theme",
     "glassAppearance",
     "uiMode",
+    "locale",
     "queueConcurrency",
     "queueProviderConcurrency",
+    "queueAutoResume",
     "cacheRetentionDays",
     "bodyIdleTimeoutSecs",
     "bodyTotalTimeoutSecs",
+    "smartMask",
 ];
 
 fn check_setting_key(key: &str) -> Result<(), String> {
@@ -43,6 +47,15 @@ fn check_setting_value(key: &str, value: &str) -> Result<(), String> {
         }
         "uiMode" if !matches!(value, "simple" | "expert") => {
             Err(format!("界面模式取值非法: {value}"))
+        }
+        "locale" if !matches!(value, "zh-CN" | "en-US") => {
+            Err(format!("界面语言取值非法: {value}"))
+        }
+        "smartMask" if !matches!(value, "on" | "off") => {
+            Err(format!("智能蒙版开关取值非法: {value}"))
+        }
+        "queueAutoResume" if !matches!(value, "on" | "off") => {
+            Err(format!("队列自动续跑开关取值非法: {value}"))
         }
         "queueConcurrency"
             if !matches!(
@@ -181,6 +194,99 @@ pub async fn save_prompt_templates(custom: serde_json::Value) -> Result<(), Stri
     Ok(())
 }
 
+const STYLE_PRESETS_KEY: &str = "stylePresets";
+const MAX_CUSTOM_STYLE_PRESETS: usize = 50;
+
+/// 内置风格：prompt 与旧版 STYLE_PRESETS 的 id 文本保持一致，
+/// 否则历史记录里的 style 字段会对不上画廊筛选项。
+pub const BUILTIN_STYLE_PRESETS: &str = r#"[
+    {"id":"photo","label":"真实摄影","prompt":"photorealistic, 8k, raw photo"},
+    {"id":"anime","label":"动漫","prompt":"anime style, vibrant, cel shading"},
+    {"id":"oil","label":"油画","prompt":"oil painting, classic brushwork"},
+    {"id":"watercolor","label":"水彩","prompt":"watercolor, soft washes, paper texture"},
+    {"id":"cyberpunk","label":"赛博朋克","prompt":"cyberpunk, neon lights, futuristic"},
+    {"id":"film","label":"胶片","prompt":"analog film photography, subtle grain"},
+    {"id":"render3d","label":"3D 渲染","prompt":"3D render, soft studio lighting"}
+]"#;
+
+fn builtin_style_ids() -> Vec<String> {
+    serde_json::from_str::<Vec<serde_json::Value>>(BUILTIN_STYLE_PRESETS)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|v| v["id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// 自定义风格写入前校验：脏数据会让下拉框出现空项或被同名内置项覆盖。
+fn validate_style_presets(custom: &serde_json::Value) -> Result<(), String> {
+    let list = custom
+        .as_array()
+        .ok_or_else(|| "自定义风格必须是数组".to_string())?;
+    if list.len() > MAX_CUSTOM_STYLE_PRESETS {
+        return Err(format!("自定义风格最多 {MAX_CUSTOM_STYLE_PRESETS} 个"));
+    }
+    let builtin_ids = builtin_style_ids();
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for item in list {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| "每个自定义风格必须是对象".to_string())?;
+        for key in ["id", "label", "prompt"] {
+            let ok = obj
+                .get(key)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty());
+            if !ok {
+                return Err("每个自定义风格都需要非空的 id / 名称 / 提示词".into());
+            }
+        }
+        let id = obj["id"].as_str().unwrap().trim();
+        let label = obj["label"].as_str().unwrap().trim();
+        let prompt = obj["prompt"].as_str().unwrap().trim();
+        if id.len() > 64 {
+            return Err("自定义风格 id 过长".into());
+        }
+        if label.chars().count() > 40 {
+            return Err("自定义风格名称最长 40 个字符".into());
+        }
+        if prompt.chars().count() > 500 {
+            return Err("自定义风格提示词最长 500 个字符".into());
+        }
+        if !seen.insert(id) {
+            return Err(format!("自定义风格 id 重复: {id}"));
+        }
+        if builtin_ids.iter().any(|b| b == id) {
+            return Err(format!("自定义风格 id 与内置风格冲突: {id}"));
+        }
+    }
+    Ok(())
+}
+
+/// 风格预设 = 内置 + 用户自定义（settings 中只存自定义部分）
+#[tauri::command]
+pub async fn get_style_presets() -> Result<serde_json::Value, String> {
+    let custom = storage::get_setting(STYLE_PRESETS_KEY)?
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+    let builtin: serde_json::Value =
+        serde_json::from_str(BUILTIN_STYLE_PRESETS).unwrap_or_else(|_| serde_json::json!([]));
+    Ok(serde_json::json!({
+        "builtin": builtin,
+        "custom": custom,
+    }))
+}
+
+#[tauri::command]
+pub async fn save_style_presets(custom: serde_json::Value) -> Result<(), String> {
+    validate_style_presets(&custom)?;
+    storage::set_setting(
+        STYLE_PRESETS_KEY,
+        &serde_json::to_string(&custom).map_err(|e| e.to_string())?,
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,12 +304,68 @@ mod tests {
     }
 
     #[test]
+    fn builtin_style_presets_are_valid() {
+        let arr: Vec<serde_json::Value> =
+            serde_json::from_str(BUILTIN_STYLE_PRESETS).expect("内置风格必须是合法 JSON");
+        assert!(arr.len() >= 5);
+        let mut ids = std::collections::HashSet::new();
+        for s in &arr {
+            let id = s["id"].as_str().unwrap();
+            assert!(ids.insert(id), "内置风格 id 不能重复: {id}");
+            assert!(!s["label"].as_str().unwrap().is_empty());
+            assert!(!s["prompt"].as_str().unwrap().is_empty());
+        }
+        assert!(validate_style_presets(&serde_json::json!([])).is_ok());
+    }
+
+    #[test]
+    fn custom_style_presets_validation() {
+        let ok = serde_json::json!([
+            {"id":"c_1","label":"我的风格","prompt":"my style, warm tones"}
+        ]);
+        assert!(validate_style_presets(&ok).is_ok());
+        // 非数组
+        assert!(validate_style_presets(&serde_json::json!({"a":1})).is_err());
+        // 缺字段 / 空字段
+        for item in [
+            serde_json::json!([{"id":"c_1","label":" ","prompt":"x"}]),
+            serde_json::json!([{"id":"c_1","label":"名","prompt":""}]),
+            serde_json::json!([{"id":"","label":"名","prompt":"x"}]),
+        ] {
+            assert!(validate_style_presets(&item).is_err(), "{item} 应被拒绝");
+        }
+        // 重复 id / 与内置冲突 / 超长
+        assert!(validate_style_presets(&serde_json::json!([
+            {"id":"c_1","label":"A","prompt":"x"},
+            {"id":"c_1","label":"B","prompt":"y"}
+        ]))
+        .is_err());
+        assert!(validate_style_presets(&serde_json::json!([
+            {"id":"anime","label":"A","prompt":"x"}
+        ]))
+        .is_err());
+        let long_prompt = "x".repeat(501);
+        assert!(validate_style_presets(&serde_json::json!([
+            {"id":"c_1","label":"A","prompt":long_prompt}
+        ]))
+        .is_err());
+        // 数量上限
+        let many: Vec<serde_json::Value> = (0..=MAX_CUSTOM_STYLE_PRESETS)
+            .map(|i| serde_json::json!({"id":format!("c_{i}"),"label":"A","prompt":"x"}))
+            .collect();
+        assert!(validate_style_presets(&serde_json::json!(many)).is_err());
+    }
+
+    #[test]
     fn setting_key_whitelist() {
         assert!(check_setting_key("defaultProviderId").is_ok());
         assert!(check_setting_key("defaultParams").is_ok());
         assert!(check_setting_key("promptTemplates").is_ok());
+        assert!(check_setting_key("stylePresets").is_ok());
         assert!(check_setting_key("theme").is_ok());
         assert!(check_setting_key("glassAppearance").is_ok());
+        assert!(check_setting_key("uiMode").is_ok());
+        assert!(check_setting_key("locale").is_ok());
         assert!(check_setting_key("queueConcurrency").is_ok());
         assert!(check_setting_key("queueProviderConcurrency").is_ok());
         assert!(check_setting_key("cacheRetentionDays").is_ok());
@@ -223,6 +385,16 @@ mod tests {
         assert_eq!(allowed, backup);
     }
 
+    /// 界面语言只接受内置的两个 locale
+    #[test]
+    fn locale_value_validation() {
+        for ok in ["zh-CN", "en-US"] {
+            assert!(check_setting_value("locale", ok).is_ok(), "{ok} 应被接受");
+        }
+        assert!(check_setting_value("locale", "fr-FR").is_err());
+        assert!(check_setting_value("locale", "").is_err());
+    }
+
     /// 主题只接受三态值：脏值会让启动恢复静默回退，故写入端直接拒绝
     #[test]
     fn theme_value_validation() {
@@ -233,6 +405,14 @@ mod tests {
         assert!(check_setting_value("theme", "").is_err());
         // 其它 key 不做枚举校验（自由文本 / JSON）
         assert!(check_setting_value("defaultParams", "anything").is_ok());
+    }
+
+    #[test]
+    fn queue_auto_resume_value_validation() {
+        assert!(check_setting_value("queueAutoResume", "on").is_ok());
+        assert!(check_setting_value("queueAutoResume", "off").is_ok());
+        assert!(check_setting_value("queueAutoResume", "true").is_err());
+        assert!(check_setting_value("queueAutoResume", "").is_err());
     }
 
     #[test]

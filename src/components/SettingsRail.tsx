@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { motion } from "framer-motion";
+import { useTranslation } from "react-i18next";
 import { useProviderStore } from "../stores/providerStore";
 import { useAppStore } from "../stores/appStore";
 import { api, ThinkingConfig } from "../lib/api";
@@ -13,6 +14,7 @@ import { IconButton } from "./ui/IconButton";
 import { IconChevron, IconBrain } from "./Icons";
 
 export default function SettingsRail() {
+  const { t } = useTranslation();
   const compact = useCompact();
   const [collapsed, setCollapsed] = useState(compact);
   const providers = useProviderStore((s) => s.providers);
@@ -49,7 +51,10 @@ export default function SettingsRail() {
       const next = { ...thinking, enabled: !thinking.enabled };
       setThinking(await api.saveThinkingConfig(next));
     } catch (e) {
-      toast(`保存思考模型配置失败：${String(e)}`, "error");
+      toast(
+        t("保存思考模型配置失败：{{error}}", { error: String(e) }),
+        "error",
+      );
     }
   };
 
@@ -62,9 +67,11 @@ export default function SettingsRail() {
         className="glass my-2 mr-2 flex flex-col overflow-hidden rounded-panel"
       >
         <div className="flex h-12 w-60 shrink-0 items-center justify-between px-4">
-          <span className="text-caption text-tertiary uppercase">生成设置</span>
+          <span className="text-caption text-tertiary uppercase">
+            {t("生成设置")}
+          </span>
           <IconButton
-            label="折叠设置栏"
+            label={t("折叠设置栏")}
             size="sm"
             tooltip={false}
             icon={<IconChevron direction="right" size={14} />}
@@ -74,16 +81,18 @@ export default function SettingsRail() {
 
         <div className="scroll-edge min-h-0 w-60 flex-1 space-y-4 overflow-y-auto px-4 pb-4">
           <div className="flex flex-col gap-1.5">
-            <span className="text-caption text-tertiary">绘图服务商</span>
+            <span className="text-caption text-tertiary">
+              {t("绘图服务商")}
+            </span>
             <Select
-              label="绘图服务商"
+              label={t("绘图服务商")}
               value={defaultProviderId ? String(defaultProviderId) : ""}
-              placeholder="（未选择）"
+              placeholder={t("（未选择）")}
               onValueChange={(v) =>
                 setDefaultProvider(v === "" ? null : Number(v))
               }
               options={[
-                { value: "", label: "（未选择）" },
+                { value: "", label: t("（未选择）") },
                 ...providers.map((p) => ({
                   value: String(p.provider.id),
                   label: p.provider.name,
@@ -93,11 +102,11 @@ export default function SettingsRail() {
           </div>
 
           <div className="flex flex-col gap-1.5">
-            <span className="text-caption text-tertiary">绘图模型</span>
+            <span className="text-caption text-tertiary">{t("绘图模型")}</span>
             <Select
-              label="绘图模型"
+              label={t("绘图模型")}
               value={defaultItem?.provider.defaultModel ?? ""}
-              placeholder="（未选择）"
+              placeholder={t("（未选择）")}
               disabled={!defaultItem || models.length === 0}
               onValueChange={(v) => {
                 if (!defaultItem) return;
@@ -105,11 +114,14 @@ export default function SettingsRail() {
                   ...defaultItem.provider,
                   defaultModel: v,
                 }).catch((err) =>
-                  toast(`保存默认模型失败：${String(err)}`, "error"),
+                  toast(
+                    t("保存默认模型失败：{{error}}", { error: String(err) }),
+                    "error",
+                  ),
                 );
               }}
               options={[
-                { value: "", label: "（未选择）" },
+                { value: "", label: t("（未选择）") },
                 ...models.map((m) => ({ value: m, label: m })),
               ]}
             />
@@ -124,19 +136,21 @@ export default function SettingsRail() {
                 </span>
                 <div className="min-w-0">
                   <div className="text-callout font-medium text-primary">
-                    思考模型
+                    {t("思考模型")}
                   </div>
                   <div className="mt-0.5 text-footnote text-tertiary">
                     {thinking?.enabled
-                      ? `已启用 · ${thinking.model || "未选模型"}`
-                      : "生成前理解意图"}
+                      ? t("已启用 · {{model}}", {
+                          model: thinking.model || t("未选模型"),
+                        })
+                      : t("生成前理解意图")}
                   </div>
                 </div>
               </div>
               <Switch
                 checked={Boolean(thinking?.enabled)}
                 onCheckedChange={() => void toggleThinking()}
-                label="启用思考模型"
+                label={t("启用思考模型")}
               />
             </div>
             <Button
@@ -145,7 +159,7 @@ export default function SettingsRail() {
               className="mt-3"
               onClick={() => setView("settings")}
             >
-              配置思考模型…
+              {t("配置思考模型…")}
             </Button>
           </div>
         </div>
@@ -154,7 +168,7 @@ export default function SettingsRail() {
       {collapsed && (
         <button
           type="button"
-          aria-label="展开生成设置"
+          aria-label={t("展开生成设置")}
           onClick={() => setCollapsed(false)}
           className="glass pressable absolute right-2 top-2 z-20 flex size-8 items-center justify-center rounded-pill text-secondary shadow-pop hover:text-primary"
         >

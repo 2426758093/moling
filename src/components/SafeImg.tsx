@@ -1,4 +1,5 @@
 import { CSSProperties, useState } from "react";
+import { useTranslation } from "react-i18next";
 
 /**
  * 带加载失败兜底的图片。
@@ -24,6 +25,7 @@ export default function SafeImg({
   loading?: "eager" | "lazy";
   decoding?: "sync" | "async" | "auto";
 }) {
+  const { t } = useTranslation();
   // 记录「哪一个 src 加载失败」，而不是布尔值：src 变化时（编辑器复用同一节点
   // 切换结果图）自然回到未失败状态，无需副作用里 setState。
   const [brokenSrc, setBrokenSrc] = useState<string | null>(null);
@@ -33,11 +35,11 @@ export default function SafeImg({
     return (
       <div
         role="img"
-        aria-label={`${alt}（图片缺失）`}
+        aria-label={t("{{alt}}（图片缺失）", { alt })}
         style={style}
         className={`${className ?? ""} flex items-center justify-center bg-sunken text-footnote text-tertiary`}
       >
-        图片缺失
+        {t("图片缺失")}
       </div>
     );
   }

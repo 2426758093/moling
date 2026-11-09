@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { api, CanvasBoardMeta } from "../lib/api";
+import i18n from "../i18n";
 import { toast } from "../lib/notify";
 
 /** 画布节点：只记 historyId 与布局，绝不存 dataUrl */
@@ -232,7 +233,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
         if (!first) return;
         if (get().activeId == null) await get().selectBoard(first.id);
       } catch (e) {
-        toast(`加载画布列表失败：${String(e)}`, "error");
+        toast(
+          i18n.t("加载画布列表失败：{{error}}", { error: String(e) }),
+          "error",
+        );
       } finally {
         set({ loading: false });
       }
@@ -241,7 +245,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
     createBoard: async (name) => {
       const trimmed = name.trim();
       if (!trimmed) {
-        toast("画布名称不能为空", "error");
+        toast(i18n.t("画布名称不能为空"), "error");
         return null;
       }
       await get().ensureLoaded();
@@ -270,7 +274,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
         }));
         return board.id;
       } catch (e) {
-        toast(`新建画布失败：${String(e)}`, "error");
+        toast(i18n.t("新建画布失败：{{error}}", { error: String(e) }), "error");
         return null;
       }
     },
@@ -308,7 +312,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
         void get().loadThumbs(data.nodes.map((n) => n.historyId));
       } catch (e) {
         if (seq === boardSeq) {
-          toast(`打开画布失败：${String(e)}`, "error");
+          toast(
+            i18n.t("打开画布失败：{{error}}", { error: String(e) }),
+            "error",
+          );
         }
       }
     },
@@ -327,7 +334,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
       try {
         await api.deleteCanvasBoard(id);
       } catch (e) {
-        toast(`删除画布失败：${String(e)}`, "error");
+        toast(i18n.t("删除画布失败：{{error}}", { error: String(e) }), "error");
         return;
       }
       const rest = get().boards.filter((b) => b.id !== id);
@@ -485,7 +492,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
           });
         } catch (e) {
           set({ saving: false });
-          toast(`画布保存失败：${String(e)}`, "error");
+          toast(
+            i18n.t("画布保存失败：{{error}}", { error: String(e) }),
+            "error",
+          );
         } finally {
           inflight = null;
         }

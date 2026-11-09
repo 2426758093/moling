@@ -20,6 +20,10 @@ import {
 } from "node:fs";
 import path from "node:path";
 import {
+  assertWithinBaseline,
+  readReleaseBaseline,
+} from "./lib/release-baseline.mjs";
+import {
   TAURI_CONF,
   assetUrl,
   fail,
@@ -76,6 +80,16 @@ if (candidates.length > 1) {
 const artifactName = candidates[0];
 const artifactPath = path.join(bundleDir, artifactName);
 const sigPath = `${artifactPath}.sig`;
+
+// 包体门禁放在签名检查之前：体积失控时先给出「为什么不能发」，
+// 而不是先让用户去配签名密钥。
+const baseline = readReleaseBaseline();
+const installerSize = assertWithinBaseline({
+  bytes: statSync(artifactPath).size,
+  baseline,
+  field: "installerMiB",
+  label: "安装包",
+});
 
 // GitHub 会静默剔除非 ASCII 字符，资产名被改写后清单里的下载地址就是 404
 if (/[^\x20-\x7e]/.test(artifactName)) {
@@ -156,11 +170,22 @@ const manifest = {
 
 const outPath = path.join(bundleDir, "latest.json");
 writeFileSync(outPath, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+const manifestSize = assertWithinBaseline({
+  bytes: statSync(outPath).size,
+  baseline,
+  field: "latestJsonMiB",
+  label: "更新清单",
+});
 
 console.log("[发布脚本] 已生成更新清单");
 console.log(`  版本   ${version}（tag ${releaseTag(version)}）`);
 console.log(
-  `  包     ${artifactName}  ${(statSync(artifactPath).size / 1024 / 1024).toFixed(2)} MB`,
+  `  包     ${artifactName}  ${installerSize.mib.toFixed(2)} MB` +
+    `（基线 ${baseline.installerMiB.toFixed(2)}，+${installerSize.delta.toFixed(2)}，` +
+    `门禁 +${baseline.maxGrowthMiB}）`,
+);
+console.log(
+  `  清单   ${manifestSize.mib.toFixed(3)} MB（基线 ${baseline.latestJsonMiB.toFixed(3)}，+${manifestSize.delta.toFixed(3)}）`,
 );
 console.log(`  签名   ${sigPath.split(/[\\/]/).pop()}`);
 console.log(`  地址   ${manifest.platforms["windows-x86_64"].url}`);

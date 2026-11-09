@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { motion } from "framer-motion";
 import {
   adapterErrorTitle,
@@ -18,6 +19,7 @@ import SafeImg from "./SafeImg";
 import { Button } from "./ui/Button";
 import { Select } from "./ui/Select";
 import { IconButton } from "./ui/IconButton";
+import { Badge } from "./ui/Badge";
 import { InsetList } from "./ui/List";
 import { EmptyState } from "./ui/EmptyState";
 import {
@@ -30,10 +32,7 @@ import {
 } from "./Icons";
 import { cn } from "./ui/cn";
 
-const STATUS_META: Record<
-  QueueStatus,
-  { label: string; cls: string; dot: string }
-> = {
+const STATUS_META = {
   queued: {
     label: "排队中",
     cls: "bg-fill text-secondary",
@@ -64,28 +63,28 @@ const STATUS_META: Record<
     cls: "bg-fill text-tertiary",
     dot: "bg-warning-fill",
   },
-};
+} as const satisfies Record<
+  QueueStatus,
+  { label: string; cls: string; dot: string }
+>;
 
 const RETRYABLE: QueueStatus[] = ["failed", "canceled", "interrupted"];
 
-const CONCURRENCY_OPTIONS = [1, 2, 3, 4].map((n) => ({
-  value: String(n),
-  label: `${n} 个任务`,
-}));
-
-const PROVIDER_CONCURRENCY_OPTIONS = [1, 2].map((n) => ({
-  value: String(n),
-  label: `${n} 个任务`,
-}));
+/// 并发档位只存数字，文案在渲染时插值，避免中文字面量与变量拼接
+const CONCURRENCY_VALUES = [1, 2, 3, 4];
+const PROVIDER_CONCURRENCY_VALUES = [1, 2];
 
 type Filter = "all" | "pending" | "done" | "issue";
 
-const FILTERS: { id: Filter; label: string }[] = [
+/// 任务操作失败提示：渲染时把错误文本插值进去，不拼接中文字面量
+type FailKey = "取消失败：{{error}}" | "重试失败：{{error}}";
+
+const FILTERS = [
   { id: "all", label: "全部" },
   { id: "pending", label: "待处理" },
   { id: "done", label: "已完成" },
   { id: "issue", label: "异常" },
-];
+] as const satisfies readonly { id: Filter; label: string }[];
 
 function matchesFilter(job: QueueJob, filter: Filter) {
   switch (filter) {
@@ -117,6 +116,7 @@ function cacheRefUrl(path: string, url: string) {
 
 /// 队列条目上的参考图缩略图（最多 4 张，路径来自 inputJson）
 function ReferenceThumbs({ inputJson }: { inputJson: string }) {
+  const { t } = useTranslation();
   const [urls, setUrls] = useState<string[]>([]);
   const paths = useMemo(() => {
     try {
@@ -160,7 +160,7 @@ function ReferenceThumbs({ inputJson }: { inputJson: string }) {
         <SafeImg
           key={src}
           src={src}
-          alt={`参考图 ${i + 1}`}
+          alt={t("参考图 {{n}}", { n: i + 1 })}
           className="size-12 rounded-btn border border-line object-cover"
         />
       ))}
@@ -169,9 +169,12 @@ function ReferenceThumbs({ inputJson }: { inputJson: string }) {
 }
 
 function JobRow({ job }: { job: QueueJob }) {
+  const { t } = useTranslation();
   const progress = useQueueStore((s) => s.progress[job.id]);
   const cancel = useQueueStore((s) => s.cancel);
   const retry = useQueueStore((s) => s.retry);
+  const backoffUntil = useQueueStore((s) => s.backoff[job.id] ?? 0);
+  const [now, setNow] = useState(() => Date.now());
   const meta = STATUS_META[job.status] ?? STATUS_META.queued;
   const active = job.status === "running";
   const error = job.error ? parseAdapterError(job.error) : null;
@@ -179,14 +182,22 @@ function JobRow({ job }: { job: QueueJob }) {
   const [errorOpen, setErrorOpen] = useState(false);
   const motionTokens = useMotionTokens();
 
-  const run = (action: Promise<void>, fallback: string) =>
-    action.catch((e) => toast(`${fallback}：${String(e)}`, "error"));
+  // 429 退避倒计时：常驻秒表，退避结束时最多延迟 1 秒归零
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const backoffLeft =
+    backoffUntil > now ? Math.ceil((backoffUntil - now) / 1000) : 0;
+
+  const run = (action: Promise<void>, failKey: FailKey) =>
+    action.catch((e) => toast(t(failKey, { error: String(e) }), "error"));
 
   const copy = (text: string, label: string) => {
     void navigator.clipboard
       .writeText(text)
       .then(() => toast(label))
-      .catch(() => toast("复制失败", "error"));
+      .catch(() => toast(t("复制失败"), "error"));
   };
 
   return (
@@ -202,7 +213,7 @@ function JobRow({ job }: { job: QueueJob }) {
           type="button"
           onClick={() => setOpen((v) => !v)}
           aria-expanded={open}
-          aria-label={`任务 #${job.id} 详情`}
+          aria-label={t("任务 #{{id}} 详情", { id: job.id })}
           className="flex h-8 min-w-0 flex-1 items-center gap-2.5 rounded-btn px-1.5 text-left outline-none transition-colors hover:bg-hover focus-visible:ring-2 focus-visible:ring-accent/25"
         >
           <span
@@ -215,11 +226,14 @@ function JobRow({ job }: { job: QueueJob }) {
               meta.cls,
             )}
           >
-            {meta.label}
+            {t(meta.label)}
           </span>
           <span className="min-w-0 flex-1 truncate text-callout text-primary">
             {job.prompt}
           </span>
+          {backoffLeft > 0 && (
+            <Badge tone="warning">{t("限流 {{n}}s", { n: backoffLeft })}</Badge>
+          )}
           {active && progress && (
             <span className="tabular hidden shrink-0 text-footnote text-tertiary compact:block">
               {progress.done}/{progress.total}
@@ -234,18 +248,18 @@ function JobRow({ job }: { job: QueueJob }) {
 
         {(job.status === "queued" || active) && (
           <IconButton
-            label="取消任务"
+            label={t("取消任务")}
             size="sm"
             icon={<IconClose size={13} />}
-            onClick={() => run(cancel(job.id), "取消失败")}
+            onClick={() => run(cancel(job.id), "取消失败：{{error}}")}
           />
         )}
         {RETRYABLE.includes(job.status) && (
           <IconButton
-            label="重试任务"
+            label={t("重试任务")}
             size="sm"
             icon={<IconRotate size={13} />}
-            onClick={() => run(retry(job.id), "重试失败")}
+            onClick={() => run(retry(job.id), "重试失败：{{error}}")}
           />
         )}
       </div>
@@ -264,7 +278,7 @@ function JobRow({ job }: { job: QueueJob }) {
             <span aria-hidden>·</span>
             <span className="tabular">{sizeLabel(job.width, job.height)}</span>
             <span aria-hidden>·</span>
-            <span>{job.count} 张</span>
+            <span>{t("{{n}} 张", { n: job.count })}</span>
             {job.style && (
               <>
                 <span aria-hidden>·</span>
@@ -273,11 +287,11 @@ function JobRow({ job }: { job: QueueJob }) {
             )}
             <button
               type="button"
-              onClick={() => copy(job.prompt, "提示词已复制")}
+              onClick={() => copy(job.prompt, t("提示词已复制"))}
               className="pressable ml-auto flex h-6 items-center gap-1 rounded-chip px-2 text-caption text-secondary transition-colors hover:bg-hover hover:text-primary"
             >
               <IconCopy size={12} />
-              复制提示词
+              {t("复制提示词")}
             </button>
           </div>
           <ReferenceThumbs inputJson={job.inputJson} />
@@ -298,8 +312,11 @@ function JobRow({ job }: { job: QueueJob }) {
               </div>
               <div className="mt-1 text-footnote text-tertiary">
                 {progress
-                  ? `已落盘 ${progress.done} / ${progress.total} 张`
-                  : "正在请求图片…"}
+                  ? t("已落盘 {{done}} / {{total}} 张", {
+                      done: progress.done,
+                      total: progress.total,
+                    })
+                  : t("正在请求图片…")}
               </div>
             </div>
           )}
@@ -329,11 +346,11 @@ function JobRow({ job }: { job: QueueJob }) {
                   </div>
                   <button
                     type="button"
-                    onClick={() => copy(error.message, "错误详情已复制")}
+                    onClick={() => copy(error.message, t("错误详情已复制"))}
                     className="pressable mt-1 flex h-6 items-center gap-1 rounded-chip px-1.5 text-caption text-secondary transition-colors hover:bg-hover hover:text-primary"
                   >
                     <IconCopy size={12} />
-                    复制错误
+                    {t("复制错误")}
                   </button>
                 </div>
               )}
@@ -346,6 +363,7 @@ function JobRow({ job }: { job: QueueJob }) {
 }
 
 export default function QueueView() {
+  const { t } = useTranslation();
   const jobs = useQueueStore((s) => s.jobs);
   const paused = useQueueStore((s) => s.paused);
   const concurrency = useQueueStore((s) => s.concurrency);
@@ -355,6 +373,7 @@ export default function QueueView() {
   const load = useQueueStore((s) => s.load);
   const start = useQueueStore((s) => s.start);
   const setConcurrency = useQueueStore((s) => s.setConcurrency);
+  const resumeInterrupted = useQueueStore((s) => s.resumeInterrupted);
   const clearFinished = useQueueStore((s) => s.clearFinished);
   const setView = useAppStore((s) => s.setView);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -362,8 +381,10 @@ export default function QueueView() {
   useScrollEdge(scrollRef);
 
   useEffect(() => {
-    load().catch((e) => toast(`加载队列失败：${String(e)}`, "error"));
-  }, [load]);
+    load().catch((e) =>
+      toast(t("加载队列失败：{{error}}", { error: String(e) }), "error"),
+    );
+  }, [load, t]);
 
   const counts = useMemo(() => {
     const result: Record<Filter, number> = {
@@ -380,7 +401,17 @@ export default function QueueView() {
     return result;
   }, [jobs]);
 
+  const concurrencyOptions = CONCURRENCY_VALUES.map((n) => ({
+    value: String(n),
+    label: t("{{n}} 个任务", { n }),
+  }));
+  const providerConcurrencyOptions = PROVIDER_CONCURRENCY_VALUES.map((n) => ({
+    value: String(n),
+    label: t("{{n}} 个任务", { n }),
+  }));
+
   const finished = counts.done + counts.issue;
+  const interrupted = jobs.filter((j) => j.status === "interrupted").length;
   const visible = useMemo(
     () => jobs.filter((job) => matchesFilter(job, filter)),
     [jobs, filter],
@@ -389,47 +420,75 @@ export default function QueueView() {
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <PageHeader
-        title="队列"
-        subtitle="生成任务按顺序执行，可随时暂停或重试"
+        title={t("队列")}
+        subtitle={t("生成任务按顺序执行，可随时暂停或重试")}
         actions={
           <>
             <div className="flex items-center gap-2">
-              <span className="text-footnote text-tertiary">并发</span>
+              <span className="text-footnote text-tertiary">{t("并发")}</span>
               <Select
                 value={String(concurrency)}
                 onValueChange={(v) =>
                   setConcurrency(Number(v)).catch((e) =>
-                    toast(`并发设置失败：${String(e)}`, "error"),
+                    toast(
+                      t("并发设置失败：{{error}}", { error: String(e) }),
+                      "error",
+                    ),
                   )
                 }
-                options={CONCURRENCY_OPTIONS}
+                options={concurrencyOptions}
                 widthClass="w-28"
-                label="队列并发数"
+                label={t("队列并发数")}
               />
             </div>
             <div className="flex items-center gap-2">
-              <span className="text-footnote text-tertiary">每服务商</span>
+              <span className="text-footnote text-tertiary">
+                {t("每服务商")}
+              </span>
               <Select
                 value={String(providerConcurrency)}
                 onValueChange={(v) =>
                   setProviderConcurrency(Number(v)).catch((e) =>
-                    toast(`并发设置失败：${String(e)}`, "error"),
+                    toast(
+                      t("并发设置失败：{{error}}", { error: String(e) }),
+                      "error",
+                    ),
                   )
                 }
-                options={PROVIDER_CONCURRENCY_OPTIONS}
+                options={providerConcurrencyOptions}
                 widthClass="w-28"
-                label="每服务商并发数"
+                label={t("每服务商并发数")}
               />
             </div>
+            {interrupted > 0 && (
+              <Button
+                size="sm"
+                onClick={() =>
+                  resumeInterrupted().catch((e) =>
+                    toast(
+                      t("恢复失败：{{error}}", { error: String(e) }),
+                      "error",
+                    ),
+                  )
+                }
+              >
+                {t("恢复中断 {{n}}", { n: interrupted })}
+              </Button>
+            )}
             {paused && (
               <Button
                 size="sm"
                 variant="primary"
                 onClick={() =>
-                  start().catch((e) => toast(`启动失败：${String(e)}`, "error"))
+                  start().catch((e) =>
+                    toast(
+                      t("启动失败：{{error}}", { error: String(e) }),
+                      "error",
+                    ),
+                  )
                 }
               >
-                开始队列
+                {t("开始队列")}
               </Button>
             )}
             {finished > 0 && (
@@ -437,11 +496,14 @@ export default function QueueView() {
                 size="sm"
                 onClick={() =>
                   clearFinished().catch((e) =>
-                    toast(`清空失败：${String(e)}`, "error"),
+                    toast(
+                      t("清空失败：{{error}}", { error: String(e) }),
+                      "error",
+                    ),
                   )
                 }
               >
-                清空已完成
+                {t("清空已完成")}
               </Button>
             )}
           </>
@@ -463,7 +525,7 @@ export default function QueueView() {
                       : "bg-fill text-secondary hover:bg-hover hover:text-primary",
                   )}
                 >
-                  {item.label}
+                  {t(item.label)}
                   <span className="tabular text-footnote opacity-70">
                     {counts[item.id]}
                   </span>
@@ -483,27 +545,31 @@ export default function QueueView() {
             <div className="flex items-start gap-2 rounded-card bg-accent-soft px-3 py-2.5 text-callout leading-relaxed text-secondary">
               <IconAlert size={14} className="mt-0.5 shrink-0 text-warning" />
               <span>
-                队列已暂停：启动应用后不会自动执行，避免重启即产生费用。点击右上角「开始队列」继续。
+                {t(
+                  "队列已暂停：启动应用后不会自动执行，避免重启即产生费用。点击右上角「开始队列」继续。",
+                )}
               </span>
             </div>
           )}
           {!loaded ? (
             <div className="py-16 text-center text-body text-tertiary">
-              加载中…
+              {t("加载中…")}
             </div>
           ) : jobs.length === 0 ? (
             <EmptyState
               icon={<IconQueue size={22} strokeWidth={1.6} />}
-              title="队列还是空的"
-              description="在聊天页输入提示词后点「加入队列」，可附带参考图并按需调整并发数。"
+              title={t("队列还是空的")}
+              description={t(
+                "在聊天页输入提示词后点「加入队列」，可附带参考图并按需调整并发数。",
+              )}
             >
               <Button size="sm" onClick={() => setView("chat")}>
-                去聊天页
+                {t("去聊天页")}
               </Button>
             </EmptyState>
           ) : visible.length === 0 ? (
             <div className="py-12 text-center text-footnote text-tertiary">
-              没有符合条件的任务
+              {t("没有符合条件的任务")}
             </div>
           ) : (
             <InsetList>

@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { motion, useReducedMotion } from "framer-motion";
+import { useTranslation } from "react-i18next";
 import { useAppStore } from "../stores/appStore";
-import { useChatStore } from "../stores/chatStore";
 import { useProviderStore } from "../stores/providerStore";
 import { api, parseAdapterError, adapterErrorTitle } from "../lib/api";
+import { deliverEditResult } from "../lib/deliverEditResult";
 import { toast } from "../lib/notify";
 import { DUR, EASE } from "../lib/motion";
 import { Button } from "./ui/Button";
@@ -16,6 +17,7 @@ import SafeImg from "./SafeImg";
 import MaskCanvas, { MaskCanvasHandle } from "./MaskCanvas";
 
 export default function EditorView() {
+  const { t } = useTranslation();
   const editTarget = useAppStore((s) => s.editTarget);
   const closeEditor = useAppStore((s) => s.closeEditor);
   const defaultProviderId = useProviderStore((s) => s.defaultProviderId);
@@ -33,7 +35,31 @@ export default function EditorView() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [resultUrl, setResultUrl] = useState<string | null>(null);
+  // 智能蒙版：设置关闭或模型不可用时整块入口隐藏，行为回到纯手动画笔
+  const [smartReady, setSmartReady] = useState(false);
+  const [pickMode, setPickMode] = useState(false);
+  const [picking, setPicking] = useState(false);
+  const canvasInline = useAppStore((s) => s.canvasInline);
   const reduce = useReducedMotion();
+
+  useEffect(() => {
+    let alive = true;
+    api
+      .getSetting("smartMask")
+      .then((v) => {
+        if (!alive || v === "off") return undefined;
+        return api
+          .segmentModelStatus()
+          .then((s) => {
+            if (alive) setSmartReady(s.available);
+          })
+          .catch(() => undefined);
+      })
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!source) return;
@@ -67,21 +93,23 @@ export default function EditorView() {
 
   if (!source) return null;
 
+  const inline = canvasInline && source.host === "canvas";
+
   const submit = async () => {
     if (!image || !source) return;
     const isErase = source.mode === "erase";
     if (!isErase && !prompt.trim()) {
-      toast("请输入重绘描述", "error");
+      toast(t("请输入重绘描述"), "error");
       return;
     }
     if (defaultProviderId == null) {
-      toast("请先在「设置」中配置服务商", "error");
+      toast(t("请先在「设置」中配置服务商"), "error");
       return;
     }
     const item = providers.find((p) => p.provider.id === defaultProviderId);
     const model = item?.provider.defaultModel;
     if (!model) {
-      toast("请先在「设置」中选择默认模型", "error");
+      toast(t("请先在「设置」中选择默认模型"), "error");
       return;
     }
     const srcCanvas = document.createElement("canvas");
@@ -89,7 +117,7 @@ export default function EditorView() {
     srcCanvas.height = image.naturalHeight;
     srcCanvas.getContext("2d")!.drawImage(image, 0, 0);
     if (!maskRef.current?.hasStrokes()) {
-      toast("请先涂抹要修改的区域", "error");
+      toast(t("请先涂抹要修改的区域"), "error");
       return;
     }
     const maskB64 = maskRef.current.toAlphaPng();
@@ -114,20 +142,16 @@ export default function EditorView() {
         parentId: source.historyId,
       });
       setResultUrl(out.dataUrl);
-      // 结果回流消息流：在当前对话追加一条助手消息
-      const displayPrompt = isErase ? "（AI 消除）" : prompt;
-      await useChatStore.getState().appendImageMessage(
-        {
-          historyId: out.historyId,
-          dataUrl: out.dataUrl,
-          path: out.filePath,
-          derivedFrom: source.historyId,
-        },
-        displayPrompt,
-      );
+      const displayPrompt = isErase ? t("（AI 消除）") : prompt;
+      await deliverEditResult(source, out, displayPrompt);
     } catch (e) {
       const parsed = parseAdapterError(String(e));
-      setError(`${adapterErrorTitle(parsed)}：${parsed.message}`);
+      setError(
+        t("{{title}}：{{message}}", {
+          title: adapterErrorTitle(parsed),
+          message: parsed.message,
+        }),
+      );
     } finally {
       setBusy(false);
     }
@@ -135,25 +159,55 @@ export default function EditorView() {
 
   const isErase = source.mode === "erase";
 
+  const handlePick = async (
+    x: number,
+    y: number,
+    mods: { shift: boolean; alt: boolean },
+  ) => {
+    if (!source || picking) return;
+    setPicking(true);
+    try {
+      const out = await api.segmentAtPoint(
+        source.dataUrl,
+        Math.round(x),
+        Math.round(y),
+      );
+      const mode = mods.shift ? "add" : mods.alt ? "subtract" : "replace";
+      await maskRef.current?.applyMask(out.dataUrl, mode);
+    } catch (e) {
+      toast(parseAdapterError(String(e)).message, "error");
+    } finally {
+      setPicking(false);
+    }
+  };
+
   return (
     <motion.div
       initial={reduce ? false : { opacity: 0 }}
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       transition={{ duration: reduce ? 0 : DUR.base, ease: EASE.ios }}
-      className="fixed inset-x-0 bottom-0 top-12 z-30 flex flex-col bg-base"
+      className={
+        inline
+          ? "flex h-full min-h-0 w-full flex-col bg-base"
+          : "fixed inset-x-0 bottom-0 top-12 z-30 flex flex-col bg-base"
+      }
     >
       {/* 栏头与工具条合并为同一块玻璃：中间不夹第二条分割玻璃 */}
       <header className="relative z-10 shrink-0 glass">
         <div className="flex min-h-12 items-center gap-3 px-6 py-2">
           <div className="flex min-w-0 flex-col">
             <h1 className="truncate text-title3 text-primary">
-              {isErase ? "AI 消除" : "局部重绘"}
+              {isErase ? t("AI 消除") : t("局部重绘")}
             </h1>
             <p className="truncate text-footnote text-tertiary">
-              {isErase
-                ? "涂抹要消除的对象，一键补全背景"
-                : "涂抹要修改的区域，其余像素保持不变"}
+              {pickMode
+                ? t(
+                    "点击要修改的物体自动选中；Shift 加选、Alt 减选，可继续用画笔修整",
+                  )
+                : isErase
+                  ? t("涂抹要消除的对象，一键补全背景")
+                  : t("涂抹要修改的区域，其余像素保持不变")}
             </p>
           </div>
           <div className="ml-auto flex shrink-0 items-center gap-2">
@@ -163,10 +217,10 @@ export default function EditorView() {
               loading={busy}
               onClick={() => void submit()}
             >
-              {isErase ? "一键消除" : "局部重绘"}
+              {isErase ? t("一键消除") : t("局部重绘")}
             </Button>
             <IconButton
-              label="关闭编辑器"
+              label={t("关闭编辑器")}
               icon={<IconClose size={16} />}
               onClick={closeEditor}
             />
@@ -175,7 +229,7 @@ export default function EditorView() {
 
         <div
           role="toolbar"
-          aria-label="蒙版工具"
+          aria-label={t("蒙版工具")}
           className="flex flex-wrap items-center gap-2 px-6 pb-2.5"
         >
           <ToolbarGroup>
@@ -188,7 +242,7 @@ export default function EditorView() {
                 onValueChange={setBrushSize}
                 min={8}
                 max={200}
-                label="画笔大小"
+                label={t("画笔大小")}
               />
             </div>
             <span className="w-8 text-right text-footnote tabular-nums text-tertiary">
@@ -200,25 +254,44 @@ export default function EditorView() {
 
           <ToolbarGroup>
             <IconButton
-              label={eraser ? "关闭橡皮擦" : "橡皮擦"}
+              label={eraser ? t("关闭橡皮擦") : t("橡皮擦")}
               icon={<IconEraser size={16} />}
               variant={eraser ? "secondary" : "ghost"}
               aria-pressed={eraser}
-              onClick={() => setEraser((v) => !v)}
+              onClick={() => {
+                // 点选模式下画笔不生效，点橡皮擦视为退出点选、回到手动涂抹
+                setPickMode(false);
+                setEraser((v) => !v);
+              }}
             />
+            {smartReady && (
+              <Button
+                size="sm"
+                variant={pickMode ? "secondary" : "ghost"}
+                aria-pressed={pickMode}
+                loading={picking}
+                title={t("AI 识别物体：点击选中，Shift 加选，Alt 减选")}
+                onClick={() => {
+                  setEraser(false);
+                  setPickMode((v) => !v);
+                }}
+              >
+                {t("点选物体")}
+              </Button>
+            )}
             <Button
               size="sm"
               variant="ghost"
               onClick={() => maskRef.current?.fillAll()}
             >
-              全选
+              {t("全选")}
             </Button>
             <Button
               size="sm"
               variant="ghost"
               onClick={() => maskRef.current?.clear()}
             >
-              清除蒙版
+              {t("清除蒙版")}
             </Button>
           </ToolbarGroup>
 
@@ -229,8 +302,8 @@ export default function EditorView() {
                 <Input
                   value={prompt}
                   onChange={(e) => setPrompt(e.target.value)}
-                  placeholder="描述要重绘的内容…"
-                  aria-label="重绘描述"
+                  placeholder={t("描述要重绘的内容…")}
+                  aria-label={t("重绘描述")}
                   compact
                 />
               </div>
@@ -247,15 +320,15 @@ export default function EditorView() {
           <div className="flex h-full min-h-0 flex-col items-center gap-3">
             <SafeImg
               src={resultUrl}
-              alt="重绘结果"
+              alt={t("重绘结果")}
               className="min-h-0 max-h-full max-w-full rounded-card border border-line object-contain shadow-pop"
             />
             <div className="flex shrink-0 gap-2">
               <Button size="sm" onClick={() => setResultUrl(null)}>
-                继续编辑
+                {t("继续编辑")}
               </Button>
               <Button size="sm" variant="primary" onClick={closeEditor}>
-                完成，返回对话
+                {inline ? t("完成，返回画布") : t("完成，返回对话")}
               </Button>
             </div>
           </div>
@@ -266,7 +339,7 @@ export default function EditorView() {
           >
             <SafeImg
               src={source.dataUrl}
-              alt="编辑对象"
+              alt={t("编辑对象")}
               className="absolute inset-0 h-full w-full"
             />
             <MaskCanvas
@@ -274,11 +347,20 @@ export default function EditorView() {
               image={image}
               brushSize={brushSize}
               eraser={eraser}
-              className="absolute inset-0 h-full w-full opacity-60"
+              onPick={
+                pickMode
+                  ? (x, y, mods) => {
+                      void handlePick(x, y, mods);
+                    }
+                  : undefined
+              }
+              className={`absolute inset-0 h-full w-full opacity-60 ${
+                pickMode ? "cursor-crosshair" : ""
+              }`}
             />
           </div>
         ) : (
-          <span className="text-body text-tertiary">加载中…</span>
+          <span className="text-body text-tertiary">{t("加载中…")}</span>
         )}
       </div>
 

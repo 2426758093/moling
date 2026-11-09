@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { useTranslation } from "react-i18next";
 import { api, parseAdapterError, ProviderItem } from "../../lib/api";
 import { useProviderStore } from "../../stores/providerStore";
 import { KIND_OPTIONS } from "./ui";
@@ -11,24 +12,33 @@ export default function ProviderCard({
   item: ProviderItem;
   onEdit: () => void;
 }) {
+  const { t } = useTranslation();
   const remove = useProviderStore((s) => s.remove);
   const defaultProviderId = useProviderStore((s) => s.defaultProviderId);
   const setDefaultProvider = useProviderStore((s) => s.setDefaultProvider);
   const [status, setStatus] = useState("");
   const p = item.provider;
   const isDefault = defaultProviderId === p.id;
+  const kindLabel = KIND_OPTIONS.find((k) => k.id === p.kind)?.label;
 
   const doTest = async () => {
-    setStatus("测试中…");
+    setStatus(t("测试中…"));
     try {
       const r = await api.testConnection(p.id!);
       setStatus(
         r.ok
-          ? `连接正常 · ${r.latencyMs}ms · ${r.modelCount} 个模型`
-          : `连接失败：${r.error ? parseAdapterError(r.error).message : "未知错误"}`,
+          ? t("连接正常 · {{ms}}ms · {{n}} 个模型", {
+              ms: r.latencyMs ?? 0,
+              n: r.modelCount ?? 0,
+            })
+          : t("连接失败：{{error}}", {
+              error: r.error
+                ? parseAdapterError(r.error).message
+                : t("未知错误"),
+            }),
       );
     } catch (e) {
-      setStatus(`连接失败：${String(e)}`);
+      setStatus(t("连接失败：{{error}}", { error: String(e) }));
     }
   };
 
@@ -41,28 +51,29 @@ export default function ProviderCard({
               {p.name}
             </span>
             <span className="rounded-chip bg-fill px-1.5 py-0.5 text-caption text-secondary">
-              {KIND_OPTIONS.find((k) => k.id === p.kind)?.label ?? p.kind}
+              {kindLabel ? t(kindLabel) : p.kind}
             </span>
             {isDefault && (
               <span className="rounded-chip bg-accent-soft px-1.5 py-0.5 text-caption text-accent-text">
-                默认
+                {t("默认")}
               </span>
             )}
           </div>
           <div className="truncate text-footnote text-tertiary">
-            {p.baseUrl || "（无地址）"} ·{" "}
+            {p.baseUrl || t("（无地址）")} ·{" "}
             {item.keyCount > 1
-              ? `${item.keyCount} 个 Key${
+              ? `${t("{{n}} 个 Key", { n: item.keyCount })}${
                   item.invalidKeyCount > 0
-                    ? ` · ${item.invalidKeyCount} 失效`
+                    ? ` ${t("· {{n}} 失效", { n: item.invalidKeyCount })}`
                     : ""
                 }`
               : `Key: ${item.apiKeyMasked}`}
-            {p.defaultModel && ` · 默认: ${p.defaultModel}`}
+            {p.defaultModel &&
+              ` ${t("· 默认: {{model}}", { model: p.defaultModel })}`}
           </div>
           {item.keyError && (
             <div className="mt-1 inline-flex w-fit items-center gap-1 rounded-pill border border-danger/25 bg-danger/10 px-2 py-0.5 text-caption text-danger">
-              Key 失效：请重新填写
+              {t("Key 失效：请重新填写")}
             </div>
           )}
           {status && (
@@ -76,32 +87,32 @@ export default function ProviderCard({
               name="defaultProvider"
               checked={isDefault}
               onChange={() => setDefaultProvider(p.id!)}
-              aria-label={`把 ${p.name} 设为默认服务商`}
+              aria-label={t("把 {{name}} 设为默认服务商", { name: p.name })}
               className="size-4 cursor-pointer accent-accent-fill"
             />
-            默认
+            {t("默认")}
           </label>
           <Button
             size="sm"
             onClick={onEdit}
-            aria-label={`编辑服务商 ${p.name}`}
+            aria-label={t("编辑服务商 {{name}}", { name: p.name })}
           >
-            编辑
+            {t("编辑")}
           </Button>
           <Button
             size="sm"
             onClick={() => void doTest()}
-            aria-label={`测试服务商 ${p.name}`}
+            aria-label={t("测试服务商 {{name}}", { name: p.name })}
           >
-            测试
+            {t("测试")}
           </Button>
           <Button
             size="sm"
             variant="danger"
             onClick={() => p.id && remove(p.id)}
-            aria-label={`删除服务商 ${p.name}`}
+            aria-label={t("删除服务商 {{name}}", { name: p.name })}
           >
-            删除
+            {t("删除")}
           </Button>
         </div>
       </div>

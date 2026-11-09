@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
+import i18n from "../i18n";
 import type { ImageQuality, ReferenceRole } from "./types";
+import type { StylePreset } from "./presets";
 
 export interface ProviderInput {
   id?: number | null;
@@ -73,17 +75,17 @@ export function parseAdapterError(raw: string): AdapterError {
 export function adapterErrorTitle(e: AdapterError): string {
   switch (e.type) {
     case "auth_invalid":
-      return "API Key 无效";
+      return i18n.t("API Key 无效");
     case "quota_exceeded":
-      return "余额不足或触发限额";
+      return i18n.t("余额不足或触发限额");
     case "timeout":
-      return "请求超时";
+      return i18n.t("请求超时");
     case "content_blocked":
-      return "内容审核拦截";
+      return i18n.t("内容审核拦截");
     case "unsupported":
-      return "该服务商不支持此操作";
+      return i18n.t("该服务商不支持此操作");
     default:
-      return "请求失败";
+      return i18n.t("请求失败");
   }
 }
 
@@ -492,6 +494,26 @@ export const api = {
       op: string;
       parentId: number | null;
     }>("replace_background", { input }),
+  /** 智能蒙版：整图主体（invert = 取背景），返回与原图同尺寸的灰度蒙版 */
+  segmentSubject: (imageB64: string, invert = false) =>
+    invoke<{
+      dataUrl: string;
+      width: number;
+      height: number;
+      covered: number;
+    }>("segment_subject", { imageB64, invert }),
+  /** 智能蒙版：点选物体所在连通域；x/y 为原图像素坐标 */
+  segmentAtPoint: (imageB64: string, x: number, y: number) =>
+    invoke<{
+      dataUrl: string;
+      width: number;
+      height: number;
+      covered: number;
+    }>("segment_at_point", { imageB64, x, y }),
+  segmentModelStatus: () =>
+    invoke<{ available: boolean; loaded: boolean; reason: string | null }>(
+      "segment_model_status",
+    ),
   /** 同族图片（根 + 直接派生） */
   listDerived: (historyId: number) =>
     invoke<{ items: HistoryItem["history"][] }>("list_derived", {
@@ -616,6 +638,8 @@ export const api = {
     }>("list_jobs"),
   cancelQueueJob: (id: number) => invoke<void>("cancel_queue_job", { id }),
   retryQueueJob: (id: number) => invoke<void>("retry_queue_job", { id }),
+  /** 恢复全部中断任务并启动队列，返回恢复数量 */
+  requeueInterruptedJobs: () => invoke<number>("requeue_interrupted_jobs"),
   resumeQueue: () => invoke<{ paused: boolean }>("resume_queue"),
   clearFinishedJobs: () => invoke<number>("clear_finished_jobs"),
   /** 参考图落盘到 appData/refs/，返回路径（入队时只传路径） */
@@ -642,6 +666,12 @@ export const api = {
     ),
   savePromptTemplates: (custom: PromptTemplate[]) =>
     invoke<void>("save_prompt_templates", { custom }),
+  getStylePresets: () =>
+    invoke<{ builtin: StylePreset[]; custom: StylePreset[] }>(
+      "get_style_presets",
+    ),
+  saveStylePresets: (custom: StylePreset[]) =>
+    invoke<void>("save_style_presets", { custom }),
   reversePrompt: (imageB64: string) =>
     invoke<{ ok: boolean; prompt?: string; error?: AdapterError }>(
       "reverse_prompt",
@@ -709,6 +739,8 @@ export interface ThinkingConfig {
   titleEnabled?: boolean;
   /** 输入框提示词优化助手 */
   optimizeEnabled?: boolean;
+  /** 输入框失焦时自动把中文提示词翻译为英文 */
+  autoTranslateOnBlur?: boolean;
 }
 
 export interface Conversation {

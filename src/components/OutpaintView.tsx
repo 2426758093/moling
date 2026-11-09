@@ -1,9 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import { motion, useReducedMotion } from "framer-motion";
+import { useTranslation } from "react-i18next";
 import { useAppStore } from "../stores/appStore";
-import { useChatStore } from "../stores/chatStore";
 import { useProviderStore } from "../stores/providerStore";
 import { api, parseAdapterError, adapterErrorTitle } from "../lib/api";
+import { deliverEditResult } from "../lib/deliverEditResult";
 import { toast } from "../lib/notify";
 import { DUR, EASE } from "../lib/motion";
 import { Button } from "./ui/Button";
@@ -22,21 +23,18 @@ interface Offsets {
   left: number;
 }
 
-const PRESETS = [
-  { value: "free", label: "自由" },
-  { value: "16:9", label: "16:9" },
-  { value: "9:16", label: "9:16" },
-  { value: "1:1", label: "1:1" },
-];
+/// 目标比例：只有「自由」需要翻译，数值比例直接展示原值
+const PRESET_RATIOS = ["16:9", "9:16", "1:1"] as const;
 
-const SIDE_LABEL: Record<Side, string> = {
+const SIDE_LABEL = {
   top: "上",
   right: "右",
   bottom: "下",
   left: "左",
-};
+} as const;
 
 export default function OutpaintView() {
+  const { t } = useTranslation();
   const target = useAppStore((s) => s.outpaintTarget);
   const closeOutpaint = useAppStore((s) => s.closeOutpaint);
   const defaultProviderId = useProviderStore((s) => s.defaultProviderId);
@@ -57,6 +55,7 @@ export default function OutpaintView() {
   const [error, setError] = useState<string | null>(null);
   const dragSide = useRef<Side | null>(null);
   const dragStart = useRef({ x: 0, y: 0, offsets: offsets });
+  const canvasInline = useAppStore((s) => s.canvasInline);
   const reduce = useReducedMotion();
 
   useEffect(() => {
@@ -91,6 +90,8 @@ export default function OutpaintView() {
   }, [closeOutpaint]);
 
   if (!target) return null;
+
+  const inline = canvasInline && target.host === "canvas";
 
   const naturalW = image?.naturalWidth ?? 1;
   const naturalH = image?.naturalHeight ?? 1;
@@ -186,13 +187,13 @@ export default function OutpaintView() {
   const submit = async () => {
     if (!image || !changed) return;
     if (defaultProviderId == null) {
-      toast("请先在「设置」中配置服务商", "error");
+      toast(t("请先在「设置」中配置服务商"), "error");
       return;
     }
     const model = providers.find((p) => p.provider.id === defaultProviderId)
       ?.provider.defaultModel;
     if (!model) {
-      toast("请先在「设置」中选择默认模型", "error");
+      toast(t("请先在「设置」中选择默认模型"), "error");
       return;
     }
     const s = display.scale || 1;
@@ -225,20 +226,17 @@ export default function OutpaintView() {
         op: "outpaint",
         parentId: target.historyId,
       });
-      const displayPrompt = `（扩图 ${tw}×${th}）`;
-      await useChatStore.getState().appendImageMessage(
-        {
-          historyId: out.historyId,
-          dataUrl: out.dataUrl,
-          path: out.filePath,
-          derivedFrom: target.historyId,
-        },
-        displayPrompt,
-      );
+      const displayPrompt = t("（扩图 {{w}}×{{h}}）", { w: tw, h: th });
+      await deliverEditResult(target, out, displayPrompt);
       closeOutpaint();
     } catch (e) {
       const parsed = parseAdapterError(String(e));
-      setError(`${adapterErrorTitle(parsed)}：${parsed.message}`);
+      setError(
+        t("{{title}}：{{message}}", {
+          title: adapterErrorTitle(parsed),
+          message: parsed.message,
+        }),
+      );
     } finally {
       setBusy(false);
     }
@@ -289,14 +287,18 @@ export default function OutpaintView() {
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       transition={{ duration: reduce ? 0 : DUR.base, ease: EASE.ios }}
-      className="fixed inset-x-0 bottom-0 top-12 z-30 flex flex-col bg-base"
+      className={
+        inline
+          ? "flex h-full min-h-0 w-full flex-col bg-base"
+          : "fixed inset-x-0 bottom-0 top-12 z-30 flex flex-col bg-base"
+      }
     >
       <header className="relative z-10 shrink-0 glass">
         <div className="flex min-h-12 items-center gap-3 px-6 py-2">
           <div className="flex min-w-0 flex-col">
-            <h1 className="truncate text-title3 text-primary">扩图</h1>
+            <h1 className="truncate text-title3 text-primary">{t("扩图")}</h1>
             <p className="truncate text-footnote text-tertiary">
-              向外拖动手柄扩展画面，AI 补全内容
+              {t("向外拖动手柄扩展画面，AI 补全内容")}
             </p>
           </div>
           <div className="ml-auto flex shrink-0 items-center gap-2">
@@ -307,10 +309,10 @@ export default function OutpaintView() {
               disabled={!changed}
               onClick={() => void submit()}
             >
-              生成扩图
+              {t("生成扩图")}
             </Button>
             <IconButton
-              label="关闭扩图"
+              label={t("关闭扩图")}
               icon={<IconClose size={16} />}
               onClick={closeOutpaint}
             />
@@ -319,15 +321,18 @@ export default function OutpaintView() {
 
         <div
           role="toolbar"
-          aria-label="扩图工具"
+          aria-label={t("扩图工具")}
           className="flex flex-wrap items-center gap-3 px-6 pb-2.5"
         >
-          <span className="text-footnote text-tertiary">目标比例</span>
+          <span className="text-footnote text-tertiary">{t("目标比例")}</span>
           <SegmentedControl
             value={preset}
             onValueChange={applyPreset}
-            options={PRESETS}
-            label="目标比例"
+            options={[
+              { value: "free", label: t("自由") },
+              ...PRESET_RATIOS.map((ratio) => ({ value: ratio, label: ratio })),
+            ]}
+            label={t("目标比例")}
             size="sm"
           />
           <span className="text-footnote tabular-nums text-tertiary">
@@ -337,8 +342,8 @@ export default function OutpaintView() {
             <Input
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
-              placeholder="补充描述（可选）：如“延伸出海面与晚霞”"
-              aria-label="补全描述"
+              placeholder={t("补充描述（可选）：如“延伸出海面与晚霞”")}
+              aria-label={t("补全描述")}
               compact
             />
           </div>
@@ -371,7 +376,7 @@ export default function OutpaintView() {
             >
               <SafeImg
                 src={target.dataUrl}
-                alt="扩图对象"
+                alt={t("扩图对象")}
                 className="absolute inset-0 h-full w-full"
               />
             </div>
@@ -380,7 +385,9 @@ export default function OutpaintView() {
                 key={h.side}
                 style={h.style}
                 role="slider"
-                aria-label={`向${SIDE_LABEL[h.side]}扩图`}
+                aria-label={t("向{{side}}扩图", {
+                  side: t(SIDE_LABEL[h.side]),
+                })}
                 aria-valuemin={0}
                 aria-valuemax={4096}
                 aria-valuenow={offsets[h.side]}
@@ -418,7 +425,7 @@ export default function OutpaintView() {
             ))}
           </div>
         ) : (
-          <span className="text-body text-tertiary">加载中…</span>
+          <span className="text-body text-tertiary">{t("加载中…")}</span>
         )}
       </div>
 

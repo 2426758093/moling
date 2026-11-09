@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { useTranslation } from "react-i18next";
 import { motion } from "framer-motion";
 import { ChatImage, useChatStore } from "../stores/chatStore";
 import { useAppStore } from "../stores/appStore";
@@ -40,6 +41,7 @@ export default function ImageCard({
   /** 所属消息 id：删除必须落库，否则刷新后图片又回来 */
   messageId: number;
 }) {
+  const { t } = useTranslation();
   const addDataUrlAttachment = useChatStore((s) => s.addDataUrlAttachment);
   const openEditor = useAppStore((s) => s.openEditor);
   const openOutpaint = useAppStore((s) => s.openOutpaint);
@@ -82,7 +84,7 @@ export default function ImageCard({
 
   // WebView2 没有下载处理器，必须走系统保存对话框 + Rust 写盘
   const download = () => {
-    const fail = () => toast("下载失败", "error");
+    const fail = () => toast(t("下载失败"), "error");
     if (image.historyId > 0) {
       // 用真实扩展名：mock/模板服务商可能出 SVG，固定 .png 会导致双击打不开
       const name = `moling_${image.historyId}.${extOf(image.path ?? "")}`;
@@ -104,8 +106,8 @@ export default function ImageCard({
     // 生成图可能很大：走 dataUrl 入口统一按需压缩
     void addDataUrlAttachment(
       image.dataUrl,
-      `引用图 #${image.historyId}`,
-    ).catch(() => toast("添加参考图失败", "error"));
+      t("引用图 #{{id}}", { id: image.historyId }),
+    ).catch(() => toast(t("添加参考图失败"), "error"));
   };
 
   const removeLocal = () =>
@@ -127,7 +129,7 @@ export default function ImageCard({
       await api.removeMessageImage(messageId, image.historyId);
       removeLocal();
     } catch (e) {
-      toast(`删除失败：${String(e)}`, "error");
+      toast(t("删除失败：{{error}}", { error: String(e) }), "error");
     }
   };
 
@@ -143,19 +145,19 @@ export default function ImageCard({
       : [
           {
             id: "inpaint",
-            label: "局部重绘",
+            label: t("局部重绘"),
             icon: <IconBrush size={14} />,
             onSelect: () => openEditor({ ...baseTarget, mode: "inpaint" }),
           },
           {
             id: "erase",
-            label: "AI 消除",
+            label: t("AI 消除"),
             icon: <IconEraser size={14} />,
             onSelect: () => openEditor({ ...baseTarget, mode: "erase" }),
           },
           {
             id: "outpaint",
-            label: "扩图",
+            label: t("扩图"),
             icon: <IconExpand size={14} />,
             onSelect: () => openOutpaint(baseTarget),
           },
@@ -168,13 +170,13 @@ export default function ImageCard({
       : [
           {
             id: "upscale",
-            label: "高清放大",
+            label: t("高清放大"),
             icon: <IconExpand size={14} />,
             onSelect: () => openTransform({ ...baseTarget, kind: "upscale" }),
           },
           {
             id: "style",
-            label: "风格转换",
+            label: t("风格转换"),
             icon: <IconSparkle size={14} />,
             onSelect: () => openTransform({ ...baseTarget, kind: "style" }),
           },
@@ -183,13 +185,13 @@ export default function ImageCard({
   const menuItems: MenuItem[] = [
     {
       id: "copy",
-      label: copied ? "已复制提示词" : "复制提示词",
+      label: copied ? t("已复制提示词") : t("复制提示词"),
       icon: <IconCopy size={14} />,
       onSelect: copyPrompt,
     },
     {
       id: "reference",
-      label: "引用为参考图",
+      label: t("引用为参考图"),
       icon: <IconQuote size={14} />,
       onSelect: reference,
     },
@@ -199,7 +201,7 @@ export default function ImageCard({
       ? [
           {
             id: "background",
-            label: "换背景",
+            label: t("换背景"),
             icon: <IconPalette size={14} />,
             onSelect: () => openBackground(baseTarget),
           },
@@ -207,21 +209,21 @@ export default function ImageCard({
       : []),
     {
       id: "basic-edit",
-      label: "基础编辑",
+      label: t("基础编辑"),
       icon: <IconCrop size={14} />,
       onSelect: () => openBasicEdit(baseTarget),
     },
     ...transformItems,
     {
       id: "download",
-      label: "下载",
+      label: t("下载"),
       icon: <IconDownload size={14} />,
       separatorBefore: true,
       onSelect: download,
     },
     {
       id: "delete",
-      label: "删除",
+      label: t("删除"),
       icon: <IconTrash size={14} />,
       danger: true,
       onSelect: removeImage,
@@ -251,7 +253,7 @@ export default function ImageCard({
           <button
             type="button"
             onClick={openViewer}
-            aria-label={`查看大图：${prompt}`}
+            aria-label={t("查看大图：{{prompt}}", { prompt })}
             className="block w-full cursor-zoom-in"
           >
             <SafeImg
@@ -262,47 +264,50 @@ export default function ImageCard({
           </button>
           {image.derivedFrom !== undefined && (
             <span className="glass-media pointer-events-none absolute left-2 top-2 rounded-pill px-2 py-0.5 text-caption text-on-accent">
-              派生自 #{image.derivedFrom}
+              {t("派生自 #{{id}}", { id: image.derivedFrom })}
             </span>
           )}
           <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center justify-end gap-1 p-2 opacity-0 transition-opacity duration-200 group-focus-within:opacity-100 group-hover:opacity-100">
             {/* 媒体玻璃操作条：图片上的浮标，5 个 28px 圆形按钮 */}
             <div className="glass-media pointer-events-auto flex items-center gap-0.5 rounded-pill p-0.5">
-              <Tooltip label="查看原图" side="top">
+              <Tooltip label={t("查看原图")} side="top">
                 <button
                   type="button"
                   onClick={openViewer}
-                  aria-label="查看原图"
+                  aria-label={t("查看原图")}
                   className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent transition-colors hover:bg-on-accent/15"
                 >
                   <IconExpand size={13} />
                 </button>
               </Tooltip>
-              <Tooltip label={copied ? "已复制" : "复制提示词"} side="top">
+              <Tooltip
+                label={copied ? t("已复制") : t("复制提示词")}
+                side="top"
+              >
                 <button
                   type="button"
                   onClick={() => void copyPrompt()}
-                  aria-label="复制提示词"
+                  aria-label={t("复制提示词")}
                   className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent transition-colors hover:bg-on-accent/15"
                 >
                   <IconCopy size={13} />
                 </button>
               </Tooltip>
-              <Tooltip label="引用为参考图" side="top">
+              <Tooltip label={t("引用为参考图")} side="top">
                 <button
                   type="button"
                   onClick={reference}
-                  aria-label="引用为参考图"
+                  aria-label={t("引用为参考图")}
                   className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent transition-colors hover:bg-on-accent/15"
                 >
                   <IconQuote size={13} />
                 </button>
               </Tooltip>
-              <Tooltip label="下载" side="top">
+              <Tooltip label={t("下载")} side="top">
                 <button
                   type="button"
                   onClick={download}
-                  aria-label="下载"
+                  aria-label={t("下载")}
                   className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent transition-colors hover:bg-on-accent/15"
                 >
                   <IconDownload size={13} />
@@ -311,7 +316,7 @@ export default function ImageCard({
               <DropdownMenu items={menuItems} align="end">
                 <button
                   type="button"
-                  aria-label="更多操作"
+                  aria-label={t("更多操作")}
                   className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent transition-colors hover:bg-on-accent/15"
                 >
                   <IconMore size={13} />

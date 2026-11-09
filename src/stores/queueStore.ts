@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api, EnqueueJobInput, QueueJob } from "../lib/api";
+import i18n from "../i18n";
 import { toast } from "../lib/notify";
 
 export interface QueueProgress {
@@ -18,13 +19,17 @@ interface QueueStore {
   providerConcurrency: number;
   loaded: boolean;
   progress: Record<number, QueueProgress>;
+  /** 限流退避结束时间（epoch ms），仅处理 429 等待期间存在 */
+  backoff: Record<number, number>;
   unlisteners: UnlistenFn[];
   load: () => Promise<void>;
   /** 订阅后端事件（引用计数：与 unsubscribe 成对调用） */
   subscribe: () => Promise<void>;
   unsubscribe: () => void;
   enqueue: (input: EnqueueJobInput) => Promise<void>;
-  start: () => Promise<void>;
+  /** silent：启动时自动续跑不打扰用户 */
+  start: (silent?: boolean) => Promise<void>;
+  resumeInterrupted: () => Promise<void>;
   setConcurrency: (n: number) => Promise<void>;
   setProviderConcurrency: (n: number) => Promise<void>;
   cancel: (id: number) => Promise<void>;
@@ -54,6 +59,7 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
   providerConcurrency: 1,
   loaded: false,
   progress: {},
+  backoff: {},
   unlisteners: [],
 
   load: async () => {
@@ -81,10 +87,28 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
           set((s) => {
             // 离开 running 后清掉本地进度，避免重试后残留旧进度
             const progress = { ...s.progress };
-            if (job.status !== "running") delete progress[job.id];
-            return { jobs: upsertJob(s.jobs, job), progress };
+            const backoff = { ...s.backoff };
+            if (job.status !== "running") {
+              delete progress[job.id];
+              delete backoff[job.id];
+            }
+            return { jobs: upsertJob(s.jobs, job), progress, backoff };
           });
         }),
+      );
+      unlisteners.push(
+        await listen<{ id: number; expiresAt: number }>(
+          "queue:backoff",
+          (e) => {
+            const { id, expiresAt } = e.payload;
+            set((s) => {
+              const backoff = { ...s.backoff };
+              if (expiresAt > 0) backoff[id] = expiresAt;
+              else delete backoff[id];
+              return { backoff };
+            });
+          },
+        ),
       );
       unlisteners.push(
         await listen<Record<string, number>>("queue:counts", (e) =>
@@ -127,24 +151,35 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
     set((s) => ({ jobs: upsertJob(s.jobs, job) }));
   },
 
-  start: async () => {
+  start: async (silent = false) => {
     await api.resumeQueue();
     set({ paused: false });
-    toast("队列已开始");
+    if (!silent) toast(i18n.t("队列已开始"));
+  },
+
+  resumeInterrupted: async () => {
+    const count = await api.requeueInterruptedJobs();
+    set({ paused: false });
+    await get().load();
+    toast(
+      count > 0
+        ? i18n.t("已恢复 {{n}} 个中断任务", { n: count })
+        : i18n.t("没有需要恢复的中断任务"),
+    );
   },
 
   setConcurrency: async (n) => {
     const next = Math.min(4, Math.max(1, Math.round(n)));
     await api.setSetting("queueConcurrency", String(next));
     set({ concurrency: next });
-    toast(`并发数已设为 ${next}`);
+    toast(i18n.t("并发数已设为 {{n}}", { n: next }));
   },
 
   setProviderConcurrency: async (n) => {
     const next = Math.min(2, Math.max(1, Math.round(n)));
     await api.setSetting("queueProviderConcurrency", String(next));
     set({ providerConcurrency: next });
-    toast(`每服务商并发已设为 ${next}`);
+    toast(i18n.t("每服务商并发已设为 {{n}}", { n: next }));
   },
 
   cancel: async (id) => {
@@ -158,6 +193,6 @@ export const useQueueStore = create<QueueStore>((set, get) => ({
   clearFinished: async () => {
     const removed = await api.clearFinishedJobs();
     await get().load();
-    if (removed > 0) toast(`已清空 ${removed} 条已结束任务`);
+    if (removed > 0) toast(i18n.t("已清空 {{n}} 条已结束任务", { n: removed }));
   },
 }));

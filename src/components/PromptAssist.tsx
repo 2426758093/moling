@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
+import { useTranslation } from "react-i18next";
+import type { TFunction } from "i18next";
 import {
   api,
   PromptTemplate,
@@ -103,21 +105,32 @@ function parseTagInput(raw: string): string[] {
     .slice(0, 8);
 }
 
-async function downloadJson(filename: string, data: unknown): Promise<void> {
+async function downloadJson(
+  filename: string,
+  data: unknown,
+  failMessage: string,
+): Promise<void> {
   try {
     await saveTextFile(JSON.stringify(data, null, 2), filename);
   } catch {
-    toast("导出失败", "error");
+    toast(failMessage, "error");
   }
 }
 
-function presetRefSummary(p: WorkflowPreset): string {
+function presetRefSummary(
+  p: WorkflowPreset,
+  t: TFunction<"translation">,
+): string {
   try {
     const v = JSON.parse(p.paramsJson);
     const parts: string[] = [];
     if (typeof v?.ratio === "string")
       parts.push(
-        v.ratio === "custom" ? "自定义" : v.ratio === "auto" ? "自动" : v.ratio,
+        v.ratio === "custom"
+          ? t("自定义")
+          : v.ratio === "auto"
+            ? t("自动")
+            : v.ratio,
       );
     if (
       typeof v?.width === "number" &&
@@ -127,12 +140,15 @@ function presetRefSummary(p: WorkflowPreset): string {
       parts.push(`${v.width}×${v.height}`);
     }
     if (typeof v?.quality === "string" && v.quality !== "auto") {
-      parts.push(`质量 ${qualityLabel(v.quality)}`);
+      const quality = qualityLabel(v.quality);
+      parts.push(`${t("质量")} ${t(quality, quality)}`);
     }
-    if (p.refs.length > 0) parts.push(`${p.refs.length} 参考图`);
+    if (p.refs.length > 0) {
+      parts.push(t("{{n}} 参考图", { n: p.refs.length }));
+    }
     return parts.join(" · ");
   } catch {
-    return p.refs.length > 0 ? `${p.refs.length} 参考图` : "";
+    return p.refs.length > 0 ? t("{{n}} 参考图", { n: p.refs.length }) : "";
   }
 }
 
@@ -154,6 +170,7 @@ export default function PromptAssist({
   draft: string;
   onClose: () => void;
 }) {
+  const { t } = useTranslation();
   const [tab, setTab] = useState<TabId>("templates");
   const setDraftPrompt = useChatStore((s) => s.setDraftPrompt);
   const favorites = usePromptAssetsStore((s) => s.favorites);
@@ -266,32 +283,36 @@ export default function PromptAssist({
     const res = await usePromptAssetsStore
       .getState()
       .upsertFavorite(text, parseTagInput(favTags));
-    if (res === "created") toast("已收藏当前提示词");
-    if (res === "updated") toast("该提示词已存在，已更新收藏");
+    if (res === "created") toast(t("已收藏当前提示词"));
+    if (res === "updated") toast(t("该提示词已存在，已更新收藏"));
     if (res) setFavTags("");
   };
 
   const exportFavorites = () => {
     if (favorites.length === 0) {
-      toast("还没有可导出的收藏", "error");
+      toast(t("还没有可导出的收藏"), "error");
       return;
     }
-    void downloadJson(`moling_favorites_${Date.now()}.json`, {
-      version: 1,
-      type: "moling-favorites",
-      favorites: favorites.map((f) => ({
-        text: f.text,
-        tags: f.tags,
-        createdAt: f.createdAt,
-      })),
-    });
+    void downloadJson(
+      `moling_favorites_${Date.now()}.json`,
+      {
+        version: 1,
+        type: "moling-favorites",
+        favorites: favorites.map((f) => ({
+          text: f.text,
+          tags: f.tags,
+          createdAt: f.createdAt,
+        })),
+      },
+      t("导出失败"),
+    );
   };
 
   const importFavorites = async (file: File) => {
     try {
       const data = JSON.parse(await readFileAsText(file));
       if (data?.type !== "moling-favorites" || !Array.isArray(data.favorites)) {
-        throw new Error("文件格式不正确");
+        throw new Error(t("文件格式不正确"));
       }
       let ok = 0;
       for (const item of data.favorites) {
@@ -305,11 +326,13 @@ export default function PromptAssist({
         if (res) ok += 1;
       }
       toast(
-        ok > 0 ? `已导入 ${ok} 条收藏` : "文件中没有可导入的收藏",
+        ok > 0
+          ? t("已导入 {{n}} 条收藏", { n: ok })
+          : t("文件中没有可导入的收藏"),
         ok > 0 ? "info" : "error",
       );
     } catch (e) {
-      toast(`导入收藏失败：${String(e)}`, "error");
+      toast(t("导入收藏失败：{{error}}", { error: String(e) }), "error");
     }
   };
 
@@ -344,14 +367,14 @@ export default function PromptAssist({
         refs,
       });
       if (saved) {
-        toast(`已保存预设「${saved.name}」`);
+        toast(t("已保存预设「{{name}}」", { name: saved.name }));
         setPresetName("");
         if (attachments.length > 4) {
-          toast("预设最多保存 4 张参考图，已取前 4 张", "error");
+          toast(t("预设最多保存 4 张参考图，已取前 4 张"), "error");
         }
       }
     } catch (e) {
-      toast(`保存预设失败：${String(e)}`, "error");
+      toast(t("保存预设失败：{{error}}", { error: String(e) }), "error");
     } finally {
       setPresetBusy(false);
     }
@@ -364,7 +387,7 @@ export default function PromptAssist({
 
   const exportPresets = async () => {
     if (presets.length === 0) {
-      toast("还没有可导出的预设", "error");
+      toast(t("还没有可导出的预设"), "error");
       return;
     }
     let skipped = 0;
@@ -393,13 +416,17 @@ export default function PromptAssist({
         updatedAt: p.updatedAt,
       });
     }
-    void downloadJson(`moling_presets_${Date.now()}.json`, {
-      version: 1,
-      type: "moling-presets",
-      presets: out,
-    });
+    void downloadJson(
+      `moling_presets_${Date.now()}.json`,
+      {
+        version: 1,
+        type: "moling-presets",
+        presets: out,
+      },
+      t("导出失败"),
+    );
     if (skipped > 0) {
-      toast(`已导出预设，${skipped} 张参考图缺失被跳过`, "error");
+      toast(t("已导出预设，{{n}} 张参考图缺失被跳过", { n: skipped }), "error");
     }
   };
 
@@ -407,7 +434,7 @@ export default function PromptAssist({
     try {
       const data = JSON.parse(await readFileAsText(file));
       if (data?.type !== "moling-presets" || !Array.isArray(data.presets)) {
-        throw new Error("文件格式不正确");
+        throw new Error(t("文件格式不正确"));
       }
       let ok = 0;
       let failed = 0;
@@ -459,11 +486,13 @@ export default function PromptAssist({
         }
       }
       toast(
-        `已导入 ${ok} 个预设${failed > 0 ? `，${failed} 个失败` : ""}`,
+        failed > 0
+          ? t("已导入 {{ok}} 个预设，{{failed}} 个失败", { ok, failed })
+          : t("已导入 {{ok}} 个预设", { ok }),
         ok > 0 ? "info" : "error",
       );
     } catch (e) {
-      toast(`导入预设失败：${String(e)}`, "error");
+      toast(t("导入预设失败：{{error}}", { error: String(e) }), "error");
     }
   };
 
@@ -511,10 +540,11 @@ export default function PromptAssist({
   const visibleFavorites = favTagFilter
     ? favorites.filter((f) => f.tags.includes(favTagFilter))
     : favorites;
-  const directionLabel = isCJK(draft) ? "中 → 英" : "英 → 中";
+  const directionLabel = isCJK(draft) ? t("中 → 英") : t("英 → 中");
 
   return (
     <motion.div
+      data-assist-panel
       initial={{ opacity: 0, y: 10 }}
       animate={{ opacity: 1, y: 0 }}
       exit={{ opacity: 0, y: 10 }}
@@ -526,13 +556,16 @@ export default function PromptAssist({
           <SegmentedControl
             value={tab}
             onValueChange={setTab}
-            label="提示词助手分区"
+            label={t("提示词助手分区")}
             size="sm"
-            options={TABS.map((t) => ({ value: t.id, label: t.label }))}
+            options={TABS.map((item) => ({
+              value: item.id,
+              label: t(item.label),
+            }))}
           />
         </div>
         <IconButton
-          label="关闭提示词助手"
+          label={t("关闭提示词助手")}
           icon={<IconClose size={14} />}
           size="sm"
           onClick={onClose}
@@ -543,12 +576,13 @@ export default function PromptAssist({
         {tab === "optimize" && (
           <div className="space-y-2.5">
             <div className="rounded-btn bg-fill px-3 py-2 text-footnote leading-snug text-secondary">
-              {draft.trim() || "先在输入框写好提示词，再回来优化"}
+              {draft.trim() || t("先在输入框写好提示词，再回来优化")}
             </div>
             <div className="flex items-center justify-between gap-2">
               <span className="text-caption text-tertiary">
-                补全场景、构图、光线与质感，保留原意
-                {!draft.trim() && "（需要先输入内容）"}
+                {draft.trim()
+                  ? t("补全场景、构图、光线与质感，保留原意")
+                  : t("补全场景、构图、光线与质感，保留原意（需要先输入内容）")}
               </span>
               <Button
                 size="sm"
@@ -556,7 +590,7 @@ export default function PromptAssist({
                 disabled={!draft.trim() || optimizeBusy}
                 onClick={() => void doOptimize()}
               >
-                {optimizeBusy ? "优化中…" : "优化"}
+                {optimizeBusy ? t("优化中…") : t("优化")}
               </Button>
             </div>
             {optimizeError && (
@@ -574,7 +608,7 @@ export default function PromptAssist({
                   onChange={(e) => setOptimizeResult(e.target.value)}
                   rows={3}
                   compact
-                  aria-label="优化结果"
+                  aria-label={t("优化结果")}
                 />
                 <Button
                   size="sm"
@@ -582,7 +616,7 @@ export default function PromptAssist({
                   block
                   onClick={() => applyText(optimizeResult)}
                 >
-                  填入输入框
+                  {t("填入输入框")}
                 </Button>
               </>
             )}
@@ -592,46 +626,46 @@ export default function PromptAssist({
         {tab === "templates" && (
           <div className="space-y-3">
             <div className="grid grid-cols-2 gap-1.5">
-              {builtin.map((t) => (
+              {builtin.map((tpl) => (
                 <button
-                  key={t.id}
-                  onClick={() => applyText(t.text)}
+                  key={tpl.id}
+                  onClick={() => applyText(tpl.text)}
                   className="pressable rounded-btn border border-line px-3 py-2 text-left transition-colors duration-150 hover:border-accent hover:bg-accent-soft"
                 >
                   <div className="text-subhead font-medium text-primary">
-                    {t.title}
+                    {tpl.title}
                   </div>
                   <div className="mt-0.5 line-clamp-2 text-footnote leading-snug text-tertiary">
-                    {t.text}
+                    {tpl.text}
                   </div>
                 </button>
               ))}
             </div>
             {custom.length > 0 && (
               <div className="space-y-1.5 border-t border-line pt-2.5">
-                {custom.map((t) => (
+                {custom.map((tpl) => (
                   <div
-                    key={t.id}
+                    key={tpl.id}
                     className="group flex items-center gap-2 rounded-btn border border-line px-3 py-2"
                   >
                     <button
-                      onClick={() => applyText(t.text)}
+                      onClick={() => applyText(tpl.text)}
                       className="min-w-0 flex-1 text-left"
                     >
                       <div className="text-subhead font-medium text-primary">
-                        {t.title}
+                        {tpl.title}
                       </div>
                       <div className="mt-0.5 truncate text-footnote text-tertiary">
-                        {t.text}
+                        {tpl.text}
                       </div>
                     </button>
                     <IconButton
-                      label={`删除模板 ${t.title}`}
+                      label={t("删除模板 {{name}}", { name: tpl.title })}
                       icon={<IconTrash size={13} />}
                       size="sm"
                       tooltip={false}
                       className="text-tertiary hover:text-danger"
-                      onClick={() => void removeCustom(t.id)}
+                      onClick={() => void removeCustom(tpl.id)}
                     />
                   </div>
                 ))}
@@ -641,16 +675,16 @@ export default function PromptAssist({
               <Input
                 value={newTitle}
                 onChange={(e) => setNewTitle(e.target.value)}
-                placeholder="模板名称"
-                aria-label="模板名称"
+                placeholder={t("模板名称")}
+                aria-label={t("模板名称")}
               />
               <Textarea
                 value={newText}
                 onChange={(e) => setNewText(e.target.value)}
                 rows={2}
                 compact
-                placeholder="模板内容（提示词，{subject} 可作占位）"
-                aria-label="模板内容"
+                placeholder={t("模板内容（提示词，{subject} 可作占位）")}
+                aria-label={t("模板内容")}
               />
               <Button
                 size="sm"
@@ -658,7 +692,7 @@ export default function PromptAssist({
                 disabled={!newTitle.trim() || !newText.trim()}
                 onClick={() => void addCustom()}
               >
-                保存为自定义模板
+                {t("保存为自定义模板")}
               </Button>
             </div>
           </div>
@@ -675,14 +709,14 @@ export default function PromptAssist({
                 icon={<IconSparkle size={13} />}
                 onClick={() => setInspiration(rollInspiration())}
               >
-                再掷一次
+                {t("再掷一次")}
               </Button>
               <Button
                 size="sm"
                 variant="primary"
                 onClick={() => applyText(inspiration)}
               >
-                使用这条
+                {t("使用这条")}
               </Button>
             </div>
           </div>
@@ -707,13 +741,15 @@ export default function PromptAssist({
                 className="pressable flex w-full flex-col items-center gap-2 rounded-btn border border-dashed border-line py-6 text-tertiary transition-colors hover:bg-hover hover:text-secondary"
               >
                 <IconImage size={22} strokeWidth={1.4} />
-                <span className="text-footnote">上传图片，反推绘制提示词</span>
+                <span className="text-footnote">
+                  {t("上传图片，反推绘制提示词")}
+                </span>
               </button>
             ) : (
               <div className="flex gap-2.5">
                 <SafeImg
                   src={reverseImg}
-                  alt="反推对象"
+                  alt={t("反推对象")}
                   className="h-16 w-16 shrink-0 rounded-xl border border-line object-cover"
                 />
                 <div className="min-w-0 flex-1">
@@ -724,7 +760,7 @@ export default function PromptAssist({
                         <span className="thinking-dot h-1.5 w-1.5 rounded-pill bg-accent" />
                         <span className="thinking-dot h-1.5 w-1.5 rounded-pill bg-accent" />
                       </span>
-                      正在反推…
+                      {t("正在反推…")}
                     </div>
                   ) : reverseError ? (
                     <div className="text-footnote leading-snug text-danger">
@@ -739,7 +775,7 @@ export default function PromptAssist({
                       onChange={(e) => setReverseResult(e.target.value)}
                       rows={3}
                       compact
-                      aria-label="反推结果"
+                      aria-label={t("反推结果")}
                     />
                   )}
                 </div>
@@ -748,14 +784,14 @@ export default function PromptAssist({
             {reverseResult && !reverseBusy && (
               <div className="flex justify-end gap-2">
                 <Button size="sm" onClick={() => fileRef.current?.click()}>
-                  换一张
+                  {t("换一张")}
                 </Button>
                 <Button
                   size="sm"
                   variant="primary"
                   onClick={() => applyText(reverseResult)}
                 >
-                  填入输入框
+                  {t("填入输入框")}
                 </Button>
               </div>
             )}
@@ -768,8 +804,8 @@ export default function PromptAssist({
               <Input
                 value={favTags}
                 onChange={(e) => setFavTags(e.target.value)}
-                placeholder="标签，逗号分隔（可选）"
-                aria-label="收藏标签"
+                placeholder={t("标签，逗号分隔（可选）")}
+                aria-label={t("收藏标签")}
               />
               <Button
                 size="sm"
@@ -777,7 +813,7 @@ export default function PromptAssist({
                 disabled={!draft.trim()}
                 onClick={() => void addFavorite()}
               >
-                收藏当前
+                {t("收藏当前")}
               </Button>
             </div>
             {allTags.length > 0 && (
@@ -790,7 +826,7 @@ export default function PromptAssist({
                       : "bg-fill text-tertiary hover:text-secondary"
                   }`}
                 >
-                  全部
+                  {t("全部")}
                 </button>
                 {allTags.map((tag) => (
                   <button
@@ -836,7 +872,9 @@ export default function PromptAssist({
                     )}
                   </button>
                   <IconButton
-                    label={`删除收藏：${f.text.slice(0, 20)}`}
+                    label={t("删除收藏：{{preview}}", {
+                      preview: f.text.slice(0, 20),
+                    })}
                     icon={<IconTrash size={13} />}
                     size="sm"
                     tooltip={false}
@@ -850,17 +888,17 @@ export default function PromptAssist({
               {visibleFavorites.length === 0 && (
                 <div className="py-4 text-center text-footnote text-tertiary">
                   {favorites.length === 0
-                    ? "还没有收藏，先在输入框写好提示词"
-                    : "该标签下没有收藏"}
+                    ? t("还没有收藏，先在输入框写好提示词")
+                    : t("该标签下没有收藏")}
                 </div>
               )}
             </div>
             <div className="flex items-center justify-between border-t border-line pt-2.5">
               <Button size="sm" onClick={exportFavorites}>
-                导出 JSON
+                {t("导出 JSON")}
               </Button>
               <Button size="sm" onClick={() => favFileRef.current?.click()}>
-                导入 JSON
+                {t("导入 JSON")}
               </Button>
               <input
                 ref={favFileRef}
@@ -883,8 +921,8 @@ export default function PromptAssist({
               <Input
                 value={presetName}
                 onChange={(e) => setPresetName(e.target.value)}
-                placeholder="预设名称"
-                aria-label="预设名称"
+                placeholder={t("预设名称")}
+                aria-label={t("预设名称")}
               />
               <Button
                 size="sm"
@@ -892,12 +930,13 @@ export default function PromptAssist({
                 disabled={!presetName.trim() || presetBusy}
                 onClick={() => void saveCurrentPreset()}
               >
-                {presetBusy ? "保存中…" : "保存当前"}
+                {presetBusy ? t("保存中…") : t("保存当前")}
               </Button>
             </div>
             <div className="text-caption leading-snug text-tertiary">
-              保存草稿、负向词、尺寸 / 比例 / 风格 / 张数，以及当前参考图（最多
-              4 张）
+              {t(
+                "保存草稿、负向词、尺寸 / 比例 / 风格 / 张数，以及当前参考图（最多 4 张）",
+              )}
             </div>
             <div className="space-y-1.5">
               {presets.map((p) => (
@@ -914,15 +953,15 @@ export default function PromptAssist({
                         {p.name}
                       </span>
                       <span className="shrink-0 text-caption text-tertiary">
-                        {presetRefSummary(p)}
+                        {presetRefSummary(p, t)}
                       </span>
                     </div>
                     <div className="mt-0.5 line-clamp-1 text-footnote text-tertiary">
-                      {p.prompt || "（无提示词）"}
+                      {p.prompt || t("（无提示词）")}
                     </div>
                   </button>
                   <IconButton
-                    label={`删除预设 ${p.name}`}
+                    label={t("删除预设 {{name}}", { name: p.name })}
                     icon={<IconTrash size={13} />}
                     size="sm"
                     tooltip={false}
@@ -935,16 +974,16 @@ export default function PromptAssist({
               ))}
               {presets.length === 0 && (
                 <div className="py-4 text-center text-footnote text-tertiary">
-                  还没有预设，命名后点击「保存当前」
+                  {t("还没有预设，命名后点击「保存当前」")}
                 </div>
               )}
             </div>
             <div className="flex items-center justify-between border-t border-line pt-2.5">
               <Button size="sm" onClick={() => void exportPresets()}>
-                导出 JSON
+                {t("导出 JSON")}
               </Button>
               <Button size="sm" onClick={() => presetFileRef.current?.click()}>
-                导入 JSON
+                {t("导入 JSON")}
               </Button>
               <input
                 ref={presetFileRef}
@@ -964,12 +1003,15 @@ export default function PromptAssist({
         {tab === "translate" && (
           <div className="space-y-2.5">
             <div className="rounded-btn bg-fill px-3 py-2 text-footnote leading-snug text-secondary">
-              {draft.trim() || "先在输入框写好提示词，再回来翻译"}
+              {draft.trim() || t("先在输入框写好提示词，再回来翻译")}
             </div>
             <div className="flex items-center justify-between">
               <span className="text-caption text-tertiary">
-                方向：{directionLabel}
-                {!draft.trim() && "（需要先输入内容）"}
+                {draft.trim()
+                  ? t("方向：{{dir}}", { dir: directionLabel })
+                  : t("方向：{{dir}}（需要先输入内容）", {
+                      dir: directionLabel,
+                    })}
               </span>
               <Button
                 size="sm"
@@ -977,7 +1019,7 @@ export default function PromptAssist({
                 disabled={!draft.trim() || translateBusy}
                 onClick={() => void doTranslate()}
               >
-                {translateBusy ? "翻译中…" : "翻译"}
+                {translateBusy ? t("翻译中…") : t("翻译")}
               </Button>
             </div>
             {translateError && (
@@ -995,7 +1037,7 @@ export default function PromptAssist({
                   onChange={(e) => setTranslateResult(e.target.value)}
                   rows={3}
                   compact
-                  aria-label="翻译结果"
+                  aria-label={t("翻译结果")}
                 />
                 <Button
                   size="sm"
@@ -1003,7 +1045,7 @@ export default function PromptAssist({
                   block
                   onClick={() => applyText(translateResult)}
                 >
-                  填入输入框
+                  {t("填入输入框")}
                 </Button>
               </>
             )}

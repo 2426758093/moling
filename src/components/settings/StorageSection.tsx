@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api, StorageStats, DirStat } from "../../lib/api";
 import { toast } from "../../lib/notify";
@@ -7,10 +8,9 @@ import { Section, Row } from "../ui/List";
 import { Select } from "../ui/Select";
 import { ConfirmDialog } from "../ui/Dialog";
 
-const RETENTION_OPTIONS = [7, 15, 30, 60, 90, 180, 365].map((days) => ({
-  value: String(days),
-  label: `${days} 天`,
-}));
+const RETENTION_DAYS = [7, 15, 30, 60, 90, 180, 365] as const;
+
+type CardLabel = "图片" | "缩略图" | "参考图" | "回收站" | "数据库";
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -24,17 +24,20 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[index]}`;
 }
 
-function statText(stat: { files: number; bytes: number }): string {
-  return `${stat.files} 个 · ${formatBytes(stat.bytes)}`;
-}
-
 /** 存储路径与缓存：媒体根可迁移，数据库/日志固定；清理与保留天数在此管理 */
 export default function StorageSection({ dataDir }: { dataDir: string }) {
+  const { t } = useTranslation();
   const [stats, setStats] = useState<StorageStats | null>(null);
   const [retention, setRetention] = useState("30");
   const [busy, setBusy] = useState(false);
   const [cleaning, setCleaning] = useState(false);
   const [pendingPath, setPendingPath] = useState<string | null>(null);
+
+  const statText = (stat: { files: number; bytes: number }) =>
+    t("{{n}} 个 · {{size}}", {
+      n: stat.files,
+      size: formatBytes(stat.bytes),
+    });
 
   const refreshStats = useCallback(async () => {
     try {
@@ -68,12 +71,12 @@ export default function StorageSection({ dataDir }: { dataDir: string }) {
       const picked = await open({
         directory: true,
         multiple: false,
-        title: "选择媒体目录（图片与参考图）",
+        title: t("选择媒体目录（图片与参考图）"),
       });
       const path = Array.isArray(picked) ? picked[0] : picked;
       if (path) setPendingPath(path);
     } catch (e) {
-      toast(`打开目录选择器失败：${String(e)}`, "error");
+      toast(t("打开目录选择器失败：{{error}}", { error: String(e) }), "error");
     }
   };
 
@@ -83,11 +86,14 @@ export default function StorageSection({ dataDir }: { dataDir: string }) {
     try {
       const report = await api.setMediaRoot(pendingPath);
       toast(
-        `已迁移 ${report.filesCopied} 个文件（${formatBytes(report.bytesCopied)}）`,
+        t("已迁移 {{n}} 个文件（{{size}}）", {
+          n: report.filesCopied,
+          size: formatBytes(report.bytesCopied),
+        }),
       );
       await refreshStats();
     } catch (e) {
-      toast(`更改位置失败：${String(e)}`, "error");
+      toast(t("更改位置失败：{{error}}", { error: String(e) }), "error");
     } finally {
       setBusy(false);
       setPendingPath(null);
@@ -98,9 +104,9 @@ export default function StorageSection({ dataDir }: { dataDir: string }) {
     setRetention(days);
     try {
       await api.setSetting("cacheRetentionDays", days);
-      toast(`缓存保留期已设为 ${days} 天`);
+      toast(t("缓存保留期已设为 {{n}} 天", { n: days }));
     } catch (e) {
-      toast(`保存缓存保留期失败：${String(e)}`, "error");
+      toast(t("保存缓存保留期失败：{{error}}", { error: String(e) }), "error");
     }
   };
 
@@ -111,18 +117,22 @@ export default function StorageSection({ dataDir }: { dataDir: string }) {
       const actions = r.moved + r.refsMoved + r.pruned + r.thumbsCreated;
       toast(
         actions > 0
-          ? `已清理：图片 ${r.moved}、参考图 ${r.refsMoved}、过期缓存 ${r.pruned}`
-          : "没有可清理的缓存",
+          ? t("已清理：图片 {{images}}、参考图 {{refs}}、过期缓存 {{pruned}}", {
+              images: r.moved,
+              refs: r.refsMoved,
+              pruned: r.pruned,
+            })
+          : t("没有可清理的缓存"),
       );
       await refreshStats();
     } catch (e) {
-      toast(`清理缓存失败：${String(e)}`, "error");
+      toast(t("清理缓存失败：{{error}}", { error: String(e) }), "error");
     } finally {
       setCleaning(false);
     }
   };
 
-  const cards: Array<[string, DirStat]> = stats
+  const cards: Array<[CardLabel, DirStat]> = stats
     ? [
         ["图片", stats.images],
         ["缩略图", stats.thumbs],
@@ -135,23 +145,28 @@ export default function StorageSection({ dataDir }: { dataDir: string }) {
   return (
     <>
       <Section
-        title="存储与缓存"
-        description="图片与参考图可以放到其它磁盘；数据库与日志始终留在应用数据目录。删除或移动图片前会先进入各自的 .trash，保留期到期后才清理。"
+        title={t("存储与缓存")}
+        description={t(
+          "图片与参考图可以放到其它磁盘；数据库与日志始终留在应用数据目录。删除或移动图片前会先进入各自的 .trash，保留期到期后才清理。",
+        )}
         action={
           <Button size="sm" onClick={() => void refreshStats()}>
-            刷新占用
+            {t("刷新占用")}
           </Button>
         }
       >
-        <Row label="媒体目录" hint="画廊图片、聊天附件、队列与预设参考图">
+        <Row
+          label={t("媒体目录")}
+          hint={t("画廊图片、聊天附件、队列与预设参考图")}
+        >
           <span className="max-w-xs truncate text-footnote text-tertiary">
-            {stats?.mediaRoot ?? "读取中…"}
+            {stats?.mediaRoot ?? t("读取中…")}
           </span>
           <Button size="sm" loading={busy} onClick={() => void pickFolder()}>
-            更改位置…
+            {t("更改位置…")}
           </Button>
         </Row>
-        <Row label="数据库与日志" hint="固定位置，不随媒体目录迁移">
+        <Row label={t("数据库与日志")} hint={t("固定位置，不随媒体目录迁移")}>
           <span className="max-w-xs truncate text-footnote text-tertiary">
             {dataDir}
           </span>
@@ -160,7 +175,7 @@ export default function StorageSection({ dataDir }: { dataDir: string }) {
           <div className="grid grid-cols-2 gap-2 border-b border-separator px-4 py-3 sm:grid-cols-3">
             {cards.map(([label, stat]) => (
               <div key={label} className="rounded-card bg-fill px-3 py-2">
-                <div className="text-caption text-tertiary">{label}</div>
+                <div className="text-caption text-tertiary">{t(label)}</div>
                 <div className="text-footnote text-primary">
                   {statText(stat)}
                 </div>
@@ -169,18 +184,21 @@ export default function StorageSection({ dataDir }: { dataDir: string }) {
           </div>
         )}
         <Row
-          label="缓存保留期"
-          hint="回收站中的文件超过该天数后，在下次启动或手动清理时删除"
+          label={t("缓存保留期")}
+          hint={t("回收站中的文件超过该天数后，在下次启动或手动清理时删除")}
         >
           <Select
             value={retention}
             onValueChange={(v) => void saveRetention(v)}
-            options={RETENTION_OPTIONS}
-            label="缓存保留期"
+            options={RETENTION_DAYS.map((days) => ({
+              value: String(days),
+              label: t("{{n}} 天", { n: days }),
+            }))}
+            label={t("缓存保留期")}
             widthClass="w-32"
           />
           <Button size="sm" loading={cleaning} onClick={() => void doClean()}>
-            立即清理缓存
+            {t("立即清理缓存")}
           </Button>
         </Row>
       </Section>
@@ -189,17 +207,19 @@ export default function StorageSection({ dataDir }: { dataDir: string }) {
         onOpenChange={(v) => {
           if (!v) setPendingPath(null);
         }}
-        title="更改媒体目录"
+        title={t("更改媒体目录")}
         description={
           <>
-            将把图片与参考图复制到：
+            {t("将把图片与参考图复制到：")}
             <br />
             <span className="break-all text-primary">{pendingPath}</span>
             <br />
-            迁移成功后更新数据库中的路径并删除旧目录中的媒体文件；数据库与日志位置不变。队列有任务运行时会拒绝执行。
+            {t(
+              "迁移成功后更新数据库中的路径并删除旧目录中的媒体文件；数据库与日志位置不变。队列有任务运行时会拒绝执行。",
+            )}
           </>
         }
-        confirmLabel="开始迁移"
+        confirmLabel={t("开始迁移")}
         onConfirm={() => void doMigrate()}
       />
     </>

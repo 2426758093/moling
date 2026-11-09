@@ -1,4 +1,6 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { useAppStore } from "../stores/appStore";
 import { useCanvasStore } from "../stores/canvasStore";
 import { Select } from "./ui/Select";
 import { Badge } from "./ui/Badge";
@@ -10,6 +12,10 @@ import { DropdownMenu, MenuItem } from "./ui/Menu";
 import PageHeader from "./PageHeader";
 import CanvasBoard from "./CanvasBoard";
 import CanvasAddDialog from "./CanvasAddDialog";
+import EditorView from "./EditorView";
+import OutpaintView from "./OutpaintView";
+import BasicEditView from "./BasicEditView";
+import BackgroundView from "./BackgroundView";
 import { IconBrush, IconChevron, IconPlus, IconTrash } from "./Icons";
 
 function NameDialog({
@@ -27,6 +33,7 @@ function NameDialog({
   onClose: () => void;
   onSubmit: (name: string) => Promise<boolean>;
 }) {
+  const { t } = useTranslation();
   const [name, setName] = useState(initial);
   const [busy, setBusy] = useState(false);
   const trimmed = name.trim();
@@ -51,7 +58,7 @@ function NameDialog({
       footer={
         <>
           <Button variant="ghost" onClick={onClose}>
-            取消
+            {t("取消")}
           </Button>
           <Button
             variant="primary"
@@ -65,7 +72,7 @@ function NameDialog({
       }
     >
       <Input
-        label="画布名称"
+        label={t("画布名称")}
         value={name}
         maxLength={80}
         autoFocus
@@ -79,6 +86,7 @@ function NameDialog({
 }
 
 export default function CanvasView() {
+  const { t } = useTranslation();
   const ensureLoaded = useCanvasStore((s) => s.ensureLoaded);
   const boards = useCanvasStore((s) => s.boards);
   const activeId = useCanvasStore((s) => s.activeId);
@@ -90,12 +98,28 @@ export default function CanvasView() {
   const selectBoard = useCanvasStore((s) => s.selectBoard);
   const renameBoard = useCanvasStore((s) => s.renameBoard);
   const deleteBoard = useCanvasStore((s) => s.deleteBoard);
+  const canvasInline = useAppStore((s) => s.canvasInline);
+  const editTarget = useAppStore((s) => s.editTarget);
+  const outpaintTarget = useAppStore((s) => s.outpaintTarget);
+  const basicEditTarget = useAppStore((s) => s.basicEditTarget);
+  const backgroundTarget = useAppStore((s) => s.backgroundTarget);
 
   const [addOpen, setAddOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
   const [renameOpen, setRenameOpen] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [wireMode, setWireMode] = useState(false);
+
+  // 画布节点的编辑入口在这里就地展开，结果回写画布节点
+  const inlinePanel = !canvasInline ? null : editTarget?.host === "canvas" ? (
+    <EditorView />
+  ) : outpaintTarget?.host === "canvas" ? (
+    <OutpaintView />
+  ) : basicEditTarget?.host === "canvas" ? (
+    <BasicEditView />
+  ) : backgroundTarget?.host === "canvas" ? (
+    <BackgroundView />
+  ) : null;
 
   useEffect(() => {
     void ensureLoaded();
@@ -104,23 +128,23 @@ export default function CanvasView() {
   // 节点少于两个时连线没有意义：切画布后自动退回浏览模式
   const wireActive = wireMode && nodeCount >= 2;
   const status = saving
-    ? "保存中…"
+    ? t("保存中…")
     : dirty
-      ? "未保存"
+      ? t("未保存")
       : activeId != null
-        ? "已保存"
+        ? t("已保存")
         : "";
 
   const moreItems: MenuItem[] = [
     {
       id: "rename",
-      label: "重命名画布",
+      label: t("重命名画布"),
       icon: <IconBrush size={14} />,
       onSelect: () => setRenameOpen(true),
     },
     {
       id: "delete",
-      label: "删除画布",
+      label: t("删除画布"),
       icon: <IconTrash size={14} />,
       danger: true,
       separatorBefore: true,
@@ -131,12 +155,15 @@ export default function CanvasView() {
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
       <PageHeader
-        title="画布"
+        title={t("画布")}
         subtitle={
           activeId != null ? (
             <span className="flex items-center gap-2">
               <span className="truncate">
-                {activeName} · {nodeCount} 个节点
+                {t("{{name}} · {{n}} 个节点", {
+                  name: activeName,
+                  n: nodeCount,
+                })}
               </span>
               {status && (
                 <Badge
@@ -147,7 +174,7 @@ export default function CanvasView() {
               )}
             </span>
           ) : (
-            "把作品放到一张无限画布上，再从节点进入编辑"
+            t("把作品放到一张无限画布上，再从节点进入编辑")
           )
         }
         actions={
@@ -162,13 +189,13 @@ export default function CanvasView() {
                   value: String(b.id),
                   label: b.name,
                 }))}
-                label="切换画布"
+                label={t("切换画布")}
                 variant="chip"
                 widthClass="w-32"
               />
             )}
             <IconButton
-              label="新建画布"
+              label={t("新建画布")}
               size="sm"
               icon={<IconPlus size={14} />}
               onClick={() => setCreateOpen(true)}
@@ -176,7 +203,7 @@ export default function CanvasView() {
             {activeId != null && (
               <DropdownMenu items={moreItems} align="end">
                 <IconButton
-                  label="画布操作"
+                  label={t("画布操作")}
                   size="sm"
                   tooltip={false}
                   icon={<IconChevron direction="down" size={14} />}
@@ -189,26 +216,36 @@ export default function CanvasView() {
               icon={<IconPlus size={14} />}
               onClick={() => setAddOpen(true)}
             >
-              添加图片
+              {t("添加图片")}
             </Button>
           </>
         }
       />
 
-      <CanvasBoard
-        wireMode={wireActive}
-        onWireModeChange={(on) => setWireMode(on)}
-        onAddImage={() => setAddOpen(true)}
-      />
+      <div className="flex min-h-0 min-w-0 flex-1 gap-2">
+        <CanvasBoard
+          wireMode={wireActive}
+          onWireModeChange={(on) => setWireMode(on)}
+          onAddImage={() => setAddOpen(true)}
+        />
+        {inlinePanel && (
+          <aside
+            aria-label={t("画布编辑面板")}
+            className="flex w-[min(440px,46%)] min-w-0 shrink-0 flex-col overflow-hidden rounded-card border border-line bg-base shadow-card"
+          >
+            {inlinePanel}
+          </aside>
+        )}
+      </div>
 
       <CanvasAddDialog open={addOpen} onOpenChange={setAddOpen} />
 
       {createOpen && (
         <NameDialog
-          title="新建画布"
-          description="给这张画布起个名字，之后可以随时切换"
+          title={t("新建画布")}
+          description={t("给这张画布起个名字，之后可以随时切换")}
           initial=""
-          confirmLabel="创建"
+          confirmLabel={t("创建")}
           onClose={() => setCreateOpen(false)}
           onSubmit={async (name) => {
             const id = await createBoard(name);
@@ -219,10 +256,10 @@ export default function CanvasView() {
 
       {renameOpen && (
         <NameDialog
-          title="重命名画布"
-          description="名称会随画布一起保存"
+          title={t("重命名画布")}
+          description={t("名称会随画布一起保存")}
           initial={activeName}
-          confirmLabel="保存"
+          confirmLabel={t("保存")}
           onClose={() => setRenameOpen(false)}
           onSubmit={async (name) => {
             renameBoard(name);
@@ -234,9 +271,9 @@ export default function CanvasView() {
       <ConfirmDialog
         open={deleteOpen}
         onOpenChange={setDeleteOpen}
-        title="删除这张画布？"
-        description="画布内的节点与连线会被删除，画廊里的作品不受影响。"
-        confirmLabel="删除"
+        title={t("删除这张画布？")}
+        description={t("画布内的节点与连线会被删除，画廊里的作品不受影响。")}
+        confirmLabel={t("删除")}
         danger
         onConfirm={() => void deleteBoard(activeId ?? -1)}
       />

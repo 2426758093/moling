@@ -2,6 +2,8 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import "./index.css";
+import "./i18n";
+import { applyLocale, isLocale } from "./i18n";
 import { api } from "./lib/api";
 import {
   applyGlassAppearance,
@@ -25,10 +27,11 @@ import { useAppStore } from "./stores/appStore";
 /// public/theme-boot.js 已经用 localStorage 镜像先画了一帧；这里读到 SQLite
 /// 的权威值后再覆盖，并把镜像同步回去，供下次启动使用。
 async function restoreAppearance() {
-  const [theme, glass, mode] = await Promise.all([
+  const [theme, glass, mode, locale] = await Promise.all([
     api.getSetting("theme").catch(() => null),
     api.getSetting("glassAppearance").catch(() => null),
     api.getSetting("uiMode").catch(() => null),
+    api.getSetting("locale").catch(() => null),
   ]);
   if (isThemeMode(theme)) {
     useAppStore.setState({ theme });
@@ -39,6 +42,10 @@ async function restoreAppearance() {
     writeGlassMirror(glass);
   }
   if (isUiMode(mode)) useAppStore.setState({ mode });
+  if (isLocale(locale)) {
+    useAppStore.setState({ locale });
+    applyLocale(locale);
+  }
   applyThemeClass(useAppStore.getState().theme);
   applyGlassAppearance(useAppStore.getState().glass);
   applyReduceTransparency(readAppearanceMirror().transparency ?? false);

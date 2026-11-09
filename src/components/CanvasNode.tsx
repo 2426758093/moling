@@ -1,4 +1,5 @@
 import { memo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { api } from "../lib/api";
 import { toast } from "../lib/notify";
 import { CanvasNode, useCanvasStore } from "../stores/canvasStore";
@@ -45,6 +46,7 @@ function CanvasNodeCard({
   onSelect: (id: string) => void;
   onWirePick: (id: string) => void;
 }) {
+  const { t } = useTranslation();
   const updateNode = useCanvasStore((s) => s.updateNode);
   const removeNode = useCanvasStore((s) => s.removeNode);
   const expert = useAppStore((s) => s.mode) === "expert";
@@ -128,7 +130,7 @@ function CanvasNodeCard({
         prompt: row?.prompt ?? "",
       });
     } catch (e) {
-      toast(`图片不可用：${String(e)}`, "error");
+      toast(t("图片不可用：{{error}}", { error: String(e) }), "error");
     }
   };
 
@@ -137,13 +139,16 @@ function CanvasNodeCard({
       const img = await api.getHistoryImage(node.historyId);
       const ok = await useChatStore
         .getState()
-        .addDataUrlAttachment(img.dataUrl, `画布图 #${node.historyId}`);
+        .addDataUrlAttachment(
+          img.dataUrl,
+          t("画布图 #{{id}}", { id: node.historyId }),
+        );
       if (ok) {
         useAppStore.getState().setView("chat");
-        toast("已加入聊天参考图");
+        toast(t("已加入聊天参考图"));
       }
     } catch (e) {
-      toast(`添加参考图失败：${String(e)}`, "error");
+      toast(t("添加参考图失败：{{error}}", { error: String(e) }), "error");
     }
   };
 
@@ -151,7 +156,7 @@ function CanvasNodeCard({
     try {
       const row = await api.getHistoryItem(node.historyId);
       if (!row) {
-        toast("该作品已从画廊删除", "error");
+        toast(t("该作品已从画廊删除"), "error");
         return;
       }
       useAppStore.getState().setPrefs({
@@ -164,9 +169,9 @@ function CanvasNodeCard({
       });
       useChatStore.getState().setDraftPrompt(row.prompt);
       useAppStore.getState().setView("chat");
-      toast("已回填生成参数");
+      toast(t("已回填生成参数"));
     } catch (e) {
-      toast(`读取参数失败：${String(e)}`, "error");
+      toast(t("读取参数失败：{{error}}", { error: String(e) }), "error");
     }
   };
 
@@ -176,29 +181,35 @@ function CanvasNodeCard({
       : [
           {
             id: "inpaint",
-            label: "局部重绘",
+            label: t("局部重绘"),
             icon: <IconBrush size={14} />,
             onSelect: () =>
-              void withTarget((t) => {
-                useAppStore.getState().openEditor({ ...t, mode: "inpaint" });
+              void withTarget((target) => {
+                useAppStore
+                  .getState()
+                  .openEditor({ ...target, mode: "inpaint", host: "canvas" });
               }),
           },
           {
             id: "erase",
-            label: "AI 消除",
+            label: t("AI 消除"),
             icon: <IconEraser size={14} />,
             onSelect: () =>
-              void withTarget((t) => {
-                useAppStore.getState().openEditor({ ...t, mode: "erase" });
+              void withTarget((target) => {
+                useAppStore
+                  .getState()
+                  .openEditor({ ...target, mode: "erase", host: "canvas" });
               }),
           },
           {
             id: "outpaint",
-            label: "扩图",
+            label: t("扩图"),
             icon: <IconExpand size={14} />,
             onSelect: () =>
-              void withTarget((t) => {
-                useAppStore.getState().openOutpaint(t);
+              void withTarget((target) => {
+                useAppStore
+                  .getState()
+                  .openOutpaint({ ...target, host: "canvas" });
               }),
           },
         ];
@@ -209,20 +220,26 @@ function CanvasNodeCard({
       : [
           {
             id: "upscale",
-            label: "高清放大",
+            label: t("高清放大"),
             icon: <IconExpand size={14} />,
             onSelect: () =>
-              void withTarget((t) => {
-                useAppStore.getState().openTransform({ ...t, kind: "upscale" });
+              void withTarget((target) => {
+                useAppStore.getState().openTransform({
+                  ...target,
+                  kind: "upscale",
+                  host: "canvas",
+                });
               }),
           },
           {
             id: "style",
-            label: "风格转换",
+            label: t("风格转换"),
             icon: <IconSparkle size={14} />,
             onSelect: () =>
-              void withTarget((t) => {
-                useAppStore.getState().openTransform({ ...t, kind: "style" });
+              void withTarget((target) => {
+                useAppStore
+                  .getState()
+                  .openTransform({ ...target, kind: "style", host: "canvas" });
               }),
           },
         ];
@@ -233,41 +250,43 @@ function CanvasNodeCard({
       ? [
           {
             id: "background",
-            label: "换背景",
+            label: t("换背景"),
             icon: <IconPalette size={14} />,
             onSelect: () =>
-              void withTarget((t) => {
-                useAppStore.getState().openBackground(t);
+              void withTarget((target) => {
+                useAppStore
+                  .getState()
+                  .openBackground({ ...target, host: "canvas" });
               }),
           },
         ]
       : []),
     {
       id: "basic-edit",
-      label: "基础编辑",
+      label: t("基础编辑"),
       icon: <IconCrop size={14} />,
       onSelect: () =>
-        void withTarget((t) => {
-          useAppStore.getState().openBasicEdit(t);
+        void withTarget((target) => {
+          useAppStore.getState().openBasicEdit({ ...target, host: "canvas" });
         }),
     },
     ...transformItems,
     {
       id: "reference",
-      label: "用作参考图",
+      label: t("用作参考图"),
       icon: <IconQuote size={14} />,
       separatorBefore: true,
       onSelect: () => void asReference(),
     },
     {
       id: "reuse",
-      label: "复用参数",
+      label: t("复用参数"),
       icon: <IconCopy size={14} />,
       onSelect: () => void reuseParams(),
     },
     {
       id: "delete",
-      label: "删除节点",
+      label: t("删除节点"),
       icon: <IconTrash size={14} />,
       danger: true,
       separatorBefore: true,
@@ -279,7 +298,7 @@ function CanvasNodeCard({
     <div
       role="button"
       tabIndex={0}
-      aria-label={`画布节点：作品 #${node.historyId}`}
+      aria-label={t("画布节点：作品 #{{id}}", { id: node.historyId })}
       onPointerDown={pointerDown}
       onPointerMove={pointerMove}
       onPointerUp={pointerUp}
@@ -305,7 +324,7 @@ function CanvasNodeCard({
     >
       <SafeImg
         src={thumbUrl ?? ""}
-        alt={`作品 #${node.historyId}`}
+        alt={t("作品 #{{id}}", { id: node.historyId })}
         className="pointer-events-none block aspect-square w-full rounded-card object-cover"
         draggable={false}
         loading="lazy"
@@ -324,7 +343,7 @@ function CanvasNodeCard({
         <DropdownMenu items={menuItems} align="end">
           <button
             type="button"
-            aria-label="节点操作"
+            aria-label={t("节点操作")}
             className="glass-media pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent hover:bg-on-accent/15"
           >
             <IconChevron direction="down" size={13} />
@@ -333,7 +352,7 @@ function CanvasNodeCard({
       </div>
       {wireArmed && (
         <span className="pointer-events-none absolute inset-x-2 bottom-2 rounded-pill bg-accent-fill px-2 py-0.5 text-center text-caption text-on-accent">
-          点击另一个节点连线
+          {t("点击另一个节点连线")}
         </span>
       )}
     </div>

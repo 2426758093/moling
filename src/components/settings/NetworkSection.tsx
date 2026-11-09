@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { api, ProxyInputPayload, ProxyMode } from "../../lib/api";
 import {
   BODY_IDLE_DEFAULT,
@@ -15,13 +16,14 @@ import { Input } from "../ui/Field";
 import { Row, Section } from "../ui/List";
 import { Select } from "../ui/Select";
 
-const MODES: { value: ProxyMode; label: string }[] = [
+const MODES = [
   { value: "system", label: "跟随系统" },
   { value: "direct", label: "直连（不使用代理）" },
   { value: "manual", label: "手动代理" },
-];
+] as const;
 
 export default function NetworkSection() {
+  const { t } = useTranslation();
   const providers = useProviderStore((s) => s.providers);
   const defaultProviderId = useProviderStore((s) => s.defaultProviderId);
   const [mode, setMode] = useState<ProxyMode>("system");
@@ -34,6 +36,7 @@ export default function NetworkSection() {
   const [idleTimeout, setIdleTimeout] = useState(String(BODY_IDLE_DEFAULT));
   const [totalTimeout, setTotalTimeout] = useState(String(BODY_TOTAL_DEFAULT));
   const [msg, setMsg] = useState("");
+  const [msgError, setMsgError] = useState(false);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -46,7 +49,10 @@ export default function NetworkSection() {
         setNoProxy(cfg.noProxy);
         setHasPassword(cfg.hasPassword);
       })
-      .catch((e) => setMsg(`读取代理设置失败：${String(e)}`));
+      .catch((e) => {
+        setMsg(t("读取代理设置失败：{{error}}", { error: String(e) }));
+        setMsgError(true);
+      });
     api
       .getSetting("bodyIdleTimeoutSecs")
       .then((v) => {
@@ -59,7 +65,8 @@ export default function NetworkSection() {
         if (v) setTotalTimeout(v);
       })
       .catch(() => undefined);
-  }, []);
+    // 语言切换后重读一次，让错误提示跟随界面语言
+  }, [t]);
 
   const payload = (): ProxyInputPayload => ({
     mode,
@@ -72,6 +79,7 @@ export default function NetworkSection() {
   const save = async () => {
     setBusy(true);
     setMsg("");
+    setMsgError(false);
     try {
       const timeouts = parseBodyTimeouts(idleTimeout, totalTimeout);
       const cfg = await api.saveProxyConfig(payload());
@@ -81,9 +89,10 @@ export default function NetworkSection() {
       await api.setSetting("bodyTotalTimeoutSecs", String(timeouts.total));
       setIdleTimeout(String(timeouts.idle));
       setTotalTimeout(String(timeouts.total));
-      setMsg("已保存并生效");
+      setMsg(t("已保存并生效"));
     } catch (e) {
-      setMsg(`保存失败：${String(e)}`);
+      setMsg(t("保存失败：{{error}}", { error: String(e) }));
+      setMsgError(true);
     } finally {
       setBusy(false);
     }
@@ -92,20 +101,29 @@ export default function NetworkSection() {
   const test = async () => {
     const providerId = defaultProviderId ?? providers[0]?.provider.id;
     if (!providerId) {
-      setMsg("请先在「服务商管理」中添加服务商，再测试代理");
+      setMsg(t("请先在「服务商管理」中添加服务商，再测试代理"));
+      setMsgError(true);
       return;
     }
     setBusy(true);
-    setMsg("正在测试…");
+    setMsg(t("正在测试…"));
+    setMsgError(false);
     try {
       const r = await api.testProxy(payload(), providerId);
       setMsg(
         r.ok
-          ? `代理链路可达（${r.latencyMs ?? 0}ms，HTTP ${r.status ?? "-"}）`
-          : `测试失败：${r.error ?? "未知错误"}`,
+          ? t("代理链路可达（{{ms}}ms，HTTP {{status}}）", {
+              ms: r.latencyMs ?? 0,
+              status: r.status ?? "-",
+            })
+          : t("测试失败：{{error}}", {
+              error: r.error ?? t("未知错误"),
+            }),
       );
+      setMsgError(!r.ok);
     } catch (e) {
-      setMsg(`测试失败：${String(e)}`);
+      setMsg(t("测试失败：{{error}}", { error: String(e) }));
+      setMsgError(true);
     } finally {
       setBusy(false);
     }
@@ -113,55 +131,62 @@ export default function NetworkSection() {
 
   return (
     <Section
-      title="网络与代理"
-      description="下载模型与生成图片都会走这里的设置"
+      title={t("网络与代理")}
+      description={t("下载模型与生成图片都会走这里的设置")}
     >
-      <Row label="代理模式">
+      <Row label={t("代理模式")}>
         <Select
           value={mode}
           onValueChange={(v) => setMode(v as ProxyMode)}
-          options={MODES}
-          label="代理模式"
+          options={MODES.map((m) => ({ value: m.value, label: t(m.label) }))}
+          label={t("代理模式")}
           widthClass="w-48"
         />
       </Row>
 
       {mode === "manual" && (
         <>
-          <Row label="代理地址">
+          <Row
+            label={t("代理地址")}
+            hint={t(
+              "支持 http / https / socks5 / socks5h；应用内更新不支持 socks5",
+            )}
+          >
             <Input
               value={url}
               onChange={(e) => setUrl(e.target.value)}
-              placeholder="http://127.0.0.1:7890"
-              aria-label="代理地址"
+              placeholder={t(
+                "http://127.0.0.1:7890 或 socks5://127.0.0.1:1080",
+              )}
+              aria-label={t("代理地址")}
               widthClass="w-64"
             />
           </Row>
-          <Row label="用户名">
+          <Row label={t("用户名")}>
             <Input
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              placeholder="可选"
-              aria-label="代理用户名"
+              placeholder={t("可选")}
+              aria-label={t("代理用户名")}
               widthClass="w-64"
             />
           </Row>
-          <Row label="密码">
+          <Row label={t("密码")}>
             <Input
               type="password"
               value={password ?? ""}
               onChange={(e) => setPassword(e.target.value)}
-              placeholder={hasPassword ? "已保存，留空不修改" : "可选"}
-              aria-label="代理密码"
+              placeholder={hasPassword ? t("已保存，留空不修改") : t("可选")}
+              aria-label={t("代理密码")}
               widthClass="w-64"
             />
           </Row>
-          <Row label="跳过代理" hint="逗号分隔的主机名不经过代理">
+          <Row label={t("跳过代理")} hint={t("逗号分隔的主机名不经过代理")}>
             <Input
               value={noProxy}
               onChange={(e) => setNoProxy(e.target.value)}
               placeholder="localhost,127.0.0.1"
-              aria-label="跳过代理的主机"
+              aria-label={t("跳过代理的主机")}
               widthClass="w-64"
             />
           </Row>
@@ -169,8 +194,15 @@ export default function NetworkSection() {
       )}
 
       <Row
-        label="无数据超时"
-        hint={`连续 ${idleTimeout || "?"} 秒收不到新数据才判定失败（${BODY_IDLE_MIN}–${BODY_IDLE_MAX} 秒）`}
+        label={t("无数据超时")}
+        hint={t(
+          "连续 {{idle}} 秒收不到新数据才判定失败（{{min}}–{{max}} 秒）",
+          {
+            idle: idleTimeout || "?",
+            min: BODY_IDLE_MIN,
+            max: BODY_IDLE_MAX,
+          },
+        )}
       >
         <Input
           type="number"
@@ -178,14 +210,20 @@ export default function NetworkSection() {
           max={BODY_IDLE_MAX}
           value={idleTimeout}
           onChange={(e) => setIdleTimeout(e.target.value)}
-          suffix="秒"
-          aria-label="响应体无数据超时"
+          suffix={t("秒")}
+          aria-label={t("响应体无数据超时")}
           widthClass="w-32"
         />
       </Row>
       <Row
-        label="响应体总超时"
-        hint={`整段响应体下载的最长耗时，不能小于无数据超时（${BODY_TOTAL_MIN}–${BODY_TOTAL_MAX} 秒）`}
+        label={t("响应体总超时")}
+        hint={t(
+          "整段响应体下载的最长耗时，不能小于无数据超时（{{min}}–{{max}} 秒）",
+          {
+            min: BODY_TOTAL_MIN,
+            max: BODY_TOTAL_MAX,
+          },
+        )}
       >
         <Input
           type="number"
@@ -193,21 +231,19 @@ export default function NetworkSection() {
           max={BODY_TOTAL_MAX}
           value={totalTimeout}
           onChange={(e) => setTotalTimeout(e.target.value)}
-          suffix="秒"
-          aria-label="响应体总超时"
+          suffix={t("秒")}
+          aria-label={t("响应体总超时")}
           widthClass="w-32"
         />
       </Row>
 
       <Row
-        label="应用设置"
+        label={t("应用设置")}
         hint={
           msg ? (
-            <span className={msg.includes("失败") ? "text-danger" : undefined}>
-              {msg}
-            </span>
+            <span className={msgError ? "text-danger" : undefined}>{msg}</span>
           ) : (
-            "目前只支持 HTTP/HTTPS 代理"
+            t("目前只支持 HTTP/HTTPS 代理")
           )
         }
       >
@@ -217,10 +253,10 @@ export default function NetworkSection() {
           loading={busy}
           onClick={() => void save()}
         >
-          保存
+          {t("保存")}
         </Button>
         <Button size="sm" onClick={() => void test()} disabled={busy}>
-          测试代理
+          {t("测试代理")}
         </Button>
       </Row>
     </Section>

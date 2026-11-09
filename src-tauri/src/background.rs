@@ -139,7 +139,7 @@ fn box_blur(src: &[u8], w: usize, h: usize, radius: usize, horizontal: bool) -> 
     out
 }
 
-fn feather(mask: &GrayImage, radius: u32) -> GrayImage {
+pub(crate) fn feather(mask: &GrayImage, radius: u32) -> GrayImage {
     if radius == 0 {
         return mask.clone();
     }

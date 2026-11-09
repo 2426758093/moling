@@ -1,4 +1,6 @@
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import type { ParseKeysWithoutVariables } from "i18next";
+import i18n from "../i18n";
 import { api } from "./api";
 import { toast } from "./notify";
 import { useAppStore } from "../stores/appStore";
@@ -26,6 +28,7 @@ export type CommandIcon =
 
 export interface Command {
   id: string;
+  /// 中文原文，也就是词典 key：展示前由 commandTitle 翻译
   title: string;
   hint?: string;
   group: CommandGroup;
@@ -260,11 +263,19 @@ export const COMMANDS: Command[] = [
         const dir = await api.getLogsDir();
         await revealItemInDir(dir);
       } catch (e) {
-        toast(`打开日志目录失败：${String(e)}`, "error");
+        toast(
+          i18n.t("打开日志目录失败：{{error}}", { error: String(e) }),
+          "error",
+        );
       }
     },
   },
 ];
+
+/// 标题是中文原文（词典 key）：展示与搜索都按当前语言取文案。
+function commandTitle(command: Command): string {
+  return i18n.t(command.title as ParseKeysWithoutVariables);
+}
 
 /// 前缀 > 词首 > 子串 > 关键词；同分保持原顺序，空查询把最近使用提到最前。
 export function filterCommands(
@@ -289,13 +300,16 @@ export function filterCommands(
 }
 
 function score(command: Command, query: string): number {
-  const title = command.title.toLowerCase();
-  if (title.startsWith(query)) return 100;
-  if (title.includes(query)) return 60;
+  // 原文与译文都参与匹配：英文界面下能按可见英文标题搜到，中文仍可搜
+  const titles = [command.title, commandTitle(command)].map((text) =>
+    text.toLowerCase(),
+  );
+  if (titles.some((title) => title.startsWith(query))) return 100;
+  if (titles.some((title) => title.includes(query))) return 60;
   if (command.keywords?.some((k) => k.toLowerCase().startsWith(query)))
     return 40;
   if (command.keywords?.some((k) => k.toLowerCase().includes(query))) return 25;
-  if (isSubsequence(query, title)) return 10;
+  if (titles.some((title) => isSubsequence(query, title))) return 10;
   return 0;
 }
 

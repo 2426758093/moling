@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
+import { useTranslation } from "react-i18next";
 import { useAppStore, AppView } from "../stores/appStore";
 import { useChatStore } from "../stores/chatStore";
 import { useQueueStore } from "../stores/queueStore";
@@ -28,12 +29,16 @@ import {
   IconChevron,
 } from "./Icons";
 
-const NAV_ITEMS: { id: AppView; label: string; icon: typeof IconGrid }[] = [
+const NAV_ITEMS = [
   { id: "canvas", label: "画布", icon: IconCanvas },
   { id: "gallery", label: "画廊", icon: IconGrid },
   { id: "queue", label: "队列", icon: IconQueue },
   { id: "settings", label: "设置", icon: IconGear },
-];
+] as const satisfies readonly {
+  id: AppView;
+  label: string;
+  icon: typeof IconGrid;
+}[];
 
 const ROW_BASE =
   "pressable relative flex h-8 w-full items-center gap-2 rounded-btn text-callout transition-colors";
@@ -45,6 +50,7 @@ function SectionLabel({ children }: { children: string }) {
 }
 
 export default function Sidebar() {
+  const { t } = useTranslation();
   const view = useAppStore((s) => s.view);
   const setView = useAppStore((s) => s.setView);
   const manualCollapsed = useAppStore((s) => s.sidebarCollapsed);
@@ -98,7 +104,11 @@ export default function Sidebar() {
   const ThemeIcon =
     theme === "dark" ? IconMoon : theme === "light" ? IconSun : IconMonitor;
   const themeLabel =
-    theme === "system" ? "跟随系统" : theme === "dark" ? "暗色" : "浅色";
+    theme === "system"
+      ? t("跟随系统")
+      : theme === "dark"
+        ? t("暗色")
+        : t("浅色");
 
   const pickConvo = async (id: number) => {
     await selectConversation(id);
@@ -129,7 +139,7 @@ export default function Sidebar() {
       >
         {collapsed ? (
           <IconButton
-            label="新对话"
+            label={t("新对话")}
             icon={<IconPlus size={16} />}
             variant="secondary"
             className="w-full"
@@ -148,7 +158,7 @@ export default function Sidebar() {
               setView("chat");
             }}
           >
-            新对话
+            {t("新对话")}
           </Button>
         )}
         {!collapsed && (
@@ -160,18 +170,18 @@ export default function Sidebar() {
               ref={searchRef}
               value={query}
               onChange={(e) => setQuery(e.target.value)}
-              placeholder="搜索对话"
-              aria-label="搜索对话"
+              placeholder={t("搜索对话")}
+              aria-label={t("搜索对话")}
               className="h-7 w-full rounded-btn bg-fill pl-7 pr-2 text-callout text-primary outline-none transition-shadow placeholder:text-tertiary focus:ring-2 focus:ring-accent/25"
             />
           </div>
         )}
       </div>
 
-      {!collapsed && <SectionLabel>对话</SectionLabel>}
+      {!collapsed && <SectionLabel>{t("对话")}</SectionLabel>}
 
       <nav
-        aria-label="对话列表"
+        aria-label={t("对话列表")}
         className="min-h-0 flex-1 space-y-px overflow-y-auto px-2 py-0.5"
       >
         <AnimatePresence initial={false}>
@@ -189,7 +199,7 @@ export default function Sidebar() {
               >
                 <button
                   onClick={() => pickConvo(c.id)}
-                  aria-label={`打开对话：${c.title}`}
+                  aria-label={t("打开对话：{{title}}", { title: c.title })}
                   aria-current={active ? "page" : undefined}
                   className={cn(
                     ROW_BASE,
@@ -215,7 +225,7 @@ export default function Sidebar() {
                       e.stopPropagation();
                       void deleteConvo(c.id);
                     }}
-                    aria-label={`删除对话：${c.title}`}
+                    aria-label={t("删除对话：{{title}}", { title: c.title })}
                     tabIndex={-1}
                     className="pressable absolute right-1 top-1/2 flex h-6 w-6 -translate-y-1/2 items-center justify-center rounded-chip text-tertiary opacity-0 transition-opacity hover:bg-active hover:text-danger focus-visible:opacity-100 group-hover:opacity-100"
                   >
@@ -228,19 +238,19 @@ export default function Sidebar() {
         </AnimatePresence>
         {visible.length === 0 && !collapsed && (
           <div className="px-2.5 py-4 text-footnote text-tertiary">
-            {query ? "没有匹配的对话" : "还没有对话"}
+            {query ? t("没有匹配的对话") : t("还没有对话")}
           </div>
         )}
       </nav>
 
-      {!collapsed && <SectionLabel>导航</SectionLabel>}
+      {!collapsed && <SectionLabel>{t("导航")}</SectionLabel>}
       <div className={cn("shrink-0 space-y-px px-2 pb-1", collapsed && "pt-1")}>
         {NAV_ITEMS.map((item) => {
           const active = view === item.id;
           const content = (
             <button
               onClick={() => setView(item.id)}
-              aria-label={item.label}
+              aria-label={t(item.label)}
               aria-current={active ? "page" : undefined}
               className={cn(
                 ROW_BASE,
@@ -253,11 +263,11 @@ export default function Sidebar() {
               {rail(active && !collapsed)}
               <item.icon size={15} />
               {!collapsed && (
-                <span className="flex-1 text-left">{item.label}</span>
+                <span className="flex-1 text-left">{t(item.label)}</span>
               )}
               {item.id === "queue" && queuePending > 0 && (
                 <span
-                  aria-label={`${queuePending} 个任务待执行`}
+                  aria-label={t("{{n}} 个任务待执行", { n: queuePending })}
                   className="tabular rounded-pill bg-accent-fill px-1.5 text-caption leading-4 text-on-accent"
                 >
                   {queuePending}
@@ -266,7 +276,7 @@ export default function Sidebar() {
             </button>
           );
           return collapsed ? (
-            <Tooltip key={item.id} label={item.label} side="right">
+            <Tooltip key={item.id} label={t(item.label)} side="right">
               {content}
             </Tooltip>
           ) : (
@@ -275,15 +285,15 @@ export default function Sidebar() {
         })}
       </div>
 
-      {!collapsed && <SectionLabel>系统</SectionLabel>}
+      {!collapsed && <SectionLabel>{t("系统")}</SectionLabel>}
       <div className={cn("shrink-0 space-y-px px-2 pb-2", collapsed && "pt-1")}>
         <Tooltip
-          label={`主题：${themeLabel}`}
+          label={t("主题：{{theme}}", { theme: themeLabel })}
           side={collapsed ? "right" : "top"}
         >
           <button
             onClick={cycleTheme}
-            aria-label={`主题：${themeLabel}，点击切换`}
+            aria-label={t("主题：{{theme}}，点击切换", { theme: themeLabel })}
             className={cn(
               ROW_BASE,
               collapsed ? "justify-center px-2" : "px-2.5",
@@ -296,10 +306,10 @@ export default function Sidebar() {
             )}
           </button>
         </Tooltip>
-        <Tooltip label="命令面板" side={collapsed ? "right" : "top"}>
+        <Tooltip label={t("命令面板")} side={collapsed ? "right" : "top"}>
           <button
             onClick={() => setPaletteOpen(true)}
-            aria-label="打开命令面板"
+            aria-label={t("打开命令面板")}
             className={cn(
               ROW_BASE,
               collapsed ? "justify-center px-2" : "px-2.5",
@@ -309,7 +319,7 @@ export default function Sidebar() {
             <IconCommand size={15} />
             {!collapsed && (
               <>
-                <span className="flex-1 text-left">命令</span>
+                <span className="flex-1 text-left">{t("命令")}</span>
                 <Kbd>Ctrl K</Kbd>
               </>
             )}
@@ -319,14 +329,14 @@ export default function Sidebar() {
         {!compact && (
           <button
             onClick={toggleSidebar}
-            aria-label={collapsed ? "展开侧栏" : "折叠侧栏"}
+            aria-label={collapsed ? t("展开侧栏") : t("折叠侧栏")}
             className={cn(
               "pressable flex h-7 w-full items-center gap-2.5 rounded-btn px-2.5 text-footnote text-tertiary transition-colors hover:bg-hover hover:text-secondary",
               collapsed && "justify-center px-2",
             )}
           >
             <IconChevron direction={collapsed ? "right" : "left"} size={13} />
-            {!collapsed && <span>折叠侧栏</span>}
+            {!collapsed && <span>{t("折叠侧栏")}</span>}
           </button>
         )}
       </div>

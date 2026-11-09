@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
   api,
   EMPTY_PROVIDER,
@@ -19,17 +20,14 @@ import { Switch } from "../ui/Switch";
 import { cn } from "../ui/cn";
 import { IconChevron, IconPlus } from "../Icons";
 
-const STEPS = ["基本信息", "拉取模型", "完成"];
+const STEPS = ["基本信息", "拉取模型", "完成"] as const;
 
-const CAP_FIELDS: {
-  key: "negative" | "edit" | "transform" | "multiImage";
-  label: string;
-}[] = [
+const CAP_FIELDS = [
   { key: "negative", label: "负向提示词" },
   { key: "edit", label: "编辑能力" },
   { key: "transform", label: "变换能力" },
   { key: "multiImage", label: "多参考图" },
-];
+] as const;
 
 type SpecPrefix = "editTemplate" | "transformTemplate";
 
@@ -76,6 +74,7 @@ function TemplateSpecEditor({
   onBodyChange: (v: string) => void;
   onResponsePathChange: (v: string) => void;
 }) {
+  const { t } = useTranslation();
   return (
     <div className="space-y-3 rounded-card border border-line p-3">
       <div className="flex items-start justify-between gap-2">
@@ -95,17 +94,17 @@ function TemplateSpecEditor({
             },
           }))}
         >
-          <Button size="sm">插入占位符</Button>
+          <Button size="sm">{t("插入占位符")}</Button>
         </DropdownMenu>
       </div>
       <Input
-        label="请求地址"
+        label={t("请求地址")}
         value={url}
         onChange={(e) => onUrlChange(e.target.value)}
         placeholder="https://api.example.com/inpaint"
       />
       <Textarea
-        label="请求体（JSON）"
+        label={t("请求体（JSON）")}
         rows={3}
         value={body}
         onChange={(e) => onBodyChange(e.target.value)}
@@ -113,11 +112,11 @@ function TemplateSpecEditor({
         className="font-mono text-subhead"
       />
       <Input
-        label="响应路径"
+        label={t("响应路径")}
         value={responsePath}
         onChange={(e) => onResponsePathChange(e.target.value)}
         placeholder="data[0].b64_json"
-        hint="留空按 data[0].b64_json 提取"
+        hint={t("留空按 data[0].b64_json 提取")}
       />
     </div>
   );
@@ -130,6 +129,7 @@ export default function ProviderDialog({
   initial: ProviderItem | null;
   onClose: () => void;
 }) {
+  const { t } = useTranslation();
   const save = useProviderStore((s) => s.save);
   const refresh = useProviderStore((s) => s.refresh);
   const providerId = initial?.provider.id ?? null;
@@ -264,7 +264,11 @@ export default function ProviderDialog({
           await useModelCapsStore.getState().load(savedId, true);
         } catch (e) {
           // 服务商本体已保存；能力批量写失败时不要静默关窗，让用户能重试
-          setError(`服务商已保存，但模型能力保存失败：${String(e)}`);
+          setError(
+            t("服务商已保存，但模型能力保存失败：{{error}}", {
+              error: String(e),
+            }),
+          );
           return;
         }
       }
@@ -279,9 +283,9 @@ export default function ProviderDialog({
   const nextLabel =
     step === 1
       ? form.kind === "template"
-        ? "下一步"
-        : "拉取模型列表"
-      : "下一步";
+        ? t("下一步")
+        : t("拉取模型列表")
+      : t("下一步");
 
   return (
     <Dialog
@@ -289,16 +293,16 @@ export default function ProviderDialog({
       onOpenChange={(open) => {
         if (!open) onClose();
       }}
-      title={providerId ? "编辑服务商" : "新增服务商"}
+      title={providerId ? t("编辑服务商") : t("新增服务商")}
       size="md"
       footer={
         <>
           <Button variant="ghost" onClick={onClose}>
-            取消
+            {t("取消")}
           </Button>
           <div className="ml-auto flex gap-2">
             {step > 0 && (
-              <Button onClick={() => setStep(step - 1)}>上一步</Button>
+              <Button onClick={() => setStep(step - 1)}>{t("上一步")}</Button>
             )}
             {step < 1 && (
               <Button variant="primary" onClick={() => setStep(1)}>
@@ -317,17 +321,17 @@ export default function ProviderDialog({
               ))}
             {step === 2 && (
               <Button variant="primary" loading={busy} onClick={doSave}>
-                保存
+                {t("保存")}
               </Button>
             )}
           </div>
         </>
       }
     >
-      <div className="mb-4 flex items-center gap-2" aria-label="配置步骤">
-        {STEPS.map((t, i) => (
+      <div className="mb-4 flex items-center gap-2" aria-label={t("配置步骤")}>
+        {STEPS.map((label, i) => (
           <span
-            key={t}
+            key={label}
             aria-current={i === step ? "step" : undefined}
             className={cn(
               "rounded-pill px-2.5 py-1 text-footnote",
@@ -336,7 +340,7 @@ export default function ProviderDialog({
                 : "bg-fill text-tertiary",
             )}
           >
-            {i + 1} {t}
+            {i + 1} {t(label)}
           </span>
         ))}
       </div>
@@ -344,27 +348,27 @@ export default function ProviderDialog({
       {step === 0 && (
         <div className="space-y-3">
           <Input
-            label="名称"
+            label={t("名称")}
             value={form.name}
             onChange={(e) => patch({ name: e.target.value })}
-            placeholder="例如：SiliconFlow"
+            placeholder={t("例如：SiliconFlow")}
           />
           <div className="flex flex-col gap-1.5">
-            <span className="text-subhead text-secondary">接口类型</span>
+            <span className="text-subhead text-secondary">{t("接口类型")}</span>
             <Select
               value={form.kind}
               onValueChange={(v) => patch({ kind: v })}
               options={KIND_OPTIONS.map((k) => ({
                 value: k.id,
-                label: k.label,
+                label: t(k.label),
               }))}
-              label="接口类型"
+              label={t("接口类型")}
             />
           </div>
           {form.kind !== "mock" && (
             <>
               <Input
-                label="API 地址（Base URL）"
+                label={t("API 地址（Base URL）")}
                 value={form.baseUrl}
                 onChange={(e) => patch({ baseUrl: e.target.value })}
                 placeholder="https://api.example.com/v1"
@@ -375,28 +379,34 @@ export default function ProviderDialog({
                 value={form.apiKey ?? ""}
                 onChange={(e) => patch({ apiKey: e.target.value })}
                 placeholder={
-                  initial?.hasKey ? "留空则继续使用已保存的 Key" : "sk-..."
+                  initial?.hasKey ? t("留空则继续使用已保存的 Key") : "sk-..."
                 }
                 hint={
                   initial?.hasKey
-                    ? `已保存 ${initial.apiKeyMasked}。出于安全考虑不回填明文 Key；留空保存即保持不变。${
-                        keys.length > 1
-                          ? " 填写新 Key 会替换第 1 个，其余保留。"
-                          : ""
-                      }`
-                    : "仅保存在本机，不会随备份导出（除非显式勾选）"
+                    ? keys.length > 1
+                      ? t(
+                          "已保存 {{key}}。出于安全考虑不回填明文 Key；留空保存即保持不变。填写新 Key 会替换第 1 个，其余保留。",
+                          { key: initial.apiKeyMasked },
+                        )
+                      : t(
+                          "已保存 {{key}}。出于安全考虑不回填明文 Key；留空保存即保持不变。",
+                          { key: initial.apiKeyMasked },
+                        )
+                    : t("仅保存在本机，不会随备份导出（除非显式勾选）")
                 }
               />
               {providerId && (
                 <div className="rounded-card border border-line p-3">
                   <div className="mb-2 flex items-center justify-between text-footnote">
                     <span className="text-secondary">
-                      Key 池（鉴权失败时自动切换到下一个）
+                      {t("Key 池（鉴权失败时自动切换到下一个）")}
                     </span>
                     <span className="text-tertiary">
-                      {keys.length} 个
+                      {t("{{n}} 个", { n: keys.length })}
                       {keys.some((k) => k.invalid) &&
-                        ` · ${keys.filter((k) => k.invalid).length} 失效`}
+                        ` ${t("· {{n}} 失效", {
+                          n: keys.filter((k) => k.invalid).length,
+                        })}`}
                     </span>
                   </div>
                   <div className="space-y-1.5">
@@ -410,11 +420,11 @@ export default function ProviderDialog({
                         </span>
                         {k.invalid ? (
                           <span className="rounded-pill border border-danger/25 bg-danger/10 px-1.5 py-0.5 text-caption text-danger">
-                            已失效
+                            {t("已失效")}
                           </span>
                         ) : (
                           <span className="text-caption text-tertiary">
-                            可用
+                            {t("可用")}
                           </span>
                         )}
                         <div className="ml-auto flex gap-1">
@@ -422,25 +432,31 @@ export default function ProviderDialog({
                             <Button
                               size="sm"
                               onClick={() => void doResetKey(k.index)}
-                              aria-label={`恢复 Key ${k.index + 1}`}
+                              aria-label={t("恢复 Key {{n}}", {
+                                n: k.index + 1,
+                              })}
                             >
-                              恢复
+                              {t("恢复")}
                             </Button>
                           )}
                           <Button
                             size="sm"
                             variant="danger"
                             onClick={() => void doDeleteKey(k.index)}
-                            aria-label={`删除 Key ${k.index + 1}`}
+                            aria-label={t("删除 Key {{n}}", {
+                              n: k.index + 1,
+                            })}
                           >
-                            删除
+                            {t("删除")}
                           </Button>
                         </div>
                       </div>
                     ))}
                     {keys.length === 0 && (
                       <div className="text-footnote text-tertiary">
-                        还没有 Key，可在上方 API Key 里填写主 Key 后保存。
+                        {t(
+                          "还没有 Key，可在上方 API Key 里填写主 Key 后保存。",
+                        )}
                       </div>
                     )}
                   </div>
@@ -450,8 +466,8 @@ export default function ProviderDialog({
                         type="password"
                         value={newKey}
                         onChange={(e) => setNewKey(e.target.value)}
-                        placeholder="添加备用 Key"
-                        aria-label="添加备用 Key"
+                        placeholder={t("添加备用 Key")}
+                        aria-label={t("添加备用 Key")}
                       />
                     </div>
                     <Button
@@ -459,7 +475,7 @@ export default function ProviderDialog({
                       disabled={!newKey.trim()}
                       onClick={() => void doAddKey()}
                     >
-                      添加
+                      {t("添加")}
                     </Button>
                   </div>
                   {keyError && (
@@ -474,20 +490,28 @@ export default function ProviderDialog({
           {form.kind === "template" && (
             <>
               <Input
-                label="请求地址模板"
+                label={t("请求地址模板")}
                 value={form.templateUrl}
                 onChange={(e) => patch({ templateUrl: e.target.value })}
                 placeholder="https://api.example.com/draw?prompt={{prompt}}"
-                hint="可用占位符：{{prompt}} {{image}} {{size}} {{key}}"
+                hint={t("可用占位符：{{prompt}} {{image}} {{size}} {{key}}", {
+                  interpolation: { skipOnVariables: true },
+                  prompt: "{{prompt}}",
+                  image: "{{image}}",
+                  size: "{{size}}",
+                  key: "{{key}}",
+                })}
               />
               <Textarea
-                label="请求体模板（JSON）"
+                label={t("请求体模板（JSON）")}
                 rows={3}
                 value={form.templateBody}
                 onChange={(e) => patch({ templateBody: e.target.value })}
                 placeholder={'{"prompt":"{{prompt}}","size":"{{size}}"}'}
                 className="font-mono text-subhead"
-                hint="可用变量：prompt / negative_prompt / size / width / height / model / seed / count / key / image / images / image_count。image 为第一张参考图的 base64。"
+                hint={t(
+                  "可用变量：prompt / negative_prompt / size / width / height / model / seed / count / key / image / images / image_count。image 为第一张参考图的 base64。",
+                )}
               />
               <div className="rounded-card border border-line">
                 <button
@@ -497,9 +521,9 @@ export default function ProviderDialog({
                   className="flex w-full items-center justify-between rounded-card px-3 py-2 text-subhead text-secondary hover:bg-hover"
                 >
                   <span>
-                    高级设置（编辑模板 / 变换模板）
+                    {t("高级设置（编辑模板 / 变换模板）")}
                     <span className="ml-1 text-footnote text-tertiary">
-                      配置后可局部重绘、消除、扩图、放大与风格转换
+                      {t("配置后可局部重绘、消除、扩图、放大与风格转换")}
                     </span>
                   </span>
                   <IconChevron
@@ -510,8 +534,8 @@ export default function ProviderDialog({
                 {advancedOpen && (
                   <div className="space-y-3 border-t border-line p-3">
                     <TemplateSpecEditor
-                      title="编辑模板"
-                      description="局部重绘 / AI 消除 / 扩图共用"
+                      title={t("编辑模板")}
+                      description={t("局部重绘 / AI 消除 / 扩图共用")}
                       placeholders={SPEC_PLACEHOLDERS.editTemplate}
                       url={form.editTemplateUrl}
                       body={form.editTemplateBody}
@@ -523,8 +547,8 @@ export default function ProviderDialog({
                       }
                     />
                     <TemplateSpecEditor
-                      title="变换模板"
-                      description="高清放大 / 风格转换共用"
+                      title={t("变换模板")}
+                      description={t("高清放大 / 风格转换共用")}
                       placeholders={SPEC_PLACEHOLDERS.transformTemplate}
                       url={form.transformTemplateUrl}
                       body={form.transformTemplateBody}
@@ -541,23 +565,25 @@ export default function ProviderDialog({
             </>
           )}
           <Input
-            label="超时（秒）"
+            label={t("超时（秒）")}
             type="number"
             min={5}
             max={1800}
             value={form.timeoutSecs}
             onChange={(e) => patch({ timeoutSecs: Number(e.target.value) })}
-            hint="等待服务商返回响应的上限。图片生成（高画质 / 多参考图）常需 1–5 分钟，建议不低于 300 秒；客户端提前断开时上游可能仍在生成并计费"
+            hint={t(
+              "等待服务商返回响应的上限。图片生成（高画质 / 多参考图）常需 1–5 分钟，建议不低于 300 秒；客户端提前断开时上游可能仍在生成并计费",
+            )}
           />
           {form.kind === "openai" && (
             <Textarea
-              label="透传参数（JSON，可选）"
+              label={t("透传参数（JSON，可选）")}
               rows={2}
               value={form.extraParams ?? ""}
               onChange={(e) => patch({ extraParams: e.target.value })}
-              placeholder='{"quality":"high"} 或 {"steps":30,"seed":42}'
+              placeholder={t('{"quality":"high"} 或 {"steps":30,"seed":42}')}
               className="font-mono text-subhead"
-              hint="会合并进请求体，优先于默认参数"
+              hint={t("会合并进请求体，优先于默认参数")}
             />
           )}
         </div>
@@ -567,7 +593,7 @@ export default function ProviderDialog({
         <div className="space-y-3">
           {form.kind === "template" ? (
             <Input
-              label="模型列表（英文逗号分隔）"
+              label={t("模型列表（英文逗号分隔）")}
               value={models.join(",")}
               onChange={(e) =>
                 setModels(
@@ -580,7 +606,7 @@ export default function ProviderDialog({
             />
           ) : (
             <p className="text-body text-secondary">
-              点击「拉取模型列表」自动请求服务商的模型接口。
+              {t("点击「拉取模型列表」自动请求服务商的模型接口。")}
             </p>
           )}
           {models.length > 0 && (
@@ -601,25 +627,27 @@ export default function ProviderDialog({
       {step === 2 && (
         <div className="space-y-3">
           <div className="flex flex-col gap-1.5">
-            <span className="text-subhead text-secondary">默认模型</span>
+            <span className="text-subhead text-secondary">{t("默认模型")}</span>
             <Select
               value={form.defaultModel || "none"}
               onValueChange={(v) =>
                 patch({ defaultModel: v === "none" ? "" : v })
               }
               options={[
-                { value: "none", label: "（未选择）" },
+                { value: "none", label: t("（未选择）") },
                 ...models.map((m) => ({ value: m, label: m })),
               ]}
-              label="默认模型"
+              label={t("默认模型")}
             />
           </div>
           {models.length > 0 && (
             <div className="space-y-2">
               <div className="flex items-baseline justify-between gap-2">
-                <span className="text-subhead text-secondary">模型能力</span>
+                <span className="text-subhead text-secondary">
+                  {t("模型能力")}
+                </span>
                 <span className="text-footnote text-tertiary">
-                  只影响界面可用项，不改变请求格式
+                  {t("只影响界面可用项，不改变请求格式")}
                 </span>
               </div>
               <div className="max-h-72 space-y-2 overflow-y-auto pr-1">
@@ -639,19 +667,19 @@ export default function ProviderDialog({
                             key={key}
                             className="flex items-center justify-between gap-2 text-footnote text-tertiary"
                           >
-                            {label}
+                            {t(label)}
                             <Switch
                               checked={caps[key]}
                               onCheckedChange={(v) =>
                                 patchCaps(m, { [key]: v } as Partial<ModelCaps>)
                               }
-                              label={`${m} ${label}`}
+                              label={`${m} ${t(label)}`}
                             />
                           </label>
                         ))}
                       </div>
                       <label className="mt-2 flex items-center justify-between gap-2 text-footnote text-tertiary">
-                        最大边长
+                        {t("最大边长")}
                         <Input
                           type="number"
                           min={256}
@@ -671,7 +699,7 @@ export default function ProviderDialog({
                               ),
                             })
                           }
-                          aria-label={`${m} 最大边长`}
+                          aria-label={t("{{model}} 最大边长", { model: m })}
                           compact
                           widthClass="w-24"
                         />
@@ -683,7 +711,9 @@ export default function ProviderDialog({
             </div>
           )}
           <p className="text-body text-secondary">
-            共获取 {models.length} 个模型，保存后可在生成页直接使用。
+            {t("共获取 {{n}} 个模型，保存后可在生成页直接使用。", {
+              n: models.length,
+            })}
           </p>
         </div>
       )}

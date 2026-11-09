@@ -1123,14 +1123,18 @@ pub const BACKUP_SETTING_KEYS: &[&str] = &[
     "defaultProviderId",
     "defaultParams",
     "promptTemplates",
+    "stylePresets",
     "theme",
     "glassAppearance",
     "uiMode",
+    "locale",
     "queueConcurrency",
     "queueProviderConcurrency",
+    "queueAutoResume",
     "cacheRetentionDays",
     "bodyIdleTimeoutSecs",
     "bodyTotalTimeoutSecs",
+    "smartMask",
 ];
 
 /// 缓存（回收站）保留天数的合法区间与默认值
@@ -1214,13 +1218,17 @@ const IMPORT_SETTINGS_V2: &[&str] = &[
     "defaultParams",
     "theme",
     "promptTemplates",
+    "stylePresets",
     "glassAppearance",
     "uiMode",
+    "locale",
     "queueConcurrency",
     "queueProviderConcurrency",
+    "queueAutoResume",
     "cacheRetentionDays",
     "bodyIdleTimeoutSecs",
     "bodyTotalTimeoutSecs",
+    "smartMask",
 ];
 
 fn invalid_import(msg: &str) -> AppError {
@@ -1258,12 +1266,35 @@ fn validate_import_settings(
     if let Some(templates) = settings.get("promptTemplates") {
         validate_import_templates(templates)?;
     }
+    if let Some(styles) = settings.get("stylePresets") {
+        validate_import_style_presets(styles)?;
+    }
     if let Some(mode) = settings.get("uiMode") {
         let ok = mode
             .as_str()
             .is_some_and(|m| matches!(m, "simple" | "expert"));
         if !ok {
             return Err(invalid_import("导入文件中的界面模式取值非法"));
+        }
+    }
+    if let Some(locale) = settings.get("locale") {
+        let ok = locale
+            .as_str()
+            .is_some_and(|l| matches!(l, "zh-CN" | "en-US"));
+        if !ok {
+            return Err(invalid_import("导入文件中的界面语言取值非法"));
+        }
+    }
+    if let Some(smart) = settings.get("smartMask") {
+        let ok = smart.as_str().is_some_and(|v| matches!(v, "on" | "off"));
+        if !ok {
+            return Err(invalid_import("导入文件中的智能蒙版开关取值非法"));
+        }
+    }
+    if let Some(auto) = settings.get("queueAutoResume") {
+        let ok = auto.as_str().is_some_and(|v| matches!(v, "on" | "off"));
+        if !ok {
+            return Err(invalid_import("导入文件中的队列自动续跑开关取值非法"));
         }
     }
     if let Some(concurrency) = settings.get("queueConcurrency") {
@@ -1361,6 +1392,32 @@ fn validate_import_templates(value: &serde_json::Value) -> AppResult<()> {
                 .is_some_and(|s| !s.trim().is_empty());
             if !ok {
                 return Err(invalid_import("自定义模板项缺少 id/title/text"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_import_style_presets(value: &serde_json::Value) -> AppResult<()> {
+    let raw = value
+        .as_str()
+        .ok_or_else(|| invalid_import("自定义风格必须是 JSON 字符串"))?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| invalid_import("自定义风格不是合法 JSON"))?;
+    let list = parsed
+        .as_array()
+        .ok_or_else(|| invalid_import("自定义风格必须是数组"))?;
+    for item in list {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| invalid_import("自定义风格项必须是对象"))?;
+        for key in ["id", "label", "prompt"] {
+            let ok = obj
+                .get(key)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.trim().is_empty());
+            if !ok {
+                return Err(invalid_import("自定义风格项缺少 id/label/prompt"));
             }
         }
     }
@@ -2023,6 +2080,12 @@ fn import_config_in_prepared(
             "baseUrl": obj.get("baseUrl").and_then(|v| v.as_str()).unwrap_or_default(),
             "apiKeyEnc": old_thinking_enc,
             "model": obj.get("model").and_then(|v| v.as_str()).unwrap_or_default(),
+            "titleEnabled": obj.get("titleEnabled").and_then(|v| v.as_bool()).unwrap_or(true),
+            "optimizeEnabled": obj.get("optimizeEnabled").and_then(|v| v.as_bool()).unwrap_or(true),
+            "autoTranslateOnBlur": obj
+                .get("autoTranslateOnBlur")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         });
         tx.execute(
             "INSERT INTO settings (key, value) VALUES ('thinkingConfig', ?1)
@@ -3368,6 +3431,18 @@ pub fn requeue_job(id: i64) -> AppResult<bool> {
     requeue_job_in(&c, id)
 }
 
+/// 用户显式恢复全部中断任务；启动时仍不自动重跑，避免重复扣费。
+pub fn requeue_interrupted_jobs() -> AppResult<usize> {
+    let c = conn()?;
+    let affected = c.execute(
+        "UPDATE jobs SET status = 'queued', error = NULL, images_json = '[]',
+         started_at = NULL, finished_at = NULL, heartbeat_at = NULL
+         WHERE status = 'interrupted'",
+        [],
+    )?;
+    Ok(affected)
+}
+
 fn requeue_job_in(c: &Connection, id: i64) -> AppResult<bool> {
     let affected = c.execute(
         "UPDATE jobs SET status = 'queued', error = NULL, images_json = '[]',
@@ -4063,9 +4138,11 @@ mod tests {
                 "defaultProviderId": "9",
                 "theme": "dark",
                 "glassAppearance": "tinted",
+                "locale": "en-US",
                 "bodyIdleTimeoutSecs": "45",
                 "bodyTotalTimeoutSecs": "900",
                 "promptTemplates": r#"[{"id":"my","title":"我的模板","text":"a {subject}"}]"#,
+                "stylePresets": r#"[{"id":"c_1","label":"我的风格","prompt":"warm tones"}]"#,
                 "unknownKey": "ignored",
             },
             "thinking": {
@@ -4103,12 +4180,20 @@ mod tests {
         assert!(setting_of(&c, "promptTemplates")
             .expect("模板已导入")
             .contains("我的模板"));
+        assert!(setting_of(&c, "stylePresets")
+            .expect("风格已导入")
+            .contains("我的风格"));
         // 白名单外的设置项不落库
         assert!(setting_of(&c, "unknownKey").is_none());
         assert_eq!(
             setting_of(&c, "glassAppearance").as_deref(),
             Some("tinted"),
             "玻璃质感随备份往返"
+        );
+        assert_eq!(
+            setting_of(&c, "locale").as_deref(),
+            Some("en-US"),
+            "界面语言随备份往返"
         );
         assert_eq!(
             setting_of(&c, "bodyIdleTimeoutSecs").as_deref(),
@@ -4155,6 +4240,7 @@ mod tests {
                 serde_json::json!({ "glassAppearance": "blurred" }),
                 "玻璃质感取值非法",
             ),
+            (serde_json::json!({ "locale": "fr-FR" }), "界面语言取值非法"),
             (
                 serde_json::json!({ "promptTemplates": "not-json" }),
                 "自定义模板",
@@ -4162,6 +4248,10 @@ mod tests {
             (
                 serde_json::json!({ "promptTemplates": "[{\"id\":\"a\"}]" }),
                 "自定义模板",
+            ),
+            (
+                serde_json::json!({ "stylePresets": "[{\"id\":\"c_1\",\"label\":\"A\"}]" }),
+                "自定义风格",
             ),
             (
                 serde_json::json!({ "bodyIdleTimeoutSecs": "4" }),

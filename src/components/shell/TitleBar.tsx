@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { useAppStore, type AppView } from "../../stores/appStore";
 import { useQueueStore } from "../../stores/queueStore";
 import { IconButton } from "../ui/IconButton";
@@ -6,13 +7,13 @@ import { cn } from "../ui/cn";
 import WindowControls from "./WindowControls";
 import type { WindowPlatform } from "../../hooks/useWindowState";
 
-const VIEW_TITLE: Record<AppView, string> = {
+const VIEW_TITLE = {
   chat: "聊天",
   gallery: "画廊",
   canvas: "画布",
   queue: "队列",
   settings: "设置",
-};
+} as const satisfies Record<AppView, string>;
 
 /// 自绘标题栏：48px 功能玻璃，整条是拖拽区。
 ///
@@ -26,6 +27,7 @@ export default function TitleBar({
   isMaximized: boolean;
   platform: WindowPlatform;
 }) {
+  const { t } = useTranslation();
   const view = useAppStore((s) => s.view);
   const toggleSidebar = useAppStore((s) => s.toggleSidebar);
   const setPaletteOpen = useAppStore((s) => s.setPaletteOpen);
@@ -43,7 +45,7 @@ export default function TitleBar({
       <div className="flex shrink-0 items-center gap-1 pl-2">
         <IconButton
           size="sm"
-          label="切换侧栏"
+          label={t("切换侧栏")}
           tooltip={false}
           icon={<IconPanelLeft size={16} />}
           onClick={toggleSidebar}
@@ -59,7 +61,7 @@ export default function TitleBar({
           ·
         </span>
         <span className="truncate text-callout text-secondary">
-          {VIEW_TITLE[view]}
+          {t(VIEW_TITLE[view])}
         </span>
       </div>
 
@@ -76,12 +78,12 @@ export default function TitleBar({
           )}
         >
           <IconSearch size={14} />
-          <span className="flex-1 text-left">搜索或跳转</span>
+          <span className="flex-1 text-left">{t("搜索或跳转")}</span>
           <kbd className="text-caption text-quaternary">{mod}</kbd>
         </button>
         {queuePending > 0 && (
           <span
-            aria-label={`${queuePending} 个任务待执行`}
+            aria-label={t("{{n}} 个任务待执行", { n: queuePending })}
             className="tabular rounded-pill bg-accent-fill px-1.5 py-0.5 text-caption text-on-accent"
           >
             {queuePending}

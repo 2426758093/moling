@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { useTranslation } from "react-i18next";
 import { motion, AnimatePresence } from "framer-motion";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useChatStore } from "../stores/chatStore";
@@ -22,6 +23,7 @@ const SUGGESTIONS = [
 ];
 
 export default function ChatView() {
+  const { t } = useTranslation();
   const messages = useChatStore((s) => s.messages);
   const activeId = useChatStore((s) => s.activeId);
   const conversations = useChatStore((s) => s.conversations);
@@ -46,10 +48,11 @@ export default function ChatView() {
     overscan: 6,
   });
 
-  const title = conversations.find((c) => c.id === activeId)?.title ?? "新对话";
+  const title =
+    conversations.find((c) => c.id === activeId)?.title ?? t("新对话");
   const model =
     providers.find((p) => p.provider.id === defaultProviderId)?.provider
-      .defaultModel ?? "未配置模型";
+      .defaultModel ?? t("未配置模型");
 
   const handleScroll = () => {
     const el = scrollRef.current;
@@ -131,18 +134,21 @@ export default function ChatView() {
             </motion.span>
           </AnimatePresence>
         }
-        subtitle={`${messages.length} 条消息 · ${model}`}
+        subtitle={t("{{n}} 条消息 · {{model}}", {
+          n: messages.length,
+          model,
+        })}
         actions={
           <>
             <Badge tone="neutral">{sizeLabel(prefs.width, prefs.height)}</Badge>
             <button
               type="button"
               onClick={() => setPaletteOpen(true)}
-              aria-label="打开命令面板"
+              aria-label={t("打开命令面板")}
               className="pressable glass-inset flex h-7 items-center gap-1.5 rounded-btn px-2 text-caption text-tertiary transition-colors hover:text-secondary"
             >
               <IconCommand size={13} />
-              <span className="hidden sm:inline">命令</span>
+              <span className="hidden sm:inline">{t("命令")}</span>
             </button>
           </>
         }
@@ -164,11 +170,13 @@ export default function ChatView() {
               className="max-w-reading text-center"
             >
               <div className="mb-3 text-caption uppercase tracking-wider text-tertiary">
-                AI 绘图
+                {t("AI 绘图")}
               </div>
-              <h2 className="text-display text-primary">描述画面，即刻成图</h2>
+              <h2 className="text-display text-primary">
+                {t("描述画面，即刻成图")}
+              </h2>
               <p className="mt-2 text-body text-tertiary">
-                像聊天一样描述想法，墨灵会读懂原话并绘制出来
+                {t("像聊天一样描述想法，墨灵会读懂原话并绘制出来")}
               </p>
             </motion.div>
             <div className="grid w-full max-w-chat grid-cols-1 gap-2.5 wide:max-w-chat-wide sm:grid-cols-2">
@@ -197,7 +205,7 @@ export default function ChatView() {
               ))}
             </div>
             <div className="text-footnote text-quaternary">
-              拖入图片作为参考 · Ctrl K 打开命令面板
+              {t("拖入图片作为参考 · Ctrl K 打开命令面板")}
             </div>
           </div>
         ) : (
@@ -208,7 +216,9 @@ export default function ChatView() {
                 role="status"
                 aria-live="polite"
               >
-                {loadingOlder ? "正在加载更早的消息…" : "上滑加载更早的消息"}
+                {loadingOlder
+                  ? t("正在加载更早的消息…")
+                  : t("上滑加载更早的消息")}
               </div>
             )}
             <div

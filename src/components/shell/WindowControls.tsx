@@ -1,4 +1,5 @@
 import { ReactNode } from "react";
+import { useTranslation } from "react-i18next";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { cn } from "../ui/cn";
 import {
@@ -47,6 +48,7 @@ export default function WindowControls({
 }: {
   isMaximized: boolean;
 }) {
+  const { t } = useTranslation();
   const win = () => getCurrentWindow();
   const guard = (fn: () => Promise<void>) => () => {
     if (inTauri()) void fn().catch(() => undefined);
@@ -54,11 +56,11 @@ export default function WindowControls({
 
   return (
     <div className="flex h-full items-stretch">
-      <Control label="最小化" onClick={guard(() => win().minimize())}>
+      <Control label={t("最小化")} onClick={guard(() => win().minimize())}>
         <IconWindowMinimize size={12} strokeWidth={1.2} />
       </Control>
       <Control
-        label={isMaximized ? "还原" : "最大化"}
+        label={isMaximized ? t("还原") : t("最大化")}
         onClick={guard(() => win().toggleMaximize())}
       >
         {isMaximized ? (
@@ -67,7 +69,7 @@ export default function WindowControls({
           <IconWindowMaximize size={12} strokeWidth={1.2} />
         )}
       </Control>
-      <Control danger label="关闭" onClick={guard(() => win().close())}>
+      <Control danger label={t("关闭")} onClick={guard(() => win().close())}>
         <IconClose size={12} strokeWidth={1.4} />
       </Control>
     </div>

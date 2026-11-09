@@ -1,5 +1,6 @@
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { ReactNode } from "react";
+import { useTranslation } from "react-i18next";
 import { IconClose } from "../Icons";
 import { Button } from "./Button";
 import { IconButton } from "./IconButton";
@@ -36,6 +37,7 @@ export function Dialog({
   size = "md",
   className,
 }: DialogProps) {
+  const { t } = useTranslation();
   return (
     <DialogPrimitive.Root open={open} onOpenChange={onOpenChange}>
       <DialogPrimitive.Portal>
@@ -60,7 +62,7 @@ export function Dialog({
               )}
             </div>
             <IconButton
-              label="关闭"
+              label={t("关闭")}
               size="sm"
               tooltip={false}
               icon={<IconClose size={16} />}
@@ -98,11 +100,12 @@ export function ConfirmDialog({
   onOpenChange,
   title,
   description,
-  confirmLabel = "确定",
-  cancelLabel = "取消",
+  confirmLabel,
+  cancelLabel,
   danger = false,
   onConfirm,
 }: ConfirmDialogProps) {
+  const { t } = useTranslation();
   return (
     <Dialog
       open={open}
@@ -112,7 +115,7 @@ export function ConfirmDialog({
       footer={
         <>
           <Button variant="ghost" onClick={() => onOpenChange(false)}>
-            {cancelLabel}
+            {cancelLabel ?? t("取消")}
           </Button>
           <Button
             variant={danger ? "danger" : "primary"}
@@ -121,7 +124,7 @@ export function ConfirmDialog({
               onConfirm();
             }}
           >
-            {confirmLabel}
+            {confirmLabel ?? t("确定")}
           </Button>
         </>
       }

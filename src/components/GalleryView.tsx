@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { api, HistoryItem } from "../lib/api";
 import { exportHistoryZip, saveHistoryImage } from "../lib/save";
 import { extOf } from "../lib/image";
-import { STYLE_PRESETS } from "../lib/types";
 import { dayKey, dayLabel } from "../lib/date";
 import { toast } from "../lib/notify";
 import SafeImg from "./SafeImg";
@@ -18,6 +18,7 @@ import { Select } from "./ui/Select";
 import { SegmentedControl } from "./ui/SegmentedControl";
 import { useAppStore } from "../stores/appStore";
 import { useChatStore } from "../stores/chatStore";
+import { useStylePresets } from "../stores/stylePresetStore";
 import { usePromptAssetsStore } from "../stores/promptAssetsStore";
 import { useCanvasStore } from "../stores/canvasStore";
 import {
@@ -61,7 +62,11 @@ async function exportZip(
   return exportHistoryZip(entries, `moling_export_${Date.now()}.zip`);
 }
 
-async function downloadOne(item: HistoryItem, withParams: boolean) {
+async function downloadOne(
+  item: HistoryItem,
+  withParams: boolean,
+  savedToast: string,
+) {
   const h = item.history;
   const ext = extOf(h.filePath);
   const p = paramsOf(item);
@@ -73,7 +78,7 @@ async function downloadOne(item: HistoryItem, withParams: boolean) {
     `moling_${h.id}.${ext}`,
     paramsText,
   );
-  if (saved) toast("已保存图片");
+  if (saved) toast(savedToast);
 }
 
 /// 画廊栅格：按容器宽度在 2 / 3 / 4 列之间切换。每行按图片宽高比做
@@ -141,10 +146,12 @@ function justifyRows(
 }
 
 export default function GalleryView() {
+  const { t } = useTranslation();
   const [items, setItems] = useState<HistoryItem[]>([]);
   const [hasMore, setHasMore] = useState(true);
   const [modelFilter, setModelFilter] = useState("");
   const [styleFilter, setStyleFilter] = useState("");
+  const stylePresets = useStylePresets();
   const [favOnly, setFavOnly] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [loading, setLoading] = useState(false);
@@ -240,33 +247,33 @@ export default function GalleryView() {
   // 风格选项：预设 + 当前已加载数据里出现的未知风格（筛选由后端执行）
   const styles = useMemo(() => {
     const map = new Map<string, string>();
-    for (const s of STYLE_PRESETS) {
-      if (s.id) map.set(s.id, s.label);
+    for (const s of stylePresets) {
+      if (s.prompt) map.set(s.prompt, s.label);
     }
     for (const item of items) {
       const s = item.history.style;
       if (s && !map.has(s)) map.set(s, s);
     }
     return Array.from(map, ([id, label]) => ({ id, label }));
-  }, [items]);
+  }, [items, stylePresets]);
 
   // 时间线：同一天归为一组，组头固定 44px 单行，组内按宽高比 justified 排布
   const groups = useMemo(() => {
     const out: { key: string; label: string; items: HistoryItem[] }[] = [];
     for (const item of items) {
-      const t = Number(item.history.createdAt);
-      const key = Number.isFinite(t) ? dayKey(t) : "unknown";
+      const createdAt = Number(item.history.createdAt);
+      const key = Number.isFinite(createdAt) ? dayKey(createdAt) : "unknown";
       const last = out[out.length - 1];
       if (last && last.key === key) last.items.push(item);
       else
         out.push({
           key,
-          label: Number.isFinite(t) ? dayLabel(t) : "更早",
+          label: Number.isFinite(createdAt) ? dayLabel(createdAt) : t("更早"),
           items: [item],
         });
     }
     return out;
-  }, [items]);
+  }, [items, t]);
 
   const blocks = useMemo(() => {
     const out: Block[] = [];
@@ -319,7 +326,7 @@ export default function GalleryView() {
         setSelected(nextSel);
       }
     } catch {
-      toast("收藏操作失败，请稍后重试", "error");
+      toast(t("收藏操作失败，请稍后重试"), "error");
     }
   };
 
@@ -333,7 +340,7 @@ export default function GalleryView() {
         setSelected(nextSel);
       }
     } catch {
-      toast("删除失败，请稍后重试", "error");
+      toast(t("删除失败，请稍后重试"), "error");
     }
   };
 
@@ -421,11 +428,14 @@ export default function GalleryView() {
       if (!res) return; // 用户取消保存
       toast(
         res.skipped > 0
-          ? `已导出 ${res.saved} 张，${res.skipped} 张因缺图被跳过`
-          : `已导出 ${res.saved} 张`,
+          ? t("已导出 {{saved}} 张，{{skipped}} 张因缺图被跳过", {
+              saved: res.saved,
+              skipped: res.skipped,
+            })
+          : t("已导出 {{n}} 张", { n: res.saved }),
       );
     } catch {
-      toast("打包导出失败，请重试", "error");
+      toast(t("打包导出失败，请重试"), "error");
     } finally {
       setExporting(false);
     }
@@ -449,14 +459,14 @@ export default function GalleryView() {
   const collectPrompt = async (item: HistoryItem) => {
     const prompt = item.history.prompt.trim();
     if (!prompt) {
-      toast("该作品没有可收藏的提示词", "error");
+      toast(t("该作品没有可收藏的提示词"), "error");
       return;
     }
     const res = await usePromptAssetsStore
       .getState()
       .upsertFavorite(prompt, []);
-    if (res === "created") toast("已收藏提示词");
-    if (res === "updated") toast("该提示词已存在，已更新收藏");
+    if (res === "created") toast(t("已收藏提示词"));
+    if (res === "updated") toast(t("该提示词已存在，已更新收藏"));
   };
 
   const addToCanvas = async (item: HistoryItem) => {
@@ -465,24 +475,24 @@ export default function GalleryView() {
     const nodeId = await canvas.addHistoryNode(item.history.id);
     if (!nodeId) return;
     useAppStore.getState().setView("canvas");
-    toast(existed ? "该作品已在画布中" : "已加入画布");
+    toast(existed ? t("该作品已在画布中") : t("已加入画布"));
   };
 
   return (
     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
       <PageHeader
-        title="画廊"
-        subtitle={`${items.length} 张作品`}
+        title={t("画廊")}
+        subtitle={t("{{n}} 张作品", { n: items.length })}
         footer={
           <div className="flex flex-wrap items-center gap-1.5">
             <Select
               value={modelFilter || "all"}
               onValueChange={(v) => setModelFilter(v === "all" ? "" : v)}
               options={[
-                { value: "all", label: "全部模型" },
+                { value: "all", label: t("全部模型") },
                 ...models.map((m) => ({ value: m, label: m })),
               ]}
-              label="按模型筛选"
+              label={t("按模型筛选")}
               variant="chip"
               widthClass="w-36"
             />
@@ -490,27 +500,27 @@ export default function GalleryView() {
               value={styleFilter || "all"}
               onValueChange={(v) => setStyleFilter(v === "all" ? "" : v)}
               options={[
-                { value: "all", label: "全部风格" },
+                { value: "all", label: t("全部风格") },
                 ...styles.map((s) => ({ value: s.id, label: s.label })),
               ]}
-              label="按风格筛选"
+              label={t("按风格筛选")}
               variant="chip"
               widthClass="w-32"
             />
             <SegmentedControl
               value={favOnly ? "fav" : "all"}
               onValueChange={(v) => setFavOnly(v === "fav")}
-              label="收藏筛选"
+              label={t("收藏筛选")}
               size="sm"
               options={[
-                { value: "all", label: "全部" },
-                { value: "fav", label: "只看收藏" },
+                { value: "all", label: t("全部") },
+                { value: "fav", label: t("只看收藏") },
               ]}
             />
             <div className="ml-auto flex items-center gap-1.5">
               <IconButton
                 size="sm"
-                label="刷新"
+                label={t("刷新")}
                 icon={<IconRotate size={14} />}
                 onClick={reload}
               />
@@ -526,20 +536,22 @@ export default function GalleryView() {
         {items.length === 0 && !loading ? (
           loadError ? (
             <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
-              <p className="text-footnote text-secondary">加载画廊失败</p>
+              <p className="text-footnote text-secondary">
+                {t("加载画廊失败")}
+              </p>
               <Button size="sm" variant="ghost" onClick={reload}>
-                重试
+                {t("重试")}
               </Button>
             </div>
           ) : (
             <EmptyState
               className="h-full"
-              eyebrow="画廊"
-              title={favOnly ? "还没有收藏的作品" : "还没有生成记录"}
+              eyebrow={t("画廊")}
+              title={favOnly ? t("还没有收藏的作品") : t("还没有生成记录")}
               description={
                 favOnly
-                  ? "在聊天里生成图片后点星标即可收藏"
-                  : "回到聊天描述一个画面，生成结果会自动归档到这里"
+                  ? t("在聊天里生成图片后点星标即可收藏")
+                  : t("回到聊天描述一个画面，生成结果会自动归档到这里")
               }
             />
           )
@@ -562,7 +574,7 @@ export default function GalleryView() {
                       {block.label}
                     </span>
                     <span className="text-caption text-tertiary">
-                      {block.count} 张
+                      {t("{{n}} 张", { n: block.count })}
                     </span>
                   </div>
                 );
@@ -599,7 +611,7 @@ export default function GalleryView() {
                           />
                         ) : (
                           <div className="flex h-full w-full items-center justify-center px-2 text-center text-caption text-tertiary">
-                            缩略图生成中
+                            {t("缩略图生成中")}
                           </div>
                         )}
                         <label
@@ -611,7 +623,9 @@ export default function GalleryView() {
                         >
                           <input
                             type="checkbox"
-                            aria-label={`选择作品：${item.history.prompt}`}
+                            aria-label={t("选择作品：{{prompt}}", {
+                              prompt: item.history.prompt,
+                            })}
                             checked={selected.has(item.history.id)}
                             onChange={() => toggleSelect(item, false)}
                             onClick={(e) => {
@@ -627,7 +641,9 @@ export default function GalleryView() {
                           type="button"
                           onClick={() => void toggleFav(item)}
                           aria-label={
-                            item.history.favorite ? "取消收藏" : "收藏该作品"
+                            item.history.favorite
+                              ? t("取消收藏")
+                              : t("收藏该作品")
                           }
                           className="glass-media pressable absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-pill text-caption text-on-accent transition-opacity hover:bg-on-accent/15"
                         >
@@ -635,60 +651,64 @@ export default function GalleryView() {
                         </button>
                         {item.history.parentId != null && (
                           <span className="glass-media pointer-events-none absolute bottom-2 left-2 rounded-pill px-2 py-0.5 text-caption text-on-accent">
-                            派生 #{item.history.parentId}
+                            {t("派生 #{{id}}", { id: item.history.parentId })}
                           </span>
                         )}
                         <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center p-2 opacity-0 transition-opacity duration-200 group-focus-within:opacity-100 group-hover:opacity-100">
                           <div className="glass-media pointer-events-auto flex items-center gap-0.5 rounded-pill p-0.5">
-                            <Tooltip label="复用参数" side="top">
+                            <Tooltip label={t("复用参数")} side="top">
                               <button
                                 type="button"
                                 onClick={() => reuse(item)}
-                                aria-label="复用参数"
+                                aria-label={t("复用参数")}
                                 className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent hover:bg-on-accent/15"
                               >
                                 <IconQuote size={13} />
                               </button>
                             </Tooltip>
-                            <Tooltip label="加入画布" side="top">
+                            <Tooltip label={t("加入画布")} side="top">
                               <button
                                 type="button"
                                 onClick={() => void addToCanvas(item)}
-                                aria-label="加入画布"
+                                aria-label={t("加入画布")}
                                 className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent hover:bg-on-accent/15"
                               >
                                 <IconCanvas size={13} />
                               </button>
                             </Tooltip>
-                            <Tooltip label="收藏提示词" side="top">
+                            <Tooltip label={t("收藏提示词")} side="top">
                               <button
                                 type="button"
                                 onClick={() => void collectPrompt(item)}
-                                aria-label="收藏提示词"
+                                aria-label={t("收藏提示词")}
                                 className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent hover:bg-on-accent/15"
                               >
                                 <IconStar size={13} />
                               </button>
                             </Tooltip>
-                            <Tooltip label="下载原图与参数" side="top">
+                            <Tooltip label={t("下载原图与参数")} side="top">
                               <button
                                 type="button"
                                 onClick={() =>
-                                  void downloadOne(item, true).catch(() =>
-                                    toast("下载失败：原图不可用", "error"),
+                                  void downloadOne(
+                                    item,
+                                    true,
+                                    t("已保存图片"),
+                                  ).catch(() =>
+                                    toast(t("下载失败：原图不可用"), "error"),
                                   )
                                 }
-                                aria-label="下载原图与参数"
+                                aria-label={t("下载原图与参数")}
                                 className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent hover:bg-on-accent/15"
                               >
                                 <IconDownload size={13} />
                               </button>
                             </Tooltip>
-                            <Tooltip label="删除" side="top">
+                            <Tooltip label={t("删除")} side="top">
                               <button
                                 type="button"
                                 onClick={() => void remove(item)}
-                                aria-label="删除"
+                                aria-label={t("删除")}
                                 className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent hover:bg-on-accent/15"
                               >
                                 <IconTrash size={13} />
@@ -707,7 +727,9 @@ export default function GalleryView() {
         <div ref={sentinelRef} aria-hidden className="h-6 w-full" />
         {loadError && items.length > 0 && (
           <div className="flex flex-col items-center gap-2 py-3 text-center">
-            <span className="text-footnote text-secondary">加载更多失败</span>
+            <span className="text-footnote text-secondary">
+              {t("加载更多失败")}
+            </span>
             <Button
               size="sm"
               variant="ghost"
@@ -715,7 +737,7 @@ export default function GalleryView() {
                 void load(cursorRef.current, modelFilter, styleFilter, favOnly)
               }
             >
-              重试
+              {t("重试")}
             </Button>
           </div>
         )}
@@ -728,13 +750,13 @@ export default function GalleryView() {
                 void load(cursorRef.current, modelFilter, styleFilter, favOnly)
               }
             >
-              加载更多
+              {t("加载更多")}
             </Button>
           </div>
         )}
         {loading && (
           <div className="py-3 text-center text-footnote text-tertiary">
-            加载中…
+            {t("加载中…")}
           </div>
         )}
       </div>
@@ -744,7 +766,7 @@ export default function GalleryView() {
         <div className="pointer-events-none absolute inset-x-0 bottom-3 z-20 flex justify-center px-4">
           <div className="glass pointer-events-auto flex items-center gap-1 rounded-pill p-1 pl-3 shadow-sheet">
             <span className="tabular text-footnote text-secondary">
-              已选 {selectedItems.length}
+              {t("已选 {{n}}", { n: selectedItems.length })}
             </span>
             {selectedItems.length === 2 && (
               <Button
@@ -752,21 +774,23 @@ export default function GalleryView() {
                 variant="ghost"
                 onClick={() => setCompareOpen(true)}
               >
-                对比
+                {t("对比")}
               </Button>
             )}
             <Button
               size="sm"
               variant="primary"
               disabled={exporting}
-              aria-label={`打包导出已选 ${selectedItems.length} 张作品`}
+              aria-label={t("打包导出已选 {{n}} 张作品", {
+                n: selectedItems.length,
+              })}
               onClick={() => void doExport()}
             >
-              {exporting ? "打包中…" : "导出"}
+              {exporting ? t("打包中…") : t("导出")}
             </Button>
             <IconButton
               size="sm"
-              label="取消选择"
+              label={t("取消选择")}
               icon={<IconClose size={13} />}
               onClick={() => setSelected(new Set())}
             />

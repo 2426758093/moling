@@ -1,0 +1,6 @@
+{
+  "_comment": "发布包体基线。make-latest-json.mjs 生成清单时比对，任一产物超过「基线 + maxGrowthMiB」即阻断发布。更新基线必须先在本机确认安装与冷启动正常，并在发版说明里写明原因。",
+  "installerMiB": 13.23,
+  "latestJsonMiB": 0.02,
+  "maxGrowthMiB": 60
+}

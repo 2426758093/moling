@@ -1,8 +1,11 @@
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { useEffect, useMemo, useRef, useState } from "react";
+import type { ParseKeysWithoutVariables } from "i18next";
+import { useTranslation } from "react-i18next";
 import {
   COMMANDS,
   Command,
+  CommandGroup,
   CommandIcon,
   filterCommands,
 } from "../../lib/commands";
@@ -29,6 +32,10 @@ import { cn } from "./cn";
 
 const RECENT_KEY = "moling.recentCommands";
 const RECENT_LIMIT = 5;
+
+/// 命令的标题/提示是中文原文，也就是词典 key；字段声明为普通 string，
+/// 这里显式收窄回 key 联合，让 t() 的严格类型仍然生效。
+const commandKey = (text: string) => text as ParseKeysWithoutVariables;
 
 const ICONS: Record<CommandIcon, typeof IconGrid> = {
   chat: IconChat,
@@ -72,7 +79,7 @@ function writeRecent(ids: string[]) {
 }
 
 type Row =
-  | { type: "group"; key: string; label: string }
+  | { type: "group"; key: string; label: CommandGroup }
   | { type: "command"; key: string; command: Command; index: number };
 
 export function CommandPalette() {
@@ -83,26 +90,27 @@ export function CommandPalette() {
 }
 
 function PaletteContent({ onClose }: { onClose: () => void }) {
+  const { t, i18n } = useTranslation();
   const [query, setQuery] = useState("");
   const [recent, setRecent] = useState<string[]>(readRecent);
   const [active, setActive] = useState(0);
   const listRef = useRef<HTMLDivElement>(null);
 
-  const items = useMemo(
-    () =>
-      filterCommands(
-        COMMANDS.filter((c) => !c.when || c.when()),
-        query,
-        recent,
-      ),
-    [query, recent],
-  );
+  const items = useMemo(() => {
+    // 过滤结果随界面语言变化：标题翻译后参与匹配
+    void i18n.language;
+    return filterCommands(
+      COMMANDS.filter((c) => !c.when || c.when()),
+      query,
+      recent,
+    );
+  }, [query, recent, i18n.language]);
   // 过滤后结果变少时高亮可能越界：派生出当前项，不写回 state
   const current = items.length === 0 ? -1 : Math.min(active, items.length - 1);
 
   const rows = useMemo<Row[]>(() => {
     const out: Row[] = [];
-    let group: string | null = null;
+    let group: CommandGroup | null = null;
     items.forEach((command, index) => {
       if (!query.trim() && command.group !== group) {
         group = command.group;
@@ -173,10 +181,10 @@ function PaletteContent({ onClose }: { onClose: () => void }) {
           }}
         >
           <DialogPrimitive.Title className="sr-only">
-            命令面板
+            {t("命令面板")}
           </DialogPrimitive.Title>
           <DialogPrimitive.Description className="sr-only">
-            输入关键词搜索命令，方向键选择，回车执行。
+            {t("输入关键词搜索命令，方向键选择，回车执行。")}
           </DialogPrimitive.Description>
 
           <div className="flex h-12 shrink-0 items-center gap-2.5 border-b border-separator px-3.5">
@@ -198,8 +206,8 @@ function PaletteContent({ onClose }: { onClose: () => void }) {
               aria-activedescendant={
                 current >= 0 ? `command-${items[current].id}` : undefined
               }
-              placeholder="搜索命令、页面或设置…"
-              aria-label="搜索命令"
+              placeholder={t("搜索命令、页面或设置…")}
+              aria-label={t("搜索命令")}
               className="h-full min-w-0 flex-1 bg-transparent text-body text-primary outline-none placeholder:text-tertiary"
             />
             <Kbd>Esc</Kbd>
@@ -209,12 +217,12 @@ function PaletteContent({ onClose }: { onClose: () => void }) {
             ref={listRef}
             id="command-list"
             role="listbox"
-            aria-label="命令"
+            aria-label={t("命令")}
             className="max-h-[min(420px,55vh)] overflow-y-auto p-1.5"
           >
             {items.length === 0 ? (
               <div className="px-3 py-10 text-center text-footnote text-tertiary">
-                没有匹配的命令
+                {t("没有匹配的命令")}
               </div>
             ) : (
               rows.map((row) =>
@@ -224,7 +232,7 @@ function PaletteContent({ onClose }: { onClose: () => void }) {
                     role="presentation"
                     className="px-2 pt-2 pb-1 text-caption text-tertiary"
                   >
-                    {row.label}
+                    {t(row.label)}
                   </div>
                 ) : (
                   <button
@@ -249,11 +257,11 @@ function PaletteContent({ onClose }: { onClose: () => void }) {
                         : null}
                     </span>
                     <span className="min-w-0 flex-1 truncate">
-                      {row.command.title}
+                      {t(commandKey(row.command.title))}
                     </span>
                     {row.command.hint && (
                       <span className="hidden shrink-0 text-footnote text-tertiary compact:block">
-                        {row.command.hint}
+                        {t(commandKey(row.command.hint))}
                       </span>
                     )}
                     {row.command.shortcut && <Kbd>{row.command.shortcut}</Kbd>}
@@ -267,13 +275,13 @@ function PaletteContent({ onClose }: { onClose: () => void }) {
             <span className="flex items-center gap-1">
               <Kbd>↑</Kbd>
               <Kbd>↓</Kbd>
-              选择
+              {t("选择")}
             </span>
             <span className="flex items-center gap-1">
               <Kbd>Enter</Kbd>
-              执行
+              {t("执行")}
             </span>
-            <span className="ml-auto">Esc 关闭</span>
+            <span className="ml-auto">{t("Esc 关闭")}</span>
           </div>
         </DialogPrimitive.Content>
       </DialogPrimitive.Portal>

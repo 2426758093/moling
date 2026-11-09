@@ -54,9 +54,9 @@ impl ProxyConfig {
                     return Err("手动代理需要填写代理地址".into());
                 }
                 let parsed = reqwest::Url::parse(raw).map_err(|e| format!("代理地址无效: {e}"))?;
-                if !matches!(parsed.scheme(), "http" | "https") {
+                if !matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h") {
                     return Err(format!(
-                        "代理地址只支持 http/https，收到 {}",
+                        "代理地址只支持 http/https/socks5/socks5h，收到 {}",
                         parsed.scheme()
                     ));
                 }
@@ -297,12 +297,14 @@ mod tests {
         }
         assert!(manual("http://127.0.0.1:7890").validate().is_ok());
         assert!(manual("https://proxy.example.com:8443").validate().is_ok());
+        assert!(manual("socks5://127.0.0.1:1080").validate().is_ok());
+        assert!(manual("socks5h://127.0.0.1:1080").validate().is_ok());
     }
 
     #[test]
     fn validate_rejects_bad_manual_url() {
         assert!(manual("").validate().is_err());
-        assert!(manual("socks5://127.0.0.1:1080").validate().is_err());
+        assert!(manual("socks4://127.0.0.1:1080").validate().is_err());
         assert!(manual("not a url").validate().is_err());
         assert!(manual("http://127.0.0.1:99999").validate().is_err());
         let unknown = ProxyConfig {

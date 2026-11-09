@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { api, ProviderItem } from "../lib/api";
 import { saveTextFile } from "../lib/save";
@@ -17,32 +18,40 @@ import AboutSection from "./settings/AboutSection";
 import NetworkSection from "./settings/NetworkSection";
 import StorageSection from "./settings/StorageSection";
 import { Button } from "./ui/Button";
+import { Input } from "./ui/Field";
 import { Section, Row } from "./ui/List";
 import { SegmentedControl } from "./ui/SegmentedControl";
 import { Switch } from "./ui/Switch";
 import { Kbd } from "./ui/Kbd";
 import { IconMonitor, IconMoon, IconPlus, IconSun } from "./Icons";
 import { cn } from "./ui/cn";
+import { useStylePresetStore } from "../stores/stylePresetStore";
 
 const THEME_OPTIONS = [
   {
-    value: "system" as const,
+    value: "system",
     label: "跟随系统",
     icon: <IconMonitor size={16} />,
   },
-  { value: "light" as const, label: "浅色", icon: <IconSun size={16} /> },
-  { value: "dark" as const, label: "暗色", icon: <IconMoon size={16} /> },
-];
+  { value: "light", label: "浅色", icon: <IconSun size={16} /> },
+  { value: "dark", label: "暗色", icon: <IconMoon size={16} /> },
+] as const;
 
 const GLASS_OPTIONS = [
-  { value: "clear" as const, label: "清晰" },
-  { value: "standard" as const, label: "标准" },
-  { value: "tinted" as const, label: "着色" },
-];
+  { value: "clear", label: "清晰" },
+  { value: "standard", label: "标准" },
+  { value: "tinted", label: "着色" },
+] as const;
 
 const MODE_OPTIONS = [
-  { value: "simple" as const, label: "简单" },
-  { value: "expert" as const, label: "专家" },
+  { value: "simple", label: "简单" },
+  { value: "expert", label: "专家" },
+] as const;
+
+// 语言名用各自母语显示，切到英文后也能认出「简体中文」
+const LOCALE_OPTIONS = [
+  { value: "zh-CN" as const, label: "简体中文" },
+  { value: "en-US" as const, label: "English" },
 ];
 
 type SettingsSection =
@@ -55,7 +64,7 @@ type SettingsSection =
   | "about"
   | "shortcuts";
 
-const SECTIONS: { id: SettingsSection; label: string }[] = [
+const SECTIONS = [
   { id: "providers", label: "服务商" },
   { id: "appearance", label: "外观" },
   { id: "generation", label: "生成" },
@@ -64,9 +73,141 @@ const SECTIONS: { id: SettingsSection; label: string }[] = [
   { id: "diagnostics", label: "诊断" },
   { id: "about", label: "关于" },
   { id: "shortcuts", label: "快捷键" },
-];
+] as const;
 
 const SHORTCUT_GROUPS = ["全局", "画布", "列表"] as const;
+
+/// 智能蒙版开关：默认开启；关闭后编辑器的「点选物体」与换背景的
+/// 「自动选中背景」入口整体隐藏，行为回到 1.2.7 的纯手动画笔。
+function SmartMaskRow() {
+  const { t } = useTranslation();
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  useEffect(() => {
+    api
+      .getSetting("smartMask")
+      .then((v) => setEnabled(v !== "off"))
+      .catch(() => setEnabled(true));
+  }, []);
+  return (
+    <Row
+      label={t("启用智能蒙版")}
+      hint={t(
+        "一键选中背景、点选要消除的物体；首次使用会加载本地模型，之后约 0.1–0.5 秒出结果",
+      )}
+    >
+      <Switch
+        checked={enabled ?? true}
+        disabled={enabled === null}
+        onCheckedChange={(v) => {
+          setEnabled(v);
+          api
+            .setSetting("smartMask", v ? "on" : "off")
+            .then(() => toast(t("已保存智能蒙版设置")))
+            .catch((e) =>
+              toast(t("保存失败：{{error}}", { error: String(e) }), "error"),
+            );
+        }}
+        label={t("启用智能蒙版")}
+      />
+    </Row>
+  );
+}
+
+/// 队列自动续跑：启动时只恢复排队中的任务；中断任务需在队列页手动恢复。
+function QueueAutoResumeRow() {
+  const { t } = useTranslation();
+  const [enabled, setEnabled] = useState<boolean | null>(null);
+  useEffect(() => {
+    api
+      .getSetting("queueAutoResume")
+      .then((v) => setEnabled(v === "on"))
+      .catch(() => setEnabled(false));
+  }, []);
+  return (
+    <Row
+      label={t("启动时自动续跑队列")}
+      hint={t(
+        "只处理排队中的任务；上次中断的任务仍需在队列页手动恢复，避免重复计费",
+      )}
+    >
+      <Switch
+        checked={enabled ?? false}
+        disabled={enabled === null}
+        onCheckedChange={(v) => {
+          setEnabled(v);
+          api
+            .setSetting("queueAutoResume", v ? "on" : "off")
+            .then(() => toast(t("已保存队列设置")))
+            .catch((e) =>
+              toast(t("保存失败：{{error}}", { error: String(e) }), "error"),
+            );
+        }}
+        label={t("启动时自动续跑队列")}
+      />
+    </Row>
+  );
+}
+
+/// 自定义风格：与内置风格同源展示在 Composer / 风格转换里，只存增量部分
+function StylePresetsSection() {
+  const { t } = useTranslation();
+  const custom = useStylePresetStore((s) => s.custom);
+  const addCustom = useStylePresetStore((s) => s.addCustom);
+  const removeCustom = useStylePresetStore((s) => s.removeCustom);
+  const [label, setLabel] = useState("");
+  const [prompt, setPrompt] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const canAdd = !busy && label.trim() !== "" && prompt.trim() !== "";
+  const add = async () => {
+    if (!canAdd) return;
+    setBusy(true);
+    const ok = await addCustom(label, prompt);
+    setBusy(false);
+    if (ok) {
+      setLabel("");
+      setPrompt("");
+      toast(t("已添加风格"));
+    }
+  };
+
+  return (
+    <Section
+      title={t("自定义风格")}
+      description={t("与内置风格一起出现在生成与风格转换里")}
+    >
+      {custom.map((p) => (
+        <Row key={p.id} label={p.label} hint={p.prompt}>
+          <Button size="sm" onClick={() => void removeCustom(p.id)}>
+            {t("删除")}
+          </Button>
+        </Row>
+      ))}
+      <div className="flex flex-col gap-2 px-3 py-2">
+        <Input
+          label={t("风格名称")}
+          value={label}
+          maxLength={40}
+          placeholder={t("例如：暖调胶片")}
+          onChange={(e) => setLabel(e.target.value)}
+        />
+        <Input
+          label={t("风格提示词")}
+          value={prompt}
+          maxLength={500}
+          placeholder={t("例如：warm analog film, soft grain")}
+          onChange={(e) => setPrompt(e.target.value)}
+        />
+        <div className="flex justify-end">
+          <Button size="sm" variant="primary" disabled={!canAdd} onClick={add}>
+            <IconPlus size={14} />
+            {t("添加风格")}
+          </Button>
+        </div>
+      </div>
+    </Section>
+  );
+}
 
 export default function SettingsView() {
   const providers = useProviderStore((s) => s.providers);
@@ -80,6 +221,9 @@ export default function SettingsView() {
   const setGlass = useAppStore((s) => s.setGlass);
   const mode = useAppStore((s) => s.mode);
   const setMode = useAppStore((s) => s.setMode);
+  const locale = useAppStore((s) => s.locale);
+  const setLocale = useAppStore((s) => s.setLocale);
+  const { t } = useTranslation();
   const prefs = useAppStore((s) => s.prefs);
   const setPrefs = useAppStore((s) => s.setPrefs);
   const [dataDir, setDataDir] = useState("");
@@ -94,6 +238,8 @@ export default function SettingsView() {
   const [section, setSection] = useState<SettingsSection>("providers");
   const reduceTransparency = useAppStore((s) => s.reduceTransparency);
   const setReduceTransparency = useAppStore((s) => s.setReduceTransparency);
+  const canvasInline = useAppStore((s) => s.canvasInline);
+  const setCanvasInline = useAppStore((s) => s.setCanvasInline);
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   useScrollEdge(scrollRef);
@@ -115,7 +261,7 @@ export default function SettingsView() {
     try {
       setDiagPath(await api.exportDiagnostics());
     } catch (e) {
-      toast(`导出诊断包失败：${String(e)}`, "error");
+      toast(t("导出诊断包失败：{{error}}", { error: String(e) }), "error");
     } finally {
       setDiagBusy(false);
     }
@@ -140,11 +286,11 @@ export default function SettingsView() {
       if (!saved) return; // 用户取消保存
       setBackupMsg(
         includeKeys
-          ? "已导出（包含明文 API Key，请勿分享或上传）"
-          : "已导出（不含 API Key）",
+          ? t("已导出（包含明文 API Key，请勿分享或上传）")
+          : t("已导出（不含 API Key）"),
       );
     } catch (e) {
-      setBackupMsg(`导出失败：${String(e)}`);
+      setBackupMsg(t("导出失败：{{error}}", { error: String(e) }));
     }
   };
 
@@ -185,18 +331,18 @@ export default function SettingsView() {
       await refresh();
       await reloadImportedSettings();
       setThinkingKey((k) => k + 1);
-      setBackupMsg("导入成功");
+      setBackupMsg(t("导入成功"));
     } catch (e) {
-      setBackupMsg(`导入失败：${String(e)}`);
+      setBackupMsg(t("导入失败：{{error}}", { error: String(e) }));
     }
   };
 
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-      <PageHeader title="设置" subtitle="服务商、外观与数据" />
+      <PageHeader title={t("设置")} subtitle={t("服务商、外观与数据")} />
       <div className="flex min-h-0 flex-1">
         <nav
-          aria-label="设置分区"
+          aria-label={t("设置分区")}
           className="flex w-44 shrink-0 flex-col gap-0.5 px-3 py-4"
         >
           {SECTIONS.map((item) => (
@@ -212,7 +358,7 @@ export default function SettingsView() {
                   : "text-secondary hover:bg-hover hover:text-primary",
               )}
             >
-              {item.label}
+              {t(item.label)}
             </button>
           ))}
         </nav>
@@ -224,8 +370,8 @@ export default function SettingsView() {
           <div className="mx-auto max-w-settings space-y-6 px-4 py-4 wide:max-w-settings-wide">
             {section === "providers" && (
               <Section
-                title="服务商管理"
-                description="至少添加一个服务商才能开始生成"
+                title={t("服务商管理")}
+                description={t("至少添加一个服务商才能开始生成")}
                 action={
                   <Button
                     size="sm"
@@ -236,14 +382,15 @@ export default function SettingsView() {
                       setDialogOpen(true);
                     }}
                   >
-                    新增服务商
+                    {t("新增服务商")}
                   </Button>
                 }
               >
                 {providers.length === 0 ? (
                   <div className="p-10 text-center text-body text-tertiary">
-                    还没有服务商。点击「新增服务商」，填入地址和 Key
-                    即可开始绘图。
+                    {t(
+                      "还没有服务商。点击「新增服务商」，填入地址和 Key 即可开始绘图。",
+                    )}
                   </div>
                 ) : (
                   providers.map((item) => (
@@ -261,7 +408,10 @@ export default function SettingsView() {
             )}
 
             {section === "appearance" && (
-              <Section title="外观" description="主题、材质与信息密度">
+              <Section
+                title={t("外观")}
+                description={t("主题、材质与信息密度")}
+              >
                 <div className="grid grid-cols-3 gap-2 p-2">
                   {THEME_OPTIONS.map((option) => {
                     const active = theme === option.value;
@@ -279,47 +429,79 @@ export default function SettingsView() {
                         )}
                       >
                         {option.icon}
-                        {option.label}
+                        {t(option.label)}
                       </button>
                     );
                   })}
                 </div>
-                <Row label="玻璃质感" hint="影响侧栏、标题栏与浮层的通透程度">
+                <Row
+                  label={t("玻璃质感")}
+                  hint={t("影响侧栏、标题栏与浮层的通透程度")}
+                >
                   <SegmentedControl
                     value={glass}
                     onValueChange={(v) => setGlass(v as GlassAppearance)}
-                    label="玻璃质感"
+                    label={t("玻璃质感")}
                     size="sm"
-                    options={GLASS_OPTIONS}
+                    options={GLASS_OPTIONS.map((o) => ({
+                      ...o,
+                      label: t(o.label),
+                    }))}
                   />
                 </Row>
                 <div className="px-3 pb-3">
                   <div className="rounded-card bg-grouped p-3">
                     <div className="glass rounded-card px-3 py-2 text-footnote text-secondary shadow-card">
-                      浮层控制预览 · 玻璃只用在内容之上
+                      {t("浮层控制预览 · 玻璃只用在内容之上")}
                     </div>
                   </div>
                 </div>
                 <Row
-                  label="减少透明效果"
-                  hint="关闭玻璃模糊、改用纯色面板，低性能设备更流畅"
+                  label={t("减少透明效果")}
+                  hint={t("关闭玻璃模糊、改用纯色面板，低性能设备更流畅")}
                 >
                   <Switch
                     checked={reduceTransparency}
                     onCheckedChange={toggleTransparency}
-                    label="减少透明效果"
+                    label={t("减少透明效果")}
                   />
                 </Row>
                 <Row
-                  label="界面模式"
-                  hint="简单模式只保留提示词、比例、风格与张数；专家模式显示负向词、队列与自定义尺寸"
+                  label={t("画布内嵌编辑")}
+                  hint={t(
+                    "从画布节点进入的编辑在右侧面板展开；关闭后回到全屏浮层",
+                  )}
+                >
+                  <Switch
+                    checked={canvasInline}
+                    onCheckedChange={setCanvasInline}
+                    label={t("画布内嵌编辑")}
+                  />
+                </Row>
+                <Row label={t("界面语言")} hint={t("切换界面语言，立即生效")}>
+                  <SegmentedControl
+                    value={locale}
+                    onValueChange={(v) => setLocale(v as typeof locale)}
+                    label={t("界面语言")}
+                    size="sm"
+                    options={LOCALE_OPTIONS}
+                  />
+                </Row>
+                <Row
+                  label={t("界面模式")}
+                  hint={t(
+                    "简单模式只保留提示词、比例、风格与张数；专家模式显示负向词、队列与自定义尺寸",
+                  )}
                 >
                   <SegmentedControl
                     value={mode}
                     onValueChange={(v) => setMode(v as "simple" | "expert")}
-                    label="界面模式"
+                    label={t("界面模式")}
                     size="sm"
-                    options={MODE_OPTIONS}
+                    options={MODE_OPTIONS.map((o) => ({
+                      ...o,
+                      label: t(o.label),
+                    }))}
                   />
                 </Row>
               </Section>
@@ -328,28 +510,42 @@ export default function SettingsView() {
             {section === "generation" && (
               <>
                 <Section
-                  title="默认生成参数"
-                  description="决定新对话里的比例、风格与张数"
+                  title={t("默认生成参数")}
+                  description={t("决定新对话里的比例、风格与张数")}
                 >
-                  <Row label="当前参数" hint="以聊天页 Composer 里的设置为准">
+                  <Row
+                    label={t("当前参数")}
+                    hint={t("以聊天页 Composer 里的设置为准")}
+                  >
                     <span className="text-footnote text-tertiary">
-                      {sizeLabel(prefs.width, prefs.height)} · 质量{" "}
-                      {qualityLabel(prefs.quality)} · {prefs.count} 张
+                      {t("{{size}} · 质量 {{quality}} · {{n}} 张", {
+                        size: sizeLabel(prefs.width, prefs.height),
+                        quality: t(
+                          qualityLabel(prefs.quality),
+                          qualityLabel(prefs.quality),
+                        ),
+                        n: prefs.count,
+                      })}
                     </span>
                   </Row>
-                  <Row label="设为默认">
+                  <Row label={t("设为默认")}>
                     <Button
                       size="sm"
                       onClick={() =>
                         api
                           .setSetting("defaultParams", JSON.stringify(prefs))
-                          .then(() => toast("已保存为默认参数"))
+                          .then(() => toast(t("已保存为默认参数")))
                           .catch((e) =>
-                            toast(`保存默认参数失败：${String(e)}`, "error"),
+                            toast(
+                              t("保存默认参数失败：{{error}}", {
+                                error: String(e),
+                              }),
+                              "error",
+                            ),
                           )
                       }
                     >
-                      将当前设为默认
+                      {t("将当前设为默认")}
                     </Button>
                     <Button
                       size="sm"
@@ -358,15 +554,28 @@ export default function SettingsView() {
                         if (!saved) return;
                         try {
                           setPrefs(sanitizePrefs(JSON.parse(saved)));
-                          toast("已恢复默认参数");
+                          toast(t("已恢复默认参数"));
                         } catch {
-                          toast("默认参数损坏，无法恢复", "error");
+                          toast(t("默认参数损坏，无法恢复"), "error");
                         }
                       }}
                     >
-                      恢复默认
+                      {t("恢复默认")}
                     </Button>
                   </Row>
+                </Section>
+                <StylePresetsSection />
+                <Section
+                  title={t("智能蒙版")}
+                  description={t("本地 AI 识别主体，离线运行，不上传图片")}
+                >
+                  <SmartMaskRow />
+                </Section>
+                <Section
+                  title={t("队列")}
+                  description={t("批量生成的启动行为与恢复策略")}
+                >
+                  <QueueAutoResumeRow />
                 </Section>
                 <ThinkingSection key={thinkingKey} />
               </>
@@ -378,18 +587,18 @@ export default function SettingsView() {
               <>
                 <StorageSection dataDir={dataDir} />
                 <Section
-                  title="数据备份"
-                  description="导出后可迁移到另一台设备"
+                  title={t("数据备份")}
+                  description={t("导出后可迁移到另一台设备")}
                 >
-                  <Row label="导出全部配置">
+                  <Row label={t("导出全部配置")}>
                     <Button
                       size="sm"
                       onClick={() => doExport().catch(() => undefined)}
                     >
-                      导出配置
+                      {t("导出配置")}
                     </Button>
                     <Button size="sm" onClick={() => fileRef.current?.click()}>
-                      导入配置
+                      {t("导入配置")}
                     </Button>
                     <input
                       ref={fileRef}
@@ -405,20 +614,20 @@ export default function SettingsView() {
                     />
                   </Row>
                   <Row
-                    label="同时导出 API Key"
-                    hint="明文写入备份文件，仅用于本机迁移"
+                    label={t("同时导出 API Key")}
+                    hint={t("明文写入备份文件，仅用于本机迁移")}
                   >
                     <Switch
                       checked={includeKeys}
                       onCheckedChange={setIncludeKeys}
-                      label="同时导出 API Key"
+                      label={t("同时导出 API Key")}
                     />
                   </Row>
                   {(includeKeys || backupMsg) && (
                     <div className="space-y-1 px-3 pb-3">
                       {includeKeys && (
                         <p className="text-footnote text-danger">
-                          导出文件将包含明文密钥，请勿分享或上传。
+                          {t("导出文件将包含明文密钥，请勿分享或上传。")}
                         </p>
                       )}
                       {backupMsg && (
@@ -434,38 +643,43 @@ export default function SettingsView() {
 
             {section === "diagnostics" && (
               <Section
-                title="诊断日志"
-                description="诊断包包含近 7 天日志、应用版本与系统信息、服务商元信息与设置项；不含图片、提示词与任何 API Key。日志里可能带上游返回的错误信息，分享前请自行确认。"
+                title={t("诊断日志")}
+                description={t(
+                  "诊断包包含近 7 天日志、应用版本与系统信息、服务商元信息与设置项；不含图片、提示词与任何 API Key。日志里可能带上游返回的错误信息，分享前请自行确认。",
+                )}
               >
-                <Row label="日志目录">
+                <Row label={t("日志目录")}>
                   <span className="max-w-xs truncate text-footnote text-tertiary">
                     {logsDir}
                   </span>
                 </Row>
-                <Row label="导出诊断包">
+                <Row label={t("导出诊断包")}>
                   <Button
                     size="sm"
                     loading={diagBusy}
                     onClick={() => doExportDiagnostics().catch(() => undefined)}
                   >
-                    导出诊断包
+                    {t("导出诊断包")}
                   </Button>
                   {diagPath && (
                     <Button
                       size="sm"
                       onClick={() =>
                         revealItemInDir(diagPath).catch((e) =>
-                          toast(`打开目录失败：${String(e)}`, "error"),
+                          toast(
+                            t("打开目录失败：{{error}}", { error: String(e) }),
+                            "error",
+                          ),
                         )
                       }
                     >
-                      打开所在目录
+                      {t("打开所在目录")}
                     </Button>
                   )}
                 </Row>
                 {diagPath && (
                   <div className="px-4 pb-3 text-footnote text-tertiary">
-                    已导出：{diagPath}
+                    {t("已导出：{{path}}", { path: diagPath })}
                   </div>
                 )}
               </Section>
@@ -477,9 +691,9 @@ export default function SettingsView() {
               SHORTCUT_GROUPS.map((group) => (
                 <Section
                   key={group}
-                  title={group}
+                  title={t(group)}
                   description={
-                    group === "全局" ? "在任何页面都可用" : undefined
+                    group === "全局" ? t("在任何页面都可用") : undefined
                   }
                 >
                   {SHORTCUTS.filter((s) => s.group === group).map((s) => (
@@ -487,7 +701,7 @@ export default function SettingsView() {
                       key={s.keys}
                       label={
                         <span className="text-callout text-secondary">
-                          {s.label}
+                          {t(s.label, s.label)}
                         </span>
                       }
                     >

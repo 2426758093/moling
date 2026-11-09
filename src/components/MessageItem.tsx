@@ -1,4 +1,5 @@
 import { memo, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { motion, AnimatePresence } from "framer-motion";
 import { DisplayMessage, useChatStore } from "../stores/chatStore";
 import { adapterErrorTitle } from "../lib/api";
@@ -13,6 +14,7 @@ import { IconAlert, IconBrain, IconChevron, IconCopy, IconEdit } from "./Icons";
 /// 思考卡是内容层：标准材质（不透明底 + 描边），不加模糊。
 /// 折叠态压到 28px —— 它是附属信息，不该抢走生成结果的注意力。
 function ThinkingCard({ message }: { message: DisplayMessage }) {
+  const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   if (!message.thinkingUsed || !message.refined) return null;
   return (
@@ -25,7 +27,7 @@ function ThinkingCard({ message }: { message: DisplayMessage }) {
         <span className="text-accent">
           <IconBrain size={14} />
         </span>
-        <span>思考模型已优化提示词</span>
+        <span>{t("思考模型已优化提示词")}</span>
         <motion.span
           animate={{ rotate: open ? 90 : 0 }}
           transition={{ duration: DUR.quick, ease: EASE.ios }}
@@ -44,13 +46,13 @@ function ThinkingCard({ message }: { message: DisplayMessage }) {
           >
             <div className="space-y-1.5 border-t border-separator px-3.5 py-3">
               <div className="text-footnote font-medium text-tertiary">
-                你的描述
+                {t("你的描述")}
               </div>
               <div className="text-subhead leading-relaxed text-secondary">
                 {message.content}
               </div>
               <div className="pt-1 text-footnote font-medium text-tertiary">
-                优化后的提示词
+                {t("优化后的提示词")}
               </div>
               <div className="text-subhead leading-relaxed text-primary">
                 {message.refined}
@@ -83,6 +85,7 @@ export default memo(function MessageItem({
 }: {
   message: DisplayMessage;
 }) {
+  const { t } = useTranslation();
   const isUser = message.role === "user";
   const sending = useChatStore((s) => s.sending);
   const retryLast = useChatStore((s) => s.retryLast);
@@ -123,18 +126,18 @@ export default memo(function MessageItem({
               <div className="flex shrink-0 items-center gap-0.5 pt-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
                 <IconButton
                   size="sm"
-                  label="复制提示词"
+                  label={t("复制提示词")}
                   icon={<IconCopy size={14} />}
                   onClick={() => {
                     void navigator.clipboard
                       .writeText(message.content)
-                      .then(() => toast("已复制提示词"))
-                      .catch(() => toast("复制失败", "error"));
+                      .then(() => toast(t("已复制提示词")))
+                      .catch(() => toast(t("复制失败"), "error"));
                   }}
                 />
                 <IconButton
                   size="sm"
-                  label="编辑提示词"
+                  label={t("编辑提示词")}
                   icon={<IconEdit size={14} />}
                   onClick={() => setDraftPrompt(message.content)}
                 />
@@ -152,12 +155,20 @@ export default memo(function MessageItem({
                   <span className="thinking-dot h-1.5 w-1.5 rounded-pill bg-accent" />
                 </span>
                 {message.progress
-                  ? `正在绘制 · ${message.progress.done}/${message.progress.total}`
-                  : `正在绘制 · 剩余 ${message.pendingImages} 张`}
+                  ? t("正在绘制 · {{done}}/{{total}}", {
+                      done: message.progress.done,
+                      total: message.progress.total,
+                    })
+                  : t("正在绘制 · 剩余 {{n}} 张", {
+                      n: message.pendingImages,
+                    })}
               </div>
             )}
+            {/* 单图不在聊天区铺满整列，限制展示尺寸；查看原图仍走大图预览 */}
             <div
-              className={`grid gap-3 ${multi ? "grid-cols-2" : "grid-cols-1"}`}
+              className={`grid gap-3 ${
+                multi ? "grid-cols-2" : "max-w-[min(420px,100%)] grid-cols-1"
+              }`}
             >
               {message.images.map((img) => (
                 <ImageCard
@@ -169,19 +180,19 @@ export default memo(function MessageItem({
                 />
               ))}
               {Array.from({ length: pendingCount }).map((_, i) => (
-                <PendingCard key={`pending-${i}`} label="绘制中" />
+                <PendingCard key={`pending-${i}`} label={t("绘制中")} />
               ))}
             </div>
             {message.status === "stopped" && message.images.length === 0 && (
               <div className="mt-2.5 flex items-center justify-between gap-3 text-footnote text-tertiary">
-                <span>已停止生成</span>
+                <span>{t("已停止生成")}</span>
                 <Button
                   size="sm"
                   variant="secondary"
                   onClick={() => void retryLast(message.id)}
                   disabled={sending}
                 >
-                  重试
+                  {t("重试")}
                 </Button>
               </div>
             )}
@@ -209,7 +220,7 @@ export default memo(function MessageItem({
                   onClick={() => void retryLast(message.id)}
                   disabled={sending}
                 >
-                  重试
+                  {t("重试")}
                 </Button>
               </motion.div>
             )}

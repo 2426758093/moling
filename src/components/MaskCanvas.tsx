@@ -1,4 +1,5 @@
 import { useEffect, useImperativeHandle, useRef } from "react";
+import { useTranslation } from "react-i18next";
 
 export interface MaskCanvasHandle {
   clear: () => void;
@@ -8,6 +9,11 @@ export interface MaskCanvasHandle {
   /** 黑底 + 白笔画：本地合成用的「白 = 替换」口径 */
   toLumaPng: () => string | null;
   hasStrokes: () => boolean;
+  /** 把灰度蒙版（255 = 选中）写入画布：replace 覆盖 / add 叠加 / subtract 减去 */
+  applyMask: (
+    dataUrl: string,
+    mode: "replace" | "add" | "subtract",
+  ) => Promise<void>;
 }
 
 interface MaskCanvasProps {
@@ -15,6 +21,12 @@ interface MaskCanvasProps {
   brushSize: number;
   eraser: boolean;
   className?: string;
+  /** 点选模式：有值时不再画笔，而是把原图坐标交给调用方 */
+  onPick?: (
+    x: number,
+    y: number,
+    mods: { shift: boolean; alt: boolean },
+  ) => void;
   ref?: React.Ref<MaskCanvasHandle>;
 }
 
@@ -25,8 +37,10 @@ export default function MaskCanvas({
   brushSize,
   eraser,
   className,
+  onPick,
   ref,
 }: MaskCanvasProps) {
+  const { t } = useTranslation();
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -134,6 +148,53 @@ export default function MaskCanvas({
       }
       return false;
     },
+    applyMask: (dataUrl, mode) =>
+      new Promise((resolve, reject) => {
+        const canvas = canvasRef.current;
+        const ctx = canvas?.getContext("2d");
+        if (!canvas || !ctx) {
+          resolve();
+          return;
+        }
+        const img = new Image();
+        img.onload = () => {
+          const off = document.createElement("canvas");
+          off.width = canvas.width;
+          off.height = canvas.height;
+          const octx = off.getContext("2d");
+          if (!octx) {
+            resolve();
+            return;
+          }
+          octx.drawImage(img, 0, 0, off.width, off.height);
+          const src = octx.getImageData(0, 0, off.width, off.height);
+          let any = false;
+          for (let i = 0; i < src.data.length; i += 4) {
+            // 灰度蒙版：R 通道即选中强度；小于 8 视为噪点，避免整张蒙版变灰
+            const v = src.data[i] < 8 ? 0 : src.data[i];
+            src.data[i] = 255;
+            src.data[i + 1] = 56;
+            src.data[i + 2] = 60;
+            src.data[i + 3] = v;
+            if (v > 0) any = true;
+          }
+          if (!any) {
+            resolve();
+            return;
+          }
+          octx.putImageData(src, 0, 0);
+          if (mode === "replace") {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+          }
+          ctx.globalCompositeOperation =
+            mode === "subtract" ? "destination-out" : "source-over";
+          ctx.drawImage(off, 0, 0);
+          ctx.globalCompositeOperation = "source-over";
+          resolve();
+        };
+        img.onerror = () => reject(new Error(t("蒙版图片加载失败")));
+        img.src = dataUrl;
+      }),
   }));
 
   return (
@@ -142,6 +203,11 @@ export default function MaskCanvas({
       className={className}
       style={{ touchAction: "none" }}
       onPointerDown={(e) => {
+        if (onPick) {
+          const { x, y } = toNatural(e);
+          onPick(x, y, { shift: e.shiftKey, alt: e.altKey });
+          return;
+        }
         e.currentTarget.setPointerCapture(e.pointerId);
         const ctx = canvasRef.current?.getContext("2d");
         if (ctx) {
@@ -158,7 +224,7 @@ export default function MaskCanvas({
         paintAt(e, false);
       }}
       onPointerMove={(e) => {
-        if (e.buttons === 1) paintAt(e, true);
+        if (!onPick && e.buttons === 1) paintAt(e, true);
       }}
       onPointerUp={() => {
         canvasRef.current?.getContext("2d")?.beginPath();

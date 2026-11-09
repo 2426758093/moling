@@ -7,6 +7,7 @@ import {
   RATIO_OPTIONS,
 } from "../lib/types";
 import { api } from "../lib/api";
+import i18n, { applyLocale, Locale, readLocaleMirror } from "../i18n";
 import { toast } from "../lib/notify";
 import {
   applyReduceTransparency,
@@ -29,17 +30,22 @@ export interface GenPrefs {
   negativePrompt: string;
 }
 
+/** 编辑入口来源；canvas = 从画布节点打开，结果回写画布 */
+export type EditHost = "canvas";
+
 export interface EditTarget {
   historyId: number;
   dataUrl: string;
   prompt: string;
   mode: "inpaint" | "erase";
+  host?: EditHost;
 }
 
 export interface OutpaintTarget {
   historyId: number;
   dataUrl: string;
   prompt: string;
+  host?: EditHost;
 }
 
 /** upscale = 高清放大；style = 风格转换 */
@@ -50,6 +56,7 @@ export interface BasicEditTarget {
   historyId: number;
   dataUrl: string;
   prompt: string;
+  host?: EditHost;
 }
 
 /** 换背景：蒙版 + 纯色 / 渐变 / AI 描述 */
@@ -57,6 +64,7 @@ export interface BackgroundTarget {
   historyId: number;
   dataUrl: string;
   prompt: string;
+  host?: EditHost;
 }
 
 export interface TransformTarget {
@@ -64,6 +72,7 @@ export interface TransformTarget {
   historyId: number;
   dataUrl: string;
   prompt: string;
+  host?: EditHost;
 }
 
 interface AppState {
@@ -72,9 +81,12 @@ interface AppState {
   glass: GlassAppearance;
   reduceTransparency: boolean;
   mode: UiMode;
+  locale: Locale;
   sidebarCollapsed: boolean;
   paletteOpen: boolean;
   shortcutsOpen: boolean;
+  /** 画布节点触发的编辑是否以内嵌面板显示；关闭则回到全屏浮层 */
+  canvasInline: boolean;
   prefs: GenPrefs;
   editTarget: EditTarget | null;
   outpaintTarget: OutpaintTarget | null;
@@ -86,9 +98,11 @@ interface AppState {
   setGlass: (glass: GlassAppearance) => void;
   setReduceTransparency: (on: boolean) => void;
   setMode: (mode: UiMode) => void;
+  setLocale: (locale: Locale) => void;
   toggleSidebar: () => void;
   setPaletteOpen: (open: boolean) => void;
   setShortcutsOpen: (open: boolean) => void;
+  setCanvasInline: (on: boolean) => void;
   setPrefs: (patch: Partial<GenPrefs>) => void;
   applyRatio: (ratioId: string) => void;
   applyCustomSize: (width: number, height: number) => void;
@@ -169,15 +183,28 @@ export function sanitizePrefs(raw: unknown): Partial<GenPrefs> {
   return out;
 }
 
+const CANVAS_INLINE_KEY = "moling.canvasInline";
+
+/// 纯显示偏好，与 reduceTransparency 一样只落 localStorage，不进 Rust 白名单
+function readCanvasInline(): boolean {
+  try {
+    return localStorage.getItem(CANVAS_INLINE_KEY) !== "off";
+  } catch {
+    return true;
+  }
+}
+
 export const useAppStore = create<AppState>((set) => ({
   view: "chat",
   theme: "system",
   glass: "standard",
   reduceTransparency: readAppearanceMirror().transparency ?? false,
   mode: "expert",
+  locale: readLocaleMirror(),
   sidebarCollapsed: false,
   paletteOpen: false,
   shortcutsOpen: false,
+  canvasInline: readCanvasInline(),
   prefs: { ...DEFAULT_PREFS },
   editTarget: null,
   outpaintTarget: null,
@@ -192,14 +219,21 @@ export const useAppStore = create<AppState>((set) => ({
     // 主题是纯本机偏好：先切 UI 再落库，写失败只提示不阻断（下次启动回退 system）
     void api
       .setSetting("theme", theme)
-      .catch((e) => toast(`保存主题失败：${String(e)}`, "error"));
+      .catch((e) =>
+        toast(i18n.t("保存主题失败：{{error}}", { error: String(e) }), "error"),
+      );
   },
   setGlass: (glass) => {
     set({ glass });
     writeGlassMirror(glass);
     void api
       .setSetting("glassAppearance", glass)
-      .catch((e) => toast(`保存玻璃质感失败：${String(e)}`, "error"));
+      .catch((e) =>
+        toast(
+          i18n.t("保存玻璃质感失败：{{error}}", { error: String(e) }),
+          "error",
+        ),
+      );
   },
   setReduceTransparency: (on) => {
     // 只落 localStorage —— 纯显示偏好，不进 Rust 设置白名单
@@ -211,11 +245,37 @@ export const useAppStore = create<AppState>((set) => ({
     set({ mode });
     void api
       .setSetting("uiMode", mode)
-      .catch((e) => toast(`保存界面模式失败：${String(e)}`, "error"));
+      .catch((e) =>
+        toast(
+          i18n.t("保存界面模式失败：{{error}}", { error: String(e) }),
+          "error",
+        ),
+      );
+  },
+  setLocale: (locale) => {
+    // 语言是纯本机偏好：先切 UI 再落库，写失败只提示不阻断
+    set({ locale });
+    applyLocale(locale);
+    void api
+      .setSetting("locale", locale)
+      .catch((e) =>
+        toast(
+          i18n.t("保存语言设置失败：{{error}}", { error: String(e) }),
+          "error",
+        ),
+      );
   },
   toggleSidebar: () => set((s) => ({ sidebarCollapsed: !s.sidebarCollapsed })),
   setPaletteOpen: (paletteOpen) => set({ paletteOpen }),
   setShortcutsOpen: (shortcutsOpen) => set({ shortcutsOpen }),
+  setCanvasInline: (canvasInline) => {
+    set({ canvasInline });
+    try {
+      localStorage.setItem(CANVAS_INLINE_KEY, canvasInline ? "on" : "off");
+    } catch {
+      // 隐私模式等写不了 localStorage 时只在本次会话生效
+    }
+  },
   setPrefs: (patch) => set((s) => ({ prefs: { ...s.prefs, ...patch } })),
   applyRatio: (ratioId) =>
     set((s) => {
@@ -241,14 +301,50 @@ export const useAppStore = create<AppState>((set) => ({
     set((s) => ({
       prefs: { ...s.prefs, ratio: "custom", ...snapSize(width, height) },
     })),
-  openEditor: (target) => set({ editTarget: target }),
+  // 同一时刻只允许一个编辑实例：打开任一入口都先关掉其余四个
+  openEditor: (editTarget) =>
+    set({
+      editTarget,
+      outpaintTarget: null,
+      transformTarget: null,
+      basicEditTarget: null,
+      backgroundTarget: null,
+    }),
   closeEditor: () => set({ editTarget: null }),
-  openOutpaint: (target) => set({ outpaintTarget: target }),
+  openOutpaint: (outpaintTarget) =>
+    set({
+      outpaintTarget,
+      editTarget: null,
+      transformTarget: null,
+      basicEditTarget: null,
+      backgroundTarget: null,
+    }),
   closeOutpaint: () => set({ outpaintTarget: null }),
-  openTransform: (target) => set({ transformTarget: target }),
+  openTransform: (transformTarget) =>
+    set({
+      transformTarget,
+      editTarget: null,
+      outpaintTarget: null,
+      basicEditTarget: null,
+      backgroundTarget: null,
+    }),
   closeTransform: () => set({ transformTarget: null }),
-  openBasicEdit: (target) => set({ basicEditTarget: target }),
+  openBasicEdit: (basicEditTarget) =>
+    set({
+      basicEditTarget,
+      editTarget: null,
+      outpaintTarget: null,
+      transformTarget: null,
+      backgroundTarget: null,
+    }),
   closeBasicEdit: () => set({ basicEditTarget: null }),
-  openBackground: (target) => set({ backgroundTarget: target }),
+  openBackground: (backgroundTarget) =>
+    set({
+      backgroundTarget,
+      editTarget: null,
+      outpaintTarget: null,
+      transformTarget: null,
+      basicEditTarget: null,
+    }),
   closeBackground: () => set({ backgroundTarget: null }),
 }));

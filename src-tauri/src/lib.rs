@@ -11,6 +11,7 @@ mod media_gate;
 mod paths;
 mod redact;
 mod reference;
+mod segment;
 mod storage;
 
 use tauri::Manager;
@@ -95,6 +96,8 @@ pub fn run() {
             adapters::http::init_from_storage();
             // 响应体读取超时同样来自设置，启动即生效
             adapters::init_body_timeouts();
+            // 智能蒙版只登记资源路径，首次分割才加载 dll / 模型
+            commands::segment::init_assets(app.handle());
             // 队列：上次残留的 running 一律标 interrupted（不自动重跑），
             // 且默认暂停，等用户点「开始队列」后才执行。
             match storage::mark_running_interrupted() {
@@ -168,11 +171,15 @@ pub fn run() {
             commands::list_jobs,
             commands::cancel_queue_job,
             commands::retry_queue_job,
+            commands::requeue_interrupted_jobs,
             commands::resume_queue,
             commands::clear_finished_jobs,
             commands::save_reference_image,
             commands::read_reference_image,
             commands::get_thinking_config,
+            commands::segment_subject,
+            commands::segment_at_point,
+            commands::segment_model_status,
             commands::save_thinking_config,
             commands::test_thinking_connection,
             commands::refine_prompt,
@@ -190,6 +197,8 @@ pub fn run() {
             commands::save_chat_image,
             commands::get_prompt_templates,
             commands::save_prompt_templates,
+            commands::get_style_presets,
+            commands::save_style_presets,
             commands::reverse_prompt,
             commands::list_favorites,
             commands::upsert_favorite,

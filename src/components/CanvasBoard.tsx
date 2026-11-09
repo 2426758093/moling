@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { api } from "../lib/api";
 import { toast } from "../lib/notify";
 import { useAppStore } from "../stores/appStore";
@@ -31,6 +32,7 @@ export default function CanvasBoard({
   onWireModeChange: (on: boolean) => void;
   onAddImage: () => void;
 }) {
+  const { t } = useTranslation();
   const nodes = useCanvasStore((s) => s.nodes);
   const edges = useCanvasStore((s) => s.edges);
   const viewport = useCanvasStore((s) => s.viewport);
@@ -196,18 +198,21 @@ export default function CanvasBoard({
     removeEdge,
   ]);
 
-  const importPasted = useCallback(async (dataUrl: string) => {
-    try {
-      const { historyId } = await api.importImage(dataUrl);
-      const id = await useCanvasStore.getState().addHistoryNode(historyId);
-      if (id) {
-        setSelectedNode(id);
-        toast("已粘贴图片到画布");
+  const importPasted = useCallback(
+    async (dataUrl: string) => {
+      try {
+        const { historyId } = await api.importImage(dataUrl);
+        const id = await useCanvasStore.getState().addHistoryNode(historyId);
+        if (id) {
+          setSelectedNode(id);
+          toast(t("已粘贴图片到画布"));
+        }
+      } catch {
+        toast(t("粘贴失败：图片无法读取"), "error");
       }
-    } catch {
-      toast("粘贴失败：图片无法读取", "error");
-    }
-  }, []);
+    },
+    [t],
+  );
 
   // 粘贴剪贴板图片：先入库拿到 historyId，再落到当前视口左上角
   useEffect(() => {
@@ -257,9 +262,9 @@ export default function CanvasBoard({
         await importPasted(dataUrl);
         return;
       }
-      toast("剪贴板里没有图片", "error");
+      toast(t("剪贴板里没有图片"), "error");
     } catch {
-      toast("无法读取剪贴板，可先复制图片再按 Ctrl V", "error");
+      toast(t("无法读取剪贴板，可先复制图片再按 Ctrl V"), "error");
     }
   };
 
@@ -328,13 +333,13 @@ export default function CanvasBoard({
     <div
       ref={containerRef}
       role="application"
-      aria-label="画布：拖动空白处平移，滚轮缩放"
+      aria-label={t("画布：拖动空白处平移，滚轮缩放")}
       onPointerDown={pointerDown}
       onPointerMove={pointerMove}
       onPointerUp={pointerUp}
       onPointerCancel={pointerUp}
       className={cn(
-        "relative min-h-0 flex-1 touch-none overflow-hidden bg-sunken",
+        "relative min-h-0 min-w-0 flex-1 touch-none overflow-hidden bg-sunken",
         panning ? "cursor-grabbing" : "cursor-grab",
       )}
       style={{
@@ -419,9 +424,11 @@ export default function CanvasBoard({
             <IconCanvas size={22} strokeWidth={1.4} />
           </span>
           <div>
-            <div className="text-title3 text-primary">画布还是空的</div>
+            <div className="text-title3 text-primary">{t("画布还是空的")}</div>
             <p className="mt-1 max-w-72 text-footnote text-quaternary">
-              从画廊挑几张作品放进来，拖动排布、滚轮缩放，再从节点进入编辑。
+              {t(
+                "从画廊挑几张作品放进来，拖动排布、滚轮缩放，再从节点进入编辑。",
+              )}
             </p>
           </div>
           <div
@@ -434,14 +441,14 @@ export default function CanvasBoard({
               icon={<IconPlus size={14} />}
               onClick={onAddImage}
             >
-              添加图片
+              {t("添加图片")}
             </Button>
             <Button
               size="sm"
               icon={<IconImage size={14} />}
               onClick={() => void pasteFromClipboard()}
             >
-              粘贴图片
+              {t("粘贴图片")}
             </Button>
             <Button
               size="sm"
@@ -449,7 +456,7 @@ export default function CanvasBoard({
               icon={<IconGrid size={14} />}
               onClick={() => useAppStore.getState().setView("gallery")}
             >
-              去画廊
+              {t("去画廊")}
             </Button>
           </div>
         </div>
@@ -458,14 +465,14 @@ export default function CanvasBoard({
       {wireMode && (
         <div className="glass pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-pill px-3 py-1 text-footnote text-secondary">
           {wireSource == null
-            ? "点击起点节点，再点击终点连线 · Esc 退出"
-            : "再点击一个节点完成连线 · Esc 取消"}
+            ? t("点击起点节点，再点击终点连线 · Esc 退出")
+            : t("再点击一个节点完成连线 · Esc 取消")}
         </div>
       )}
 
       {selectedEdge && (
         <div className="glass pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-pill px-3 py-1 text-footnote text-secondary">
-          已选中连线 · 按 Delete 删除
+          {t("已选中连线 · 按 Delete 删除")}
         </div>
       )}
 
@@ -484,7 +491,7 @@ export default function CanvasBoard({
                 : "bg-elevated text-primary shadow-card"
             }`}
           >
-            浏览
+            {t("浏览")}
           </button>
           <button
             type="button"
@@ -497,12 +504,12 @@ export default function CanvasBoard({
                 : "text-secondary hover:bg-hover"
             }`}
           >
-            连线
+            {t("连线")}
           </button>
         </div>
         <span className="mx-0.5 h-4 w-px bg-separator" />
         <IconButton
-          label="缩小"
+          label={t("缩小")}
           size="sm"
           tooltip={false}
           icon={<IconMinus size={14} />}
@@ -510,13 +517,15 @@ export default function CanvasBoard({
           onClick={() => zoomBy(1 / ZOOM_STEP)}
         />
         <span
-          aria-label={`缩放 ${Math.round(viewport.zoom * 100)}%`}
+          aria-label={t("缩放 {{percent}}%", {
+            percent: Math.round(viewport.zoom * 100),
+          })}
           className="tabular min-w-12 text-center text-footnote text-secondary"
         >
           {Math.round(viewport.zoom * 100)}%
         </span>
         <IconButton
-          label="放大"
+          label={t("放大")}
           size="sm"
           tooltip={false}
           icon={<IconPlus size={14} />}
@@ -529,7 +538,7 @@ export default function CanvasBoard({
           className="h-7 px-2 text-footnote"
           onClick={fit}
         >
-          适应
+          {t("适应")}
         </Button>
       </div>
     </div>

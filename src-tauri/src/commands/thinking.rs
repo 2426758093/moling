@@ -20,6 +20,9 @@ pub struct ThinkingConfig {
     /// 输入框提示词优化助手
     #[serde(default = "default_true")]
     pub optimize_enabled: bool,
+    /// 输入框失焦时自动把中文提示词翻译为英文
+    #[serde(default)]
+    pub auto_translate_on_blur: bool,
 }
 
 fn default_true() -> bool {
@@ -61,6 +64,7 @@ fn read_thinking_config() -> Result<(ThinkingConfig, String), String> {
             key_error,
             title_enabled: value["titleEnabled"].as_bool().unwrap_or(true),
             optimize_enabled: value["optimizeEnabled"].as_bool().unwrap_or(true),
+            auto_translate_on_blur: value["autoTranslateOnBlur"].as_bool().unwrap_or(false),
         },
         api_key_enc,
     ))
@@ -83,6 +87,7 @@ pub(crate) fn backup_value() -> serde_json::Value {
             "model": cfg.model,
             "titleEnabled": cfg.title_enabled,
             "optimizeEnabled": cfg.optimize_enabled,
+            "autoTranslateOnBlur": cfg.auto_translate_on_blur,
         }),
         Err(e) => {
             tracing::warn!("导出：思考模型配置读取失败，按未配置导出: {}", e);
@@ -94,6 +99,7 @@ pub(crate) fn backup_value() -> serde_json::Value {
                 "model": "",
                 "titleEnabled": true,
                 "optimizeEnabled": true,
+                "autoTranslateOnBlur": false,
             })
         }
     }
@@ -118,6 +124,7 @@ pub async fn save_thinking_config(
         "model": config.model,
         "titleEnabled": config.title_enabled,
         "optimizeEnabled": config.optimize_enabled,
+        "autoTranslateOnBlur": config.auto_translate_on_blur,
     });
     storage::set_setting(THINKING_CONFIG_KEY, &value.to_string())?;
     // 脱敏后返回
@@ -442,6 +449,19 @@ mod tests {
         assert!(!contains_cjk("MoLing 0.8.0"));
         // 假名与全角标点不算汉字，避免把日文误判为中文输入
         assert!(!contains_cjk("こんにちは、"));
+    }
+
+    /// 失焦自动翻译默认关闭：老配置文件没有该字段时不能悄悄产生翻译请求
+    #[test]
+    fn auto_translate_defaults_off() {
+        let cfg: ThinkingConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "mode": "reuse",
+            "baseUrl": "",
+            "model": "gpt-4o-mini",
+        }))
+        .expect("旧配置应能反序列化");
+        assert!(!cfg.auto_translate_on_blur);
     }
 
     /// F-005：思考返回空白文本时不得 used:true（否则前端会用空串覆盖正文）

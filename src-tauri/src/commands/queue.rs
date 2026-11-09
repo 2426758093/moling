@@ -441,11 +441,25 @@ async fn run_job(app: &tauri::AppHandle, job: &JobRow) -> Result<(), String> {
                         extras.quota_retries,
                         MAX_QUOTA_RETRIES
                     );
+                    // 退避期间任务仍是 running：单独广播结束时间，界面显示倒计时
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    let expires_at = now_ms.saturating_add((wait as i64) * 1000);
+                    let _ = app.emit(
+                        "queue:backoff",
+                        serde_json::json!({ "id": job.id, "expiresAt": expires_at }),
+                    );
                     tokio::time::sleep(
                         std::time::Duration::from_secs(wait)
                             + std::time::Duration::from_millis(jitter),
                     )
                     .await;
+                    let _ = app.emit(
+                        "queue:backoff",
+                        serde_json::json!({ "id": job.id, "expiresAt": 0 }),
+                    );
                     if is_cancelled(&token) {
                         finish_or_force(job.id, "canceled", "[]", None)?;
                     } else {
@@ -599,6 +613,19 @@ pub async fn retry_queue_job(
         state.wake();
     }
     Ok(())
+}
+
+/// 用户显式恢复全部中断任务，并顺手启动队列（点击即视为同意继续计费）
+#[tauri::command]
+pub async fn requeue_interrupted_jobs(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, SharedQueue>,
+) -> Result<usize, String> {
+    let count = storage::requeue_interrupted_jobs().map_err(|e| e.to_string())?;
+    let _ = app.emit("queue:counts", counts_json());
+    state.paused.store(false, Ordering::SeqCst);
+    state.wake();
+    Ok(count)
 }
 
 /// 开始队列（启动后默认暂停，必须显式调用一次）

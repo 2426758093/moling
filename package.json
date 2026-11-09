@@ -1,7 +1,7 @@
 {
   "name": "moling",
   "private": true,
-  "version": "1.2.7",
+  "version": "1.6.0",
   "type": "module",
   "packageManager": "pnpm@11.23.0",
   "engines": {
@@ -22,6 +22,7 @@
     "release:config": "node scripts/release-config.mjs",
     "release:build": "pnpm release:config && pnpm tauri build --config src-tauri/tauri.release.conf.json",
     "release:manifest": "node scripts/make-latest-json.mjs",
+    "updater:serve": "node scripts/updater-test-server.mjs",
     "gh:push": "node scripts/gh.mjs push",
     "gh:release": "node scripts/gh.mjs release",
     "gh:status": "node scripts/gh.mjs status"
@@ -42,9 +43,11 @@
     "@tauri-apps/plugin-dialog": "^2.8.4",
     "@tauri-apps/plugin-opener": "^2.7.0",
     "framer-motion": "^14.0.0",
+    "i18next": "^27.0.1",
     "jszip": "^3.10.2",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
+    "react-i18next": "^18.0.0",
     "tailwindcss": "^4.3.3",
     "zustand": "^5.0.15"
   },

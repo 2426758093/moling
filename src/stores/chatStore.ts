@@ -8,6 +8,7 @@ import {
   ImageProgress,
   parseAdapterError,
 } from "../lib/api";
+import i18n from "../i18n";
 import { toast } from "../lib/notify";
 import { currentModelCaps, maxReferenceImages } from "../lib/useModelCaps";
 import { DEFAULT_REFERENCE_STRENGTH, ReferenceRole } from "../lib/types";
@@ -274,7 +275,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           status: "error",
           error: {
             type: "other",
-            message: "请先在「设置」中配置绘图服务商与模型",
+            message: i18n.t("请先在「设置」中配置绘图服务商与模型"),
           },
           pendingImages: 0,
         });
@@ -408,7 +409,12 @@ export const useChatStore = create<ChatState>((set, get) => {
         !genError &&
         images.length < count
       ) {
-        toast(`服务商仅返回 ${images.length} 张（请求 ${count} 张）`);
+        toast(
+          i18n.t("服务商仅返回 {{done}} 张（请求 {{total}} 张）", {
+            done: images.length,
+            total: count,
+          }),
+        );
       }
 
       // 3. 停止/取消语义：已生成的图片保留并照常持久化，assistant 消息标记 stopped
@@ -488,7 +494,12 @@ export const useChatStore = create<ChatState>((set, get) => {
           attachments: [],
         });
       } catch (e) {
-        toast(`新建会话失败：${parseAdapterError(String(e)).message}`, "error");
+        toast(
+          i18n.t("新建会话失败：{{error}}", {
+            error: parseAdapterError(String(e)).message,
+          }),
+          "error",
+        );
       }
     },
 
@@ -518,7 +529,9 @@ export const useChatStore = create<ChatState>((set, get) => {
       } catch (e) {
         if (convSeq === myConvSeq) {
           toast(
-            `加载消息失败：${parseAdapterError(String(e)).message}`,
+            i18n.t("加载消息失败：{{error}}", {
+              error: parseAdapterError(String(e)).message,
+            }),
             "error",
           );
         }
@@ -550,7 +563,9 @@ export const useChatStore = create<ChatState>((set, get) => {
         });
       } catch (e) {
         toast(
-          `加载更早消息失败：${parseAdapterError(String(e)).message}`,
+          i18n.t("加载更早消息失败：{{error}}", {
+            error: parseAdapterError(String(e)).message,
+          }),
           "error",
         );
       } finally {
@@ -575,7 +590,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     addAttachment: (att) => {
       const limit = maxReferenceImages();
       if (get().attachments.length >= limit) {
-        toast(`最多添加 ${limit} 张参考图`, "error");
+        toast(i18n.t("最多添加 {{n}} 张参考图", { n: limit }), "error");
         return false;
       }
       set((s) => ({ attachments: [...s.attachments, att] }));
@@ -622,7 +637,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       );
       const model = provider?.provider.defaultModel;
       if (!provider || defaultProviderId == null || !model) {
-        toast("请先在「设置」中配置绘图服务商与模型", "error");
+        toast(i18n.t("请先在「设置」中配置绘图服务商与模型"), "error");
         return false;
       }
 
@@ -644,7 +659,9 @@ export const useChatStore = create<ChatState>((set, get) => {
             );
           } catch (e) {
             toast(
-              `创建会话失败：${parseAdapterError(String(e)).message}`,
+              i18n.t("创建会话失败：{{error}}", {
+                error: parseAdapterError(String(e)).message,
+              }),
               "error",
             );
             return false;
@@ -676,7 +693,9 @@ export const useChatStore = create<ChatState>((set, get) => {
           );
         } catch (e) {
           toast(
-            `参考图保存失败，已中止发送：${parseAdapterError(String(e)).message}`,
+            i18n.t("参考图保存失败，已中止发送：{{error}}", {
+              error: parseAdapterError(String(e)).message,
+            }),
             "error",
           );
           return false;
@@ -704,7 +723,12 @@ export const useChatStore = create<ChatState>((set, get) => {
             createdAt: nowTimestamp(),
           });
         } catch (e) {
-          toast(`发送失败：${parseAdapterError(String(e)).message}`, "error");
+          toast(
+            i18n.t("发送失败：{{error}}", {
+              error: parseAdapterError(String(e)).message,
+            }),
+            "error",
+          );
           return false;
         }
         if (!isMine()) return false;
@@ -773,7 +797,12 @@ export const useChatStore = create<ChatState>((set, get) => {
       } catch (e) {
         // 兜底：任何未预期异常都要提示并复位 sending，不能让异常把锁死在 true
         if (isMine()) {
-          toast(`发送失败：${parseAdapterError(String(e)).message}`, "error");
+          toast(
+            i18n.t("发送失败：{{error}}", {
+              error: parseAdapterError(String(e)).message,
+            }),
+            "error",
+          );
         }
         return committed;
       } finally {
@@ -825,12 +854,12 @@ export const useChatStore = create<ChatState>((set, get) => {
       const target = msgs[targetIdx];
       if (target.role !== "assistant") return;
       if (msgs.slice(targetIdx + 1).some((m) => m.role === "user")) {
-        toast("仅能重试最新一轮对话", "error");
+        toast(i18n.t("仅能重试最新一轮对话"), "error");
         return;
       }
       // 只允许重试最后一条回复：新占位会追加到列表末尾，否则时间线错乱
       if (targetIdx !== msgs.length - 1) {
-        toast("仅能重试最新一条回复", "error");
+        toast(i18n.t("仅能重试最新一条回复"), "error");
         return;
       }
       // 从目标向前定位它对应的 user 消息（assistant 消息与 user 消息之间没有持久外键）
@@ -845,7 +874,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         get().conversationsLoaded &&
         !get().conversations.some((c) => c.id === convId)
       ) {
-        toast("会话不存在或已被删除，无法重试", "error");
+        toast(i18n.t("会话不存在或已被删除，无法重试"), "error");
         return;
       }
 
@@ -857,7 +886,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       // 只有磁盘文件已缺失时 dataUrl 为空，过滤后仅用文本重试。
       const restorable = lastUser.attachments.filter((a) => a.dataUrl);
       if (lastUser.attachments.length > restorable.length) {
-        toast("参考图无法恢复，将仅用文本重试");
+        toast(i18n.t("参考图无法恢复，将仅用文本重试"));
       }
 
       const assistantLocalId = localAssistantId(lastUser.id);
@@ -888,7 +917,9 @@ export const useChatStore = create<ChatState>((set, get) => {
             await api.deleteMessage(assistantAfter.id);
           } catch (e) {
             toast(
-              `重试失败：无法清理上一条回复（${parseAdapterError(String(e)).message}）`,
+              i18n.t("重试失败：无法清理上一条回复（{{error}}）", {
+                error: parseAdapterError(String(e)).message,
+              }),
               "error",
             );
             return;
@@ -913,7 +944,12 @@ export const useChatStore = create<ChatState>((set, get) => {
         );
       } catch (e) {
         if (isMine()) {
-          toast(`重试失败：${parseAdapterError(String(e)).message}`, "error");
+          toast(
+            i18n.t("重试失败：{{error}}", {
+              error: parseAdapterError(String(e)).message,
+            }),
+            "error",
+          );
         }
       } finally {
         if (isMine()) set({ sending: false });
@@ -971,7 +1007,9 @@ export const useChatStore = create<ChatState>((set, get) => {
       } catch (e) {
         // 兜底：图片消息入库失败只提示，不把 unhandled rejection 抛给调用方
         toast(
-          `保存图片消息失败：${parseAdapterError(String(e)).message}`,
+          i18n.t("保存图片消息失败：{{error}}", {
+            error: parseAdapterError(String(e)).message,
+          }),
           "error",
         );
       }

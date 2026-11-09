@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { motion, useReducedMotion } from "framer-motion";
-import { useAppStore } from "../stores/appStore";
-import { useChatStore } from "../stores/chatStore";
+import { useTranslation } from "react-i18next";
+import { BasicEditTarget, useAppStore } from "../stores/appStore";
 import { api } from "../lib/api";
+import { deliverEditResult } from "../lib/deliverEditResult";
 import { toast } from "../lib/notify";
 import { DUR, EASE } from "../lib/motion";
 import { ensureRasterDataUrl } from "../lib/file";
@@ -61,12 +62,13 @@ function BasicEditBody({
   target,
   close,
 }: {
-  target: { historyId: number; dataUrl: string; prompt: string };
+  target: BasicEditTarget;
   close: () => void;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const stageRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<DragState | null>(null);
+  const { t } = useTranslation();
   const [image, setImage] = useState<HTMLImageElement | null>(null);
   const [scale, setScale] = useState(1);
   const [deg, setDeg] = useState<0 | 90 | 180 | 270>(0);
@@ -78,7 +80,9 @@ function BasicEditBody({
   const [saturation, setSaturation] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const canvasInline = useAppStore((s) => s.canvasInline);
   const reduce = useReducedMotion();
+  const inline = canvasInline && target.host === "canvas";
 
   useEffect(() => {
     const img = new Image();
@@ -210,7 +214,7 @@ function BasicEditBody({
   const submit = async () => {
     if (!image || busy) return;
     if (!changed) {
-      toast("还没有任何改动", "error");
+      toast(t("还没有任何改动"), "error");
       return;
     }
     const ops: Parameters<typeof api.applyEdit>[0]["ops"] = [];
@@ -239,20 +243,7 @@ function BasicEditBody({
         ops,
         parentId: target.historyId,
       });
-      if (useChatStore.getState().activeId === null) {
-        toast("已保存到画廊（当前没有打开的会话）");
-      } else {
-        await useChatStore.getState().appendImageMessage(
-          {
-            historyId: out.historyId,
-            dataUrl: out.dataUrl,
-            path: out.filePath,
-            derivedFrom: target.historyId,
-          },
-          "基础编辑",
-        );
-        toast("已生成，结果已放入当前会话");
-      }
+      await deliverEditResult(target, out, t("基础编辑"));
       close();
     } catch (e) {
       setError(String(e));
@@ -271,14 +262,20 @@ function BasicEditBody({
       animate={{ opacity: 1 }}
       exit={{ opacity: 0 }}
       transition={{ duration: reduce ? 0 : DUR.base, ease: EASE.ios }}
-      className="fixed inset-x-0 bottom-0 top-12 z-30 flex flex-col bg-base"
+      className={
+        inline
+          ? "flex h-full min-h-0 w-full flex-col bg-base"
+          : "fixed inset-x-0 bottom-0 top-12 z-30 flex flex-col bg-base"
+      }
     >
       <header className="relative z-10 shrink-0 glass">
         <div className="flex min-h-12 items-center gap-3 px-6 py-2">
           <div className="flex min-w-0 flex-col">
-            <h1 className="truncate text-title3 text-primary">基础编辑</h1>
+            <h1 className="truncate text-title3 text-primary">
+              {t("基础编辑")}
+            </h1>
             <p className="truncate text-footnote text-tertiary">
-              裁剪、旋转、翻转与调色全在本地完成，不消耗接口额度
+              {t("裁剪、旋转、翻转与调色全在本地完成，不消耗接口额度")}
             </p>
           </div>
           <div className="ml-auto flex shrink-0 items-center gap-2">
@@ -289,10 +286,10 @@ function BasicEditBody({
               disabled={!image || !changed}
               onClick={() => void submit()}
             >
-              应用编辑
+              {t("应用编辑")}
             </Button>
             <IconButton
-              label="关闭编辑器"
+              label={t("关闭编辑器")}
               icon={<IconClose size={16} />}
               onClick={close}
             />
@@ -301,29 +298,29 @@ function BasicEditBody({
 
         <div
           role="toolbar"
-          aria-label="基础编辑工具"
+          aria-label={t("基础编辑工具")}
           className="flex flex-wrap items-center gap-2 px-6 pb-2.5"
         >
           <ToolbarGroup>
             <IconButton
-              label="左转 90°"
+              label={t("左转 90°")}
               icon={<IconRotate size={16} className="-scale-x-100" />}
               onClick={() => setDeg((d) => ((d + 270) % 360) as typeof d)}
             />
             <IconButton
-              label="右转 90°"
+              label={t("右转 90°")}
               icon={<IconRotate size={16} />}
               onClick={() => setDeg((d) => ((d + 90) % 360) as typeof d)}
             />
             <IconButton
-              label={flipH ? "取消水平翻转" : "水平翻转"}
+              label={flipH ? t("取消水平翻转") : t("水平翻转")}
               icon={<IconFlip size={16} />}
               variant={flipH ? "secondary" : "ghost"}
               aria-pressed={flipH}
               onClick={() => setFlipH((v) => !v)}
             />
             <IconButton
-              label={flipV ? "取消垂直翻转" : "垂直翻转"}
+              label={flipV ? t("取消垂直翻转") : t("垂直翻转")}
               icon={<IconFlip size={16} className="rotate-90" />}
               variant={flipV ? "secondary" : "ghost"}
               aria-pressed={flipV}
@@ -338,26 +335,28 @@ function BasicEditBody({
               <IconCrop size={16} />
             </span>
             <Button size="sm" variant="ghost" onClick={resetCrop}>
-              全图
+              {t("全图")}
             </Button>
           </ToolbarGroup>
 
           <ToolbarSeparator />
 
-          {[
-            { label: "亮度", value: brightness, set: setBrightness },
-            { label: "对比度", value: contrast, set: setContrast },
-            { label: "饱和度", value: saturation, set: setSaturation },
-          ].map((s) => (
+          {(
+            [
+              { label: "亮度", value: brightness, set: setBrightness },
+              { label: "对比度", value: contrast, set: setContrast },
+              { label: "饱和度", value: saturation, set: setSaturation },
+            ] as const
+          ).map((s) => (
             <div key={s.label} className="flex items-center gap-2">
-              <span className="text-footnote text-tertiary">{s.label}</span>
+              <span className="text-footnote text-tertiary">{t(s.label)}</span>
               <div className="w-24">
                 <Slider
                   value={s.value}
                   onValueChange={s.set}
                   min={-100}
                   max={100}
-                  label={s.label}
+                  label={t(s.label)}
                 />
               </div>
               <span className="w-8 text-right text-footnote tabular-nums text-tertiary">
@@ -374,7 +373,7 @@ function BasicEditBody({
               setSaturation(0);
             }}
           >
-            重置色彩
+            {t("重置色彩")}
           </Button>
         </div>
       </header>
@@ -399,7 +398,7 @@ function BasicEditBody({
           >
             <img
               src={target.dataUrl}
-              alt="编辑对象"
+              alt={t("编辑对象")}
               draggable={false}
               className="pointer-events-none absolute left-1/2 top-1/2 max-w-none select-none"
               style={{
@@ -446,16 +445,16 @@ function BasicEditBody({
             })}
           </div>
         ) : (
-          <span className="text-body text-tertiary">加载中…</span>
+          <span className="text-body text-tertiary">{t("加载中…")}</span>
         )}
       </div>
 
       <footer className="flex shrink-0 items-center gap-3 border-t border-line px-6 py-2">
         <span className="text-footnote tabular-nums text-tertiary">
-          输出 {outW} × {outH}
+          {t("输出 {{w}} × {{h}}", { w: outW, h: outH })}
         </span>
         <span className="text-footnote text-tertiary">
-          在图上拖拽框选裁剪区域，拖动角点可微调
+          {t("在图上拖拽框选裁剪区域，拖动角点可微调")}
         </span>
       </footer>
 

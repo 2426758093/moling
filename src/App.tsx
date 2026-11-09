@@ -1,4 +1,6 @@
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import i18n from "./i18n";
 import {
   AnimatePresence,
   MotionConfig,
@@ -56,6 +58,7 @@ function useApplyAppearance() {
 }
 
 function AppShell() {
+  const { t } = useTranslation();
   useApplyAppearance();
   useGlobalShortcuts();
   const view = useAppStore((s) => s.view);
@@ -63,6 +66,7 @@ function AppShell() {
   const outpaintTarget = useAppStore((s) => s.outpaintTarget);
   const basicEditTarget = useAppStore((s) => s.basicEditTarget);
   const backgroundTarget = useAppStore((s) => s.backgroundTarget);
+  const canvasInline = useAppStore((s) => s.canvasInline);
   const addFileAttachment = useChatStore((s) => s.addFileAttachment);
   const setView = useAppStore((s) => s.setView);
   const reduce = useReducedMotion();
@@ -104,7 +108,12 @@ function AppShell() {
     useProviderStore
       .getState()
       .refresh()
-      .catch((e) => toast(`加载服务商失败：${String(e)}`, "error"));
+      .catch((e) =>
+        toast(
+          i18n.t("加载服务商失败：{{error}}", { error: String(e) }),
+          "error",
+        ),
+      );
     useChatStore
       .getState()
       .loadConversations()
@@ -127,8 +136,14 @@ function AppShell() {
       try {
         await useQueueStore.getState().subscribe();
         await useQueueStore.getState().load();
+        // 自动续跑只处理排队任务；中断任务仍需用户显式恢复（避免重复扣费）
+        const autoResume = await api
+          .getSetting("queueAutoResume")
+          .catch(() => null);
+        if (autoResume === "on") await useQueueStore.getState().start(true);
       } catch (e) {
-        toast(`加载队列失败：${String(e)}`, "error");
+        // 订阅只在挂载时执行一次，用全局实例翻译，避免把 t 加进依赖
+        toast(i18n.t("加载队列失败：{{error}}", { error: String(e) }), "error");
       }
     })();
     // 启动静默检查更新：离线/未配置不打扰，有更新才弹窗
@@ -142,6 +157,20 @@ function AppShell() {
       useUpdateStore.getState().unsubscribe();
     };
   }, []);
+
+  // 画布入口的编辑以内嵌面板渲染在 CanvasView 里，不再盖住整屏；
+  // 离开画布时关闭这些目标，避免返回其他视图时突然弹出全屏编辑器。
+  const overlayVisible = (target: { host?: "canvas" } | null) =>
+    !!target && !(canvasInline && target.host === "canvas");
+  useEffect(() => {
+    if (view === "canvas") return;
+    const app = useAppStore.getState();
+    if (app.editTarget?.host === "canvas") app.closeEditor();
+    if (app.outpaintTarget?.host === "canvas") app.closeOutpaint();
+    if (app.transformTarget?.host === "canvas") app.closeTransform();
+    if (app.basicEditTarget?.host === "canvas") app.closeBasicEdit();
+    if (app.backgroundTarget?.host === "canvas") app.closeBackground();
+  }, [view]);
 
   return (
     <div
@@ -172,11 +201,14 @@ function AppShell() {
           const limit = maxReferenceImages();
           const remaining = limit - useChatStore.getState().attachments.length;
           if (remaining <= 0) {
-            toast(`最多添加 ${limit} 张参考图`, "error");
+            toast(t("最多添加 {{limit}} 张参考图", { limit }), "error");
             return;
           }
           if (files.length > remaining) {
-            toast(`最多添加 ${limit} 张参考图，已忽略多余文件`, "error");
+            toast(
+              t("最多添加 {{limit}} 张参考图，已忽略多余文件", { limit }),
+              "error",
+            );
           }
           for (const file of files.slice(0, remaining)) {
             const invalid = await validateImageFile(file);
@@ -231,11 +263,17 @@ function AppShell() {
       <CommandPalette />
       <ShortcutsSheet />
       <UpdateDialog />
-      <AnimatePresence>{editTarget && <EditorView />}</AnimatePresence>
-      <AnimatePresence>{outpaintTarget && <OutpaintView />}</AnimatePresence>
-      <AnimatePresence>{basicEditTarget && <BasicEditView />}</AnimatePresence>
       <AnimatePresence>
-        {backgroundTarget && <BackgroundView />}
+        {overlayVisible(editTarget) && <EditorView />}
+      </AnimatePresence>
+      <AnimatePresence>
+        {overlayVisible(outpaintTarget) && <OutpaintView />}
+      </AnimatePresence>
+      <AnimatePresence>
+        {overlayVisible(basicEditTarget) && <BasicEditView />}
+      </AnimatePresence>
+      <AnimatePresence>
+        {overlayVisible(backgroundTarget) && <BackgroundView />}
       </AnimatePresence>
       <TransformDialog />
     </div>

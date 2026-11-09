@@ -1,3 +1,4 @@
+import { useTranslation } from "react-i18next";
 import { Button } from "../ui/Button";
 import { Dialog } from "../ui/Dialog";
 import {
@@ -7,24 +8,25 @@ import {
   type UpdatePhase,
 } from "../../stores/updateStore";
 
-function titleOf(phase: UpdatePhase): string {
+function titleOf(phase: UpdatePhase) {
   switch (phase) {
     case "available":
-      return "发现新版本";
+      return "发现新版本" as const;
     case "downloading":
-      return "正在下载更新";
+      return "正在下载更新" as const;
     case "downloaded":
-      return "更新已就绪";
+      return "更新已就绪" as const;
     case "installing":
-      return "正在安装更新";
+      return "正在安装更新" as const;
     case "error":
-      return "更新失败";
+      return "更新失败" as const;
     default:
-      return "软件更新";
+      return "软件更新" as const;
   }
 }
 
 export default function UpdateDialog() {
+  const { t } = useTranslation();
   const dialogOpen = useUpdateStore((s) => s.dialogOpen);
   const phase = useUpdateStore((s) => s.phase);
   const info = useUpdateStore((s) => s.info);
@@ -48,10 +50,10 @@ export default function UpdateDialog() {
         return (
           <>
             <Button variant="ghost" onClick={closeDialog}>
-              稍后
+              {t("稍后")}
             </Button>
             <Button variant="primary" onClick={() => void download()}>
-              下载更新
+              {t("下载更新")}
             </Button>
           </>
         );
@@ -59,41 +61,41 @@ export default function UpdateDialog() {
         // 关掉弹窗不打断下载，完成后会重新弹出
         return (
           <Button variant="secondary" onClick={closeDialog}>
-            后台下载
+            {t("后台下载")}
           </Button>
         );
       case "downloaded":
         return (
           <>
             <Button variant="ghost" onClick={closeDialog}>
-              稍后安装
+              {t("稍后安装")}
             </Button>
             <Button variant="primary" onClick={() => void install()}>
-              立即安装并重启
+              {t("立即安装并重启")}
             </Button>
           </>
         );
       case "installing":
         return (
           <Button variant="primary" loading>
-            正在安装…
+            {t("正在安装…")}
           </Button>
         );
       case "error":
         return (
           <>
             <Button variant="ghost" onClick={closeDialog}>
-              稍后
+              {t("稍后")}
             </Button>
             <Button variant="primary" onClick={() => void download()}>
-              重试下载
+              {t("重试下载")}
             </Button>
           </>
         );
       default:
         return (
           <Button variant="ghost" onClick={closeDialog}>
-            关闭
+            {t("关闭")}
           </Button>
         );
     }
@@ -103,10 +105,10 @@ export default function UpdateDialog() {
     <Dialog
       open={dialogOpen}
       onOpenChange={(open) => (open ? openDialog() : closeDialog())}
-      title={titleOf(phase)}
+      title={t(titleOf(phase))}
       description={
         phase === "available" && info
-          ? `新版本 ${info.version} 已发布`
+          ? t("新版本 {{version}} 已发布", { version: info.version })
           : undefined
       }
       footer={footer()}
@@ -114,13 +116,15 @@ export default function UpdateDialog() {
       {info && (
         <div className="space-y-2">
           <div className="flex items-center justify-between text-footnote">
-            <span className="text-secondary">新版本 {info.version}</span>
+            <span className="text-secondary">
+              {t("新版本 {{version}}", { version: info.version })}
+            </span>
             {info.date && (
               <span className="text-tertiary">{info.date.slice(0, 10)}</span>
             )}
           </div>
           <p className="max-h-64 overflow-y-auto whitespace-pre-wrap text-footnote leading-relaxed text-tertiary">
-            {info.notes?.trim() || "该版本未提供更新说明"}
+            {info.notes?.trim() || t("该版本未提供更新说明")}
           </p>
         </div>
       )}
@@ -135,17 +139,30 @@ export default function UpdateDialog() {
           </div>
           <p className="text-footnote text-tertiary">
             {phase === "downloaded"
-              ? "下载完成，安装后应用会自动重启"
+              ? t("下载完成，安装后应用会自动重启")
               : percent !== null
-                ? `${percent}% · ${formatBytes(progress.downloaded)} / ${formatBytes(progress.total ?? 0)} · ${formatSpeed(progress.speed)} · ${progress.route || "自动选择线路"}`
-                : `已下载 ${formatBytes(progress.downloaded)} · ${formatSpeed(progress.speed)} · ${progress.route || "自动选择线路"}`}
+                ? t(
+                    "{{percent}}% · {{downloaded}} / {{total}} · {{speed}} · {{route}}",
+                    {
+                      percent,
+                      downloaded: formatBytes(progress.downloaded),
+                      total: formatBytes(progress.total ?? 0),
+                      speed: formatSpeed(progress.speed),
+                      route: progress.route || t("自动选择线路"),
+                    },
+                  )
+                : t("已下载 {{downloaded}} · {{speed}} · {{route}}", {
+                    downloaded: formatBytes(progress.downloaded),
+                    speed: formatSpeed(progress.speed),
+                    route: progress.route || t("自动选择线路"),
+                  })}
           </p>
         </div>
       )}
 
       {phase === "installing" && (
         <p className="mt-3 text-body text-secondary">
-          正在安装更新，应用即将自动重启…
+          {t("正在安装更新，应用即将自动重启…")}
         </p>
       )}
 

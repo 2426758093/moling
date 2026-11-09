@@ -1,3 +1,5 @@
+import i18n from "../i18n";
+
 export const RATIO_OPTIONS = [
   { id: "auto", label: "自动", w: 0, h: 0 },
   { id: "1:1", label: "1:1", w: 1, h: 1 },
@@ -17,27 +19,54 @@ export function isAutoSize(width: number, height: number): boolean {
 
 /** 尺寸展示文案：自动尺寸显示「自动」，避免界面出现 0×0 */
 export function sizeLabel(width: number, height: number): string {
-  return isAutoSize(width, height) ? "自动" : `${width} × ${height}`;
+  return isAutoSize(width, height) ? i18n.t("自动") : `${width} × ${height}`;
 }
 
 export type ImageQuality = "auto" | "low" | "medium" | "high";
 
-export const QUALITY_OPTIONS: { id: ImageQuality; label: string }[] = [
+/// label 即词典 key：写成字面量类型，漏补英文时编译期即报错
+export const QUALITY_OPTIONS = [
   { id: "auto", label: "自动" },
   { id: "low", label: "低" },
   { id: "medium", label: "中" },
   { id: "high", label: "高" },
-];
+] as const satisfies readonly { id: ImageQuality; label: string }[];
 
 export function qualityLabel(quality: string): string {
-  return QUALITY_OPTIONS.find((q) => q.id === quality)?.label ?? "自动";
+  const label = QUALITY_OPTIONS.find((q) => q.id === quality)?.label ?? "自动";
+  return i18n.t(label);
 }
 
-export const STYLE_PRESETS = [
-  { id: "", label: "无风格" },
-  { id: "photorealistic, 8k, raw photo", label: "真实摄影" },
-  { id: "anime style, vibrant, cel shading", label: "动漫" },
-  { id: "oil painting, classic brushwork", label: "油画" },
-  { id: "cyberpunk, neon lights, futuristic", label: "赛博朋克" },
-  { id: "watercolor, soft washes, paper texture", label: "水彩" },
+export interface StylePreset {
+  id: string;
+  label: string;
+  prompt: string;
+}
+
+/** 内置风格的兜底副本：Rust 侧 get_style_presets 返回前先用它渲染，
+ * prompt 文本与历史记录里的 style 字段保持一致。 */
+export const STYLE_PRESETS: StylePreset[] = [
+  { id: "photo", label: "真实摄影", prompt: "photorealistic, 8k, raw photo" },
+  { id: "anime", label: "动漫", prompt: "anime style, vibrant, cel shading" },
+  { id: "oil", label: "油画", prompt: "oil painting, classic brushwork" },
+  {
+    id: "watercolor",
+    label: "水彩",
+    prompt: "watercolor, soft washes, paper texture",
+  },
+  {
+    id: "cyberpunk",
+    label: "赛博朋克",
+    prompt: "cyberpunk, neon lights, futuristic",
+  },
+  {
+    id: "film",
+    label: "胶片",
+    prompt: "analog film photography, subtle grain",
+  },
+  {
+    id: "render3d",
+    label: "3D 渲染",
+    prompt: "3D render, soft studio lighting",
+  },
 ];

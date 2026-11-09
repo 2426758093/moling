@@ -1,6 +1,6 @@
 [package]
 name = "moling"
-version = "1.2.7"
+version = "1.6.0"
 description = "MoLing - AI drawing client for any API"
 authors = ["MoLing Contributors"]
 edition = "2021"
@@ -31,6 +31,8 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls-native-roots",
   # default-features=false 会关掉系统代理；代理设置依赖它读取系统/环境代理
   "system-proxy",
+  # SOCKS5 代理（socks5 / socks5h，含远端 DNS）
+  "socks",
   # 不开 gzip/brotli/deflate：自动解压一旦遇到链路谎报的 Content-Encoding，
   # 原始字节会被 reqwest 丢弃，只剩 "error decoding response body"。
   # 这里统一请求明文，解压由 adapters::mod 按魔数/头自己做
@@ -58,6 +60,8 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 tauri-plugin-updater = "2"
 # 插件 2.14 用 reqwest 0.13；configure_client 回调要求同版本类型，单独取一份别名
 reqwest013 = { package = "reqwest", version = "0.13", default-features = false }
+# 智能蒙版：运行时动态加载随包的 onnxruntime.dll，不在构建期下载二进制
+ort = { version = "2.0.0-rc.15", features = ["load-dynamic"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

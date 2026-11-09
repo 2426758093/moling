@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { api, type AvailableUpdate, type UpdateProgress } from "../lib/api";
+import i18n from "../i18n";
 
 export type UpdatePhase =
   | "idle"
@@ -102,7 +103,7 @@ export const useUpdateStore = create<UpdateStore>((set, get) => ({
 
         const silentDone = () => {
           if (manual) {
-            set({ phase: "idle", notice: "当前已是最新版本" });
+            set({ phase: "idle", notice: i18n.t("当前已是最新版本") });
           } else if (get().phase === "checking") {
             set({ phase: "idle" });
           }
@@ -111,7 +112,7 @@ export const useUpdateStore = create<UpdateStore>((set, get) => ({
           if (manual) {
             set({
               phase: "idle",
-              notice: "当前版本未接入更新源，无法检查更新",
+              notice: i18n.t("当前版本未接入更新源，无法检查更新"),
             });
           } else if (get().phase === "checking") {
             set({ phase: "idle" });
@@ -120,7 +121,12 @@ export const useUpdateStore = create<UpdateStore>((set, get) => ({
         }
         if (status.error) {
           if (manual) {
-            set({ phase: "idle", notice: `检查更新失败：${status.error}` });
+            set({
+              phase: "idle",
+              notice: i18n.t("检查更新失败：{{error}}", {
+                error: status.error,
+              }),
+            });
           } else if (get().phase === "checking") {
             set({ phase: "idle" });
           }
@@ -144,7 +150,10 @@ export const useUpdateStore = create<UpdateStore>((set, get) => ({
         });
       } catch (e) {
         if (manual) {
-          set({ phase: "idle", notice: `检查更新失败：${String(e)}` });
+          set({
+            phase: "idle",
+            notice: i18n.t("检查更新失败：{{error}}", { error: String(e) }),
+          });
         } else if (get().phase === "checking") {
           set({ phase: "idle" });
         }

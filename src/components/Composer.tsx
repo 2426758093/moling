@@ -6,13 +6,13 @@ import {
   useLayoutEffect,
 } from "react";
 import { motion, AnimatePresence } from "framer-motion";
+import { useTranslation } from "react-i18next";
 import { useChatStore } from "../stores/chatStore";
 import { useAppStore, SIZE_MIN, SIZE_MAX } from "../stores/appStore";
 import { useProviderStore } from "../stores/providerStore";
 import { useQueueStore } from "../stores/queueStore";
 import {
   RATIO_OPTIONS,
-  STYLE_PRESETS,
   QUALITY_OPTIONS,
   qualityLabel,
   REFERENCE_ROLES,
@@ -25,6 +25,13 @@ import { validateImageFile } from "../lib/file";
 import { toast } from "../lib/notify";
 import { FOCUS_COMPOSER_EVENT, OPEN_ASSIST_EVENT } from "../lib/commands";
 import { maxReferenceImages, useModelCaps } from "../lib/useModelCaps";
+import {
+  MAX_REGIONS,
+  REGION_ITEMS,
+  writeRegionPrompt,
+  type RegionArea,
+  type RegionHint,
+} from "../lib/regionPrompt";
 import { useMotionTokens } from "../lib/useMotion";
 import { DUR } from "../lib/motion";
 import SafeImg from "./SafeImg";
@@ -46,13 +53,10 @@ import {
 } from "./Icons";
 import PromptAssist from "./PromptAssist";
 import { Input } from "./ui/Field";
+import { useStylePresets } from "../stores/stylePresetStore";
 
 // Radix Select 不接受空字符串作为选项值，空风格需要一个哨兵值
 const NONE_STYLE = "none";
-const STYLE_ITEMS = STYLE_PRESETS.map((s) => ({
-  value: s.id || NONE_STYLE,
-  label: s.label,
-}));
 const ROLE_ITEMS = REFERENCE_ROLES.map((r) => ({
   value: r.id,
   label: r.label,
@@ -72,6 +76,7 @@ function CustomSizeRow({
   height: number;
   onApply: (w: number, h: number) => void;
 }) {
+  const { t } = useTranslation();
   const [w, setW] = useState(String(width));
   const [h, setH] = useState(String(height));
   const apply = () => {
@@ -83,7 +88,7 @@ function CustomSizeRow({
   return (
     <div>
       <div className="mb-1.5 mt-3.5 text-footnote font-medium text-tertiary">
-        自定义尺寸
+        {t("自定义尺寸")}
       </div>
       <div className="flex items-center gap-1.5">
         <Input
@@ -97,7 +102,7 @@ function CustomSizeRow({
           onKeyDown={(e) => {
             if (e.key === "Enter") apply();
           }}
-          aria-label="宽度"
+          aria-label={t("宽度")}
           compact
           widthClass="w-20"
         />
@@ -113,22 +118,149 @@ function CustomSizeRow({
           onKeyDown={(e) => {
             if (e.key === "Enter") apply();
           }}
-          aria-label="高度"
+          aria-label={t("高度")}
           compact
           widthClass="w-20"
         />
         <Button size="sm" variant="secondary" onClick={apply}>
-          应用
+          {t("应用")}
         </Button>
       </div>
       <div className="mt-1.5 text-caption text-tertiary">
-        512–4096，自动对齐到 8 的倍数
+        {t("512–4096，自动对齐到 8 的倍数")}
+      </div>
+    </div>
+  );
+}
+
+/// 透传参数是自由 JSON：解析失败按空对象处理，避免损坏的配置卡住界面
+function parseExtraParams(
+  raw: string | null | undefined,
+): Record<string, unknown> {
+  try {
+    const v = JSON.parse(raw || "{}");
+    return v && typeof v === "object" && !Array.isArray(v)
+      ? (v as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+const SAMPLING_KEYS = ["guidance", "steps", "seed"] as const;
+
+/// 高级采样参数：写入所选服务商的 extraParams（走既有透传通道，不改标准请求体）
+function SamplingPanel({
+  raw,
+  onSave,
+}: {
+  raw: string | null | undefined;
+  onSave: (next: Record<string, unknown>) => Promise<void>;
+}) {
+  const current = parseExtraParams(raw);
+  const { t } = useTranslation();
+  const text = (key: string) =>
+    current[key] === undefined ? "" : String(current[key]);
+  const [guidance, setGuidance] = useState(() => text("guidance"));
+  const [steps, setSteps] = useState(() => text("steps"));
+  const [seed, setSeed] = useState(() => text("seed"));
+  const [busy, setBusy] = useState(false);
+
+  const apply = async (clear: boolean) => {
+    const next = { ...current };
+    for (const key of SAMPLING_KEYS) delete next[key];
+    if (!clear) {
+      const g = guidance.trim();
+      const s = steps.trim();
+      const sd = seed.trim();
+      if (g) {
+        const n = Number(g);
+        if (!Number.isFinite(n) || n < 0 || n > 30) {
+          toast(t("Guidance 应为 0–30 的数字"), "error");
+          return;
+        }
+        next.guidance = n;
+      }
+      if (s) {
+        const n = Number(s);
+        if (!Number.isInteger(n) || n < 1 || n > 150) {
+          toast(t("Steps 应为 1–150 的整数"), "error");
+          return;
+        }
+        next.steps = n;
+      }
+      if (sd) {
+        const n = Number(sd);
+        if (!Number.isInteger(n) || n < 0) {
+          toast(t("Seed 应为非负整数"), "error");
+          return;
+        }
+        next.seed = n;
+      }
+    }
+    setBusy(true);
+    try {
+      await onSave(next);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="w-64 space-y-2">
+      <div className="text-footnote font-medium text-tertiary">
+        {t("高级采样参数")}
+      </div>
+      <Input
+        label="Guidance"
+        value={guidance}
+        onChange={(e) => setGuidance(e.target.value)}
+        placeholder={t("如 7.5（留空不发送）")}
+        compact
+      />
+      <Input
+        label="Steps"
+        value={steps}
+        onChange={(e) => setSteps(e.target.value)}
+        placeholder={t("如 30（留空不发送）")}
+        compact
+      />
+      <Input
+        label="Seed"
+        value={seed}
+        onChange={(e) => setSeed(e.target.value)}
+        placeholder={t("固定随机种子可复现")}
+        compact
+      />
+      <p className="text-caption text-tertiary">
+        {t(
+          "写入所选服务商的透传参数，影响该服务商全部请求；部分模型不支持这些字段。",
+        )}
+      </p>
+      <div className="flex justify-end gap-1.5">
+        <Button
+          size="sm"
+          variant="ghost"
+          disabled={busy}
+          onClick={() => void apply(true)}
+        >
+          {t("清除")}
+        </Button>
+        <Button
+          size="sm"
+          variant="secondary"
+          disabled={busy}
+          onClick={() => void apply(false)}
+        >
+          {t("保存")}
+        </Button>
       </div>
     </div>
   );
 }
 
 export default function Composer() {
+  const { t } = useTranslation();
   // 从画布/画廊切回聊天时 Composer 才挂载，草稿需在首次渲染就进输入框
   const [text, setText] = useState(
     () => useChatStore.getState().draftPrompt ?? "",
@@ -150,11 +282,112 @@ export default function Composer() {
   const applyRatio = useAppStore((s) => s.applyRatio);
   const applyCustomSize = useAppStore((s) => s.applyCustomSize);
   const mode = useAppStore((s) => s.mode);
+  const stylePresets = useStylePresets();
+  const qualityText = qualityLabel(prefs.quality);
+  const [samplingOpen, setSamplingOpen] = useState(false);
+  const providers = useProviderStore((s) => s.providers);
+  const defaultProviderId = useProviderStore((s) => s.defaultProviderId);
+  const selectedProvider = providers.find(
+    (p) => p.provider.id === defaultProviderId,
+  );
+  const samplingAvailable = selectedProvider?.provider.kind === "openai";
+  const samplingActive = SAMPLING_KEYS.some(
+    (k) =>
+      parseExtraParams(selectedProvider?.provider.extraParams)[k] !== undefined,
+  );
+  const saveSampling = async (next: Record<string, unknown>) => {
+    const store = useProviderStore.getState();
+    const item = store.providers.find(
+      (p) => p.provider.id === store.defaultProviderId,
+    );
+    if (!item?.provider.id) {
+      toast(t("请先选择绘图服务商"), "error");
+      return;
+    }
+    try {
+      await store.save({
+        ...item.provider,
+        extraParams: Object.keys(next).length ? JSON.stringify(next) : null,
+      });
+      toast(t("已更新采样参数"));
+    } catch (e) {
+      toast(t("保存失败：{{error}}", { error: String(e) }), "error");
+    }
+  };
   const caps = useModelCaps();
   const [negOpen, setNegOpen] = useState(false);
+  const [regionOpen, setRegionOpen] = useState(false);
+  const [regions, setRegions] = useState<RegionHint[]>([
+    { area: "left", description: "" },
+  ]);
+  // 上次写入的区域段：再次写入时先移除旧段，避免重复追加同一块
+  const regionBlockRef = useRef<string | null>(null);
   const draftPrompt = useChatStore((s) => s.draftPrompt);
   const setDraftPrompt = useChatStore((s) => s.setDraftPrompt);
   const motionTokens = useMotionTokens();
+  // 失焦自动翻译：600ms 去抖，只处理含中文且自上次翻译后未变化的文本
+  const textRef = useRef(text);
+  useEffect(() => {
+    textRef.current = text;
+  }, [text]);
+  const translateTimer = useRef<number | null>(null);
+  const lastTranslatedSource = useRef<string | null>(null);
+  const [autoTranslated, setAutoTranslated] = useState<{
+    from: string;
+    to: string;
+  } | null>(null);
+
+  useEffect(
+    () => () => {
+      if (translateTimer.current !== null) {
+        window.clearTimeout(translateTimer.current);
+      }
+    },
+    [],
+  );
+
+  const cancelAutoTranslate = () => {
+    if (translateTimer.current !== null) {
+      window.clearTimeout(translateTimer.current);
+      translateTimer.current = null;
+    }
+  };
+
+  const runAutoTranslate = async (source: string) => {
+    if (useChatStore.getState().sending) return;
+    const cfg = await api.getThinkingConfig().catch(() => null);
+    if (!cfg?.enabled || !cfg.autoTranslateOnBlur) return;
+    if (textRef.current.trim() !== source) return;
+    const r = await api.translatePrompt(source).catch(() => null);
+    if (!r?.ok || !r.translated) return;
+    const translated = r.translated.trim();
+    if (!translated || translated === source) return;
+    // 翻译期间用户又改了输入：放弃这次结果，避免覆盖新内容
+    if (textRef.current.trim() !== source) return;
+    lastTranslatedSource.current = source;
+    setText(translated);
+    setAutoTranslated({ from: source, to: translated });
+  };
+
+  const scheduleAutoTranslate = (value: string) => {
+    cancelAutoTranslate();
+    const source = value.trim();
+    if (!source || !/[\u4e00-\u9fff]/.test(source)) return;
+    if (lastTranslatedSource.current === source) return;
+    translateTimer.current = window.setTimeout(() => {
+      translateTimer.current = null;
+      void runAutoTranslate(source);
+    }, 600);
+  };
+
+  const undoAutoTranslate = () => {
+    if (!autoTranslated) return;
+    // 撤销后同一段文本不再自动翻译，避免失焦又立刻翻回去
+    lastTranslatedSource.current = autoTranslated.from;
+    setText(autoTranslated.from);
+    setAutoTranslated(null);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  };
 
   const autoGrow = useCallback(() => {
     const el = textareaRef.current;
@@ -201,11 +434,37 @@ export default function Composer() {
     autoGrow();
   }, [text, autoGrow]);
 
+  const updateRegion = (index: number, patch: Partial<RegionHint>) => {
+    setRegions((list) =>
+      list.map((item, i) => (i === index ? { ...item, ...patch } : item)),
+    );
+  };
+
+  // 区域提示只是把区位描述追加进草稿，不改变请求协议
+  const applyRegions = () => {
+    const { text: next, block } = writeRegionPrompt(
+      text,
+      regions,
+      regionBlockRef.current,
+    );
+    if (!block) {
+      toast(t("请先填写区域描述"), "error");
+      return;
+    }
+    regionBlockRef.current = block;
+    setText(next);
+    setDraftPrompt(next);
+    setRegionOpen(false);
+  };
+
   const doSend = async () => {
     const value = text;
     // 直接读 store 的实时状态：渲染期闭包里的 sending 可能滞后一帧，
     // 连点/连按 Enter 会重复触发；sending 期间一律直接 return。
     if (!value.trim() || sending || useChatStore.getState().sending) return;
+    cancelAutoTranslate();
+    lastTranslatedSource.current = null;
+    setAutoTranslated(null);
     setText("");
     requestAnimationFrame(autoGrow);
     const accepted = await send(value);
@@ -242,7 +501,7 @@ export default function Composer() {
     const provider = providers.find((p) => p.provider.id === defaultProviderId);
     const model = provider?.provider.defaultModel;
     if (!provider || defaultProviderId == null || !model) {
-      toast("请先在「设置」中配置绘图服务商与模型", "error");
+      toast(t("请先在「设置」中配置绘图服务商与模型"), "error");
       return;
     }
     setEnqueuing(true);
@@ -270,11 +529,14 @@ export default function Composer() {
             : undefined,
       });
       useChatStore.getState().clearAttachments();
+      cancelAutoTranslate();
+      lastTranslatedSource.current = null;
+      setAutoTranslated(null);
       setText("");
       requestAnimationFrame(autoGrow);
-      toast("已加入队列");
+      toast(t("已加入队列"));
     } catch (e) {
-      toast(`加入队列失败：${String(e)}`, "error");
+      toast(t("加入队列失败：{{error}}", { error: String(e) }), "error");
     } finally {
       setEnqueuing(false);
     }
@@ -324,11 +586,14 @@ export default function Composer() {
     const limit = maxReferenceImages();
     const remaining = limit - useChatStore.getState().attachments.length;
     if (remaining <= 0) {
-      toast(`最多添加 ${limit} 张参考图`, "error");
+      toast(t("最多添加 {{n}} 张参考图", { n: limit }), "error");
       return;
     }
     if (all.length > remaining) {
-      toast(`最多添加 ${limit} 张参考图，已忽略多余文件`, "error");
+      toast(
+        t("最多添加 {{n}} 张参考图，已忽略多余文件", { n: limit }),
+        "error",
+      );
     }
     for (const file of all.slice(0, remaining)) {
       const invalid = await validateImageFile(file);
@@ -370,7 +635,7 @@ export default function Composer() {
           {dropActive && (
             <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-card bg-scrim/30">
               <span className="rounded-pill bg-elevated px-3 py-1 text-footnote text-primary shadow-card">
-                松开以添加参考图
+                {t("松开以添加参考图")}
               </span>
             </div>
           )}
@@ -424,12 +689,12 @@ export default function Composer() {
                         />
                         {a.compressed && (
                           <span className="pointer-events-none absolute bottom-0 left-0 rounded-bl-chip rounded-tr-chip bg-elevated px-1 py-px text-caption leading-none text-tertiary ring-1 ring-line">
-                            已压缩
+                            {t("已压缩")}
                           </span>
                         )}
                         <button
                           onClick={() => removeAttachment(a.id)}
-                          aria-label={`移除附件 ${a.name}`}
+                          aria-label={t("移除附件 {{name}}", { name: a.name })}
                           className="pressable absolute -right-1.5 -top-1.5 flex h-5 w-5 items-center justify-center rounded-pill bg-elevated text-secondary opacity-0 shadow-card ring-1 ring-line transition-opacity hover:text-danger focus-visible:opacity-100 group-hover:opacity-100"
                         >
                           <IconClose size={10} />
@@ -444,8 +709,11 @@ export default function Composer() {
                                 role: v as ReferenceRole,
                               })
                             }
-                            options={ROLE_ITEMS}
-                            label={`${a.name} 的参考角色`}
+                            options={ROLE_ITEMS.map((r) => ({
+                              value: r.value,
+                              label: t(r.label, r.label),
+                            }))}
+                            label={t("{{name}} 的参考角色", { name: a.name })}
                             variant="bare"
                             widthClass="w-full"
                             className="mt-0.5"
@@ -456,7 +724,7 @@ export default function Composer() {
                               onValueChange={(v) =>
                                 updateAttachment(a.id, { strength: v })
                               }
-                              label="参考强度"
+                              label={t("参考强度")}
                               className="flex-1"
                             />
                             <span className="w-5 shrink-0 text-right text-caption tabular-nums text-tertiary">
@@ -478,13 +746,13 @@ export default function Composer() {
               side="top"
               align="start"
               trigger={
-                <button className={CHIP} aria-label="画面比例与尺寸">
+                <button className={CHIP} aria-label={t("画面比例与尺寸")}>
                   {prefs.ratio === "auto" ? (
-                    "自动"
+                    t("自动")
                   ) : (
                     <>
                       {RATIO_OPTIONS.find((r) => r.id === prefs.ratio)?.label ??
-                        "自定义"}
+                        t("自定义")}
                       <span className="text-quaternary">·</span>
                       <span className="tabular-nums">
                         {prefs.width}×{prefs.height}
@@ -497,7 +765,7 @@ export default function Composer() {
             >
               <div className="w-60">
                 <div className="mb-2 text-footnote font-medium text-tertiary">
-                  画面比例
+                  {t("画面比例")}
                 </div>
                 <button
                   onClick={() => applyRatio("auto")}
@@ -507,9 +775,9 @@ export default function Composer() {
                       : "text-tertiary hover:bg-hover hover:text-secondary"
                   }`}
                 >
-                  自动
+                  {t("自动")}
                   <span className="text-caption font-normal text-tertiary">
-                    由服务商决定
+                    {t("由服务商决定")}
                   </span>
                 </button>
                 <div className="grid grid-cols-4 gap-1.5">
@@ -541,25 +809,25 @@ export default function Composer() {
               side="top"
               align="start"
               trigger={
-                <button className={CHIP} aria-label="每次生成张数">
-                  {prefs.count} 张
+                <button className={CHIP} aria-label={t("每次生成张数")}>
+                  {t("{{n}} 张", { n: prefs.count })}
                   <IconChevron size={10} direction="down" />
                 </button>
               }
             >
               <div className="w-40">
                 <div className="mb-2 text-footnote font-medium text-tertiary">
-                  每次生成
+                  {t("每次生成")}
                 </div>
                 <SegmentedControl
                   value={String(prefs.count)}
                   onValueChange={(v) => setPrefs({ count: Number(v) })}
-                  label="每次生成张数"
+                  label={t("每次生成张数")}
                   size="sm"
                   block
                   options={[1, 2, 4].map((n) => ({
                     value: String(n),
-                    label: `${n} 张`,
+                    label: t("{{n}} 张", { n }),
                   }))}
                 />
               </div>
@@ -569,42 +837,75 @@ export default function Composer() {
               side="top"
               align="start"
               trigger={
-                <button className={CHIP} aria-label="图片质量">
-                  质量 · {qualityLabel(prefs.quality)}
+                <button className={CHIP} aria-label={t("图片质量")}>
+                  {t("质量")} · {t(qualityText, qualityText)}
                   <IconChevron size={10} direction="down" />
                 </button>
               }
             >
               <div className="w-56">
                 <div className="mb-2 text-footnote font-medium text-tertiary">
-                  图片质量
+                  {t("图片质量")}
                 </div>
                 <SegmentedControl
                   value={prefs.quality}
                   onValueChange={(v) =>
                     setPrefs({ quality: v as ImageQuality })
                   }
-                  label="图片质量"
+                  label={t("图片质量")}
                   size="sm"
                   block
                   options={QUALITY_OPTIONS.map((q) => ({
                     value: q.id,
-                    label: q.label,
+                    label: t(q.label, q.label),
                   }))}
                 />
                 <div className="mt-2 text-caption text-tertiary">
-                  自动不发送质量参数；低 / 中 / 高需要服务商支持
+                  {t("自动不发送质量参数；低 / 中 / 高需要服务商支持")}
                 </div>
               </div>
             </Popover>
+
+            {mode === "expert" && samplingAvailable && (
+              <Popover
+                side="top"
+                align="start"
+                open={samplingOpen}
+                onOpenChange={setSamplingOpen}
+                trigger={
+                  <button
+                    className={CHIP}
+                    aria-label={t("高级采样参数")}
+                    aria-expanded={samplingOpen}
+                  >
+                    {t("采样")}
+                    {samplingActive && (
+                      <span className="h-1 w-1 rounded-pill bg-accent-text" />
+                    )}
+                    <IconChevron size={10} direction="down" />
+                  </button>
+                }
+              >
+                <SamplingPanel
+                  raw={selectedProvider?.provider.extraParams}
+                  onSave={saveSampling}
+                />
+              </Popover>
+            )}
 
             <Select
               value={prefs.style || NONE_STYLE}
               onValueChange={(v) =>
                 setPrefs({ style: v === NONE_STYLE ? "" : v })
               }
-              options={STYLE_ITEMS}
-              label="风格"
+              options={[
+                { value: NONE_STYLE, label: t("无风格") },
+                ...stylePresets.map((p) => ({
+                  value: p.prompt,
+                  label: p.label,
+                })),
+              ]}
+              label={t("风格")}
               variant="chip"
               widthClass="w-24"
             />
@@ -616,10 +917,10 @@ export default function Composer() {
                 trigger={
                   <button
                     className={CHIP}
-                    aria-label="负向提示词"
+                    aria-label={t("负向提示词")}
                     aria-expanded={negOpen}
                   >
-                    负向
+                    {t("负向")}
                     {prefs.negativePrompt.trim() && (
                       <span className="h-1 w-1 rounded-pill bg-accent-text" />
                     )}
@@ -629,7 +930,7 @@ export default function Composer() {
               >
                 <div className="w-64">
                   <div className="mb-1.5 text-footnote font-medium text-tertiary">
-                    负向提示词
+                    {t("负向提示词")}
                   </div>
                   <Input
                     value={prefs.negativePrompt}
@@ -637,42 +938,162 @@ export default function Composer() {
                       setNegOpen(true);
                       setPrefs({ negativePrompt: e.target.value });
                     }}
-                    placeholder="不希望出现的元素，如：模糊、水印"
-                    aria-label="负向提示词内容"
+                    placeholder={t("不希望出现的元素，如：模糊、水印")}
+                    aria-label={t("负向提示词内容")}
                     compact
                     widthClass="w-full"
                   />
                 </div>
               </Popover>
             )}
+
+            {mode === "expert" && (
+              <Popover
+                side="top"
+                align="start"
+                open={regionOpen}
+                onOpenChange={setRegionOpen}
+                trigger={
+                  <button
+                    className={CHIP}
+                    aria-label={t("区域提示")}
+                    aria-expanded={regionOpen}
+                  >
+                    {t("区域")}
+                    {regions.some((r) => r.description.trim()) && (
+                      <span className="h-1 w-1 rounded-pill bg-accent-text" />
+                    )}
+                    <IconChevron size={10} direction="down" />
+                  </button>
+                }
+              >
+                <div className="w-72 space-y-2">
+                  <div className="text-footnote font-medium text-tertiary">
+                    {t("区域提示（最多 {{n}} 个）", { n: MAX_REGIONS })}
+                  </div>
+                  {regions.map((region, index) => (
+                    <div key={index} className="flex items-center gap-1.5">
+                      <Select
+                        value={region.area}
+                        onValueChange={(v) =>
+                          updateRegion(index, { area: v as RegionArea })
+                        }
+                        options={REGION_ITEMS.map((item) => ({
+                          value: item.value,
+                          label: t(item.label),
+                        }))}
+                        label={t("区域 {{n}} 位置", { n: index + 1 })}
+                        variant="chip"
+                        widthClass="w-20"
+                      />
+                      <Input
+                        value={region.description}
+                        onChange={(e) =>
+                          updateRegion(index, { description: e.target.value })
+                        }
+                        placeholder={t("该区域画什么")}
+                        aria-label={t("区域 {{n}} 描述", { n: index + 1 })}
+                        compact
+                        widthClass="w-full"
+                      />
+                      {regions.length > 1 && (
+                        <IconButton
+                          label={t("删除区域 {{n}}", { n: index + 1 })}
+                          icon={<IconClose size={12} />}
+                          onClick={() =>
+                            setRegions((list) =>
+                              list.filter((_, i) => i !== index),
+                            )
+                          }
+                        />
+                      )}
+                    </div>
+                  ))}
+                  <div className="flex items-center justify-between gap-2">
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      disabled={regions.length >= MAX_REGIONS}
+                      onClick={() =>
+                        setRegions((list) => [
+                          ...list,
+                          { area: "center", description: "" },
+                        ])
+                      }
+                    >
+                      {t("添加区域")}
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={applyRegions}
+                    >
+                      {t("写入提示词")}
+                    </Button>
+                  </div>
+                  <p className="text-caption text-tertiary">
+                    {t(
+                      "按区域逐个描述，模型可能不完全遵循；需要精确改图请用局部重绘。",
+                    )}
+                  </p>
+                </div>
+              </Popover>
+            )}
           </div>
+
+          {autoTranslated && (
+            <div className="flex items-center gap-2 px-3 pt-2 text-caption text-tertiary">
+              <span>{t("已自动翻译为英文")}</span>
+              <button
+                type="button"
+                className="pressable text-accent-text"
+                onClick={undoAutoTranslate}
+              >
+                {t("撤销")}
+              </button>
+            </div>
+          )}
 
           <textarea
             ref={textareaRef}
             value={text}
             onChange={(e) => {
               setText(e.target.value);
+              if (autoTranslated) setAutoTranslated(null);
               autoGrow();
             }}
             onKeyDown={onKeyDown}
             onFocus={() => setInputFocused(true)}
-            onBlur={() => setInputFocused(false)}
+            onBlur={(e) => {
+              setInputFocused(false);
+              const to = e.relatedTarget;
+              // 失焦到提示词助手不算离开输入：不要在用户挑模板时偷偷翻译
+              if (
+                to instanceof Element &&
+                to.closest("[data-assist-toggle], [data-assist-panel]")
+              ) {
+                return;
+              }
+              if (assistOpen) return;
+              scheduleAutoTranslate(textRef.current);
+            }}
             rows={1}
-            placeholder="描述你想要的画面…"
-            aria-label="提示词"
+            placeholder={t("描述你想要的画面…")}
+            aria-label={t("提示词")}
             className="block max-h-[150px] w-full resize-none bg-transparent px-3 pb-1 pt-2 text-body leading-relaxed text-primary outline-none placeholder:text-tertiary"
           />
 
           <div className="flex items-center gap-1 px-1.5 pb-1.5">
             <IconButton
-              label="提示词助手"
+              label={t("提示词助手")}
               icon={<IconSparkle size={18} />}
               variant={assistOpen ? "secondary" : "ghost"}
               aria-expanded={assistOpen}
+              data-assist-toggle
               onClick={() => setAssistOpen(!assistOpen)}
             />
             <IconButton
-              label="参考图"
+              label={t("参考图")}
               icon={<IconImage size={18} />}
               onClick={() => fileRef.current?.click()}
             />
@@ -690,7 +1111,7 @@ export default function Composer() {
             <span className="flex-1" />
             {mode === "expert" && (
               <IconButton
-                label="加入队列"
+                label={t("加入队列")}
                 icon={<IconQueue size={18} />}
                 disabled={!text.trim() || sending || enqueuing}
                 onClick={() => void doEnqueue()}
@@ -698,7 +1119,7 @@ export default function Composer() {
             )}
             {sending ? (
               <IconButton
-                label="停止"
+                label={t("停止")}
                 icon={<IconStop size={13} />}
                 variant="danger"
                 shape="pill"
@@ -706,7 +1127,7 @@ export default function Composer() {
               />
             ) : (
               <IconButton
-                label="生成"
+                label={t("生成")}
                 icon={
                   <IconSend
                     size={15}
@@ -723,10 +1144,10 @@ export default function Composer() {
         </div>
 
         <div className="mt-1.5 flex items-center justify-center gap-2 text-center text-footnote text-quaternary">
-          <span>Enter 发送 · Shift Enter 换行 · / 提示词助手</span>
+          <span>{t("Enter 发送 · Shift Enter 换行 · / 提示词助手")}</span>
           {attachments.length > 0 && (
             <span className="text-tertiary">
-              · {attachments.length} 张参考图
+              · {t("{{n}} 张参考图", { n: attachments.length })}
             </span>
           )}
         </div>

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { motion } from "framer-motion";
 import SafeImg from "./SafeImg";
 import { extFromDataUrl, saveDataUrl } from "../lib/save";
@@ -34,6 +35,7 @@ export default function ImageViewer({
   onIndexChange: (i: number) => void;
   onClose: () => void;
 }) {
+  const { t } = useTranslation();
   const [scale, setScale] = useState(1);
   const [offset, setOffset] = useState({ x: 0, y: 0 });
   const [fullscreen, setFullscreen] = useState(false);
@@ -84,7 +86,7 @@ export default function ImageViewer({
       ref={containerRef}
       role="dialog"
       aria-modal="true"
-      aria-label="图片查看器"
+      aria-label={t("图片查看器")}
       className="fixed inset-0 z-50 flex flex-col bg-stage"
       onClick={onClose}
     >
@@ -103,10 +105,10 @@ export default function ImageViewer({
               onClick={() => {
                 void navigator.clipboard
                   .writeText(current.prompt ?? "")
-                  .then(() => toast("已复制提示词"))
-                  .catch(() => toast("复制失败", "error"));
+                  .then(() => toast(t("已复制提示词")))
+                  .catch(() => toast(t("复制失败"), "error"));
               }}
-              aria-label="复制提示词"
+              aria-label={t("复制提示词")}
               className={BAR_BTN}
             >
               <IconCopy size={15} />
@@ -118,9 +120,9 @@ export default function ImageViewer({
               void saveDataUrl(
                 current.dataUrl,
                 `moling-${index + 1}.${extFromDataUrl(current.dataUrl)}`,
-              ).catch(() => toast("下载失败", "error"))
+              ).catch(() => toast(t("下载失败"), "error"))
             }
-            aria-label="下载图片"
+            aria-label={t("下载图片")}
             className={BAR_BTN}
           >
             <IconDownload size={15} />
@@ -134,7 +136,7 @@ export default function ImageViewer({
                 containerRef.current?.requestFullscreen();
               }
             }}
-            aria-label={fullscreen ? "退出全屏" : "全屏查看"}
+            aria-label={fullscreen ? t("退出全屏") : t("全屏查看")}
             className={BAR_BTN}
           >
             <IconExpand size={15} />
@@ -142,7 +144,7 @@ export default function ImageViewer({
           <button
             type="button"
             onClick={onClose}
-            aria-label="关闭查看器"
+            aria-label={t("关闭查看器")}
             className={BAR_BTN}
           >
             <IconClose size={15} />
@@ -189,7 +191,7 @@ export default function ImageViewer({
               e.stopPropagation();
               onIndexChange(index - 1);
             }}
-            aria-label="上一张"
+            aria-label={t("上一张")}
             className={`glass-media absolute left-3 ${BAR_BTN}`}
           >
             <IconChevron direction="left" size={18} />
@@ -202,7 +204,7 @@ export default function ImageViewer({
               e.stopPropagation();
               onIndexChange(index + 1);
             }}
-            aria-label="下一张"
+            aria-label={t("下一张")}
             className={`glass-media absolute right-3 ${BAR_BTN}`}
           >
             <IconChevron direction="right" size={18} />
@@ -219,7 +221,7 @@ export default function ImageViewer({
               key={`${image.dataUrl.slice(-12)}-${i}`}
               type="button"
               onClick={() => onIndexChange(i)}
-              aria-label={`查看第 ${i + 1} 张`}
+              aria-label={t("查看第 {{n}} 张", { n: i + 1 })}
               aria-current={i === index ? "true" : undefined}
               className={
                 i === index

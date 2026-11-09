@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import { api, HistoryItem } from "../lib/api";
 import { sizeLabel } from "../lib/types";
 import { Dialog } from "./ui/Dialog";
@@ -9,9 +10,9 @@ import { IconChevron } from "./Icons";
 
 type Mode = "slide" | "side";
 
-function metaOf(item: HistoryItem) {
+function metaOf(item: HistoryItem, unknownModel: string) {
   const h = item.history;
-  return `${h.model || "未知模型"} · ${sizeLabel(h.width, h.height)} · #${h.id}`;
+  return `${h.model || unknownModel} · ${sizeLabel(h.width, h.height)} · #${h.id}`;
 }
 
 /** 对比主体：按两图 id 作 key 挂载，切换组合时位置与加载状态自然重置 */
@@ -22,6 +23,7 @@ function CompareBody({
   left: HistoryItem;
   right: HistoryItem;
 }) {
+  const { t } = useTranslation();
   const [mode, setMode] = useState<Mode>("slide");
   const [pos, setPos] = useState(50);
   const [urls, setUrls] = useState<{ left: string; right: string } | null>(
@@ -64,22 +66,22 @@ function CompareBody({
       <SegmentedControl
         value={mode}
         onValueChange={(v) => setMode(v as Mode)}
-        label="对比模式"
+        label={t("对比模式")}
         size="sm"
         options={[
-          { value: "slide", label: "滑动对比" },
-          { value: "side", label: "并排对比" },
+          { value: "slide", label: t("滑动对比") },
+          { value: "side", label: t("并排对比") },
         ]}
       />
 
       {failed && (
         <div className="rounded-card bg-fill px-3 py-6 text-center text-footnote text-tertiary">
-          原图不可用，无法对比
+          {t("原图不可用，无法对比")}
         </div>
       )}
       {!failed && !ready && (
         <div className="rounded-card bg-fill px-3 py-6 text-center text-footnote text-tertiary">
-          加载原图中…
+          {t("加载原图中…")}
         </div>
       )}
 
@@ -87,7 +89,7 @@ function CompareBody({
         <div
           ref={stageRef}
           role="slider"
-          aria-label="对比分隔位置"
+          aria-label={t("对比分隔位置")}
           aria-valuemin={0}
           aria-valuemax={100}
           aria-valuenow={pos}
@@ -119,7 +121,7 @@ function CompareBody({
         >
           <SafeImg
             src={urls.right}
-            alt={right.history.prompt || "右图"}
+            alt={right.history.prompt || t("右图")}
             className="pointer-events-none absolute inset-0 h-full w-full object-contain"
           />
           <div
@@ -128,15 +130,15 @@ function CompareBody({
           >
             <SafeImg
               src={urls.left}
-              alt={left.history.prompt || "左图"}
+              alt={left.history.prompt || t("左图")}
               className="h-full w-full object-contain"
             />
           </div>
           <span className="glass-media pointer-events-none absolute bottom-2 left-2 rounded-pill px-2 py-0.5 text-caption text-on-accent">
-            左 #{left.history.id}
+            {t("左 #{{id}}", { id: left.history.id })}
           </span>
           <span className="glass-media pointer-events-none absolute bottom-2 right-2 rounded-pill px-2 py-0.5 text-caption text-on-accent">
-            右 #{right.history.id}
+            {t("右 #{{id}}", { id: right.history.id })}
           </span>
           <div
             className="pointer-events-none absolute inset-y-0 w-0.5 bg-accent-fill"
@@ -162,14 +164,16 @@ function CompareBody({
               <div className="flex aspect-square items-center justify-center overflow-hidden rounded-card bg-sunken">
                 <SafeImg
                   src={i === 0 ? urls.left : urls.right}
-                  alt={item.history.prompt || "对比图"}
+                  alt={item.history.prompt || t("对比图")}
                   className="h-full w-full object-contain"
                 />
               </div>
               <div className="line-clamp-2 text-footnote leading-snug text-secondary">
-                {item.history.prompt || "（无提示词）"}
+                {item.history.prompt || t("（无提示词）")}
               </div>
-              <div className="text-caption text-tertiary">{metaOf(item)}</div>
+              <div className="text-caption text-tertiary">
+                {metaOf(item, t("未知模型"))}
+              </div>
             </div>
           ))}
         </div>
@@ -190,8 +194,14 @@ export default function CompareDialog({
   right: HistoryItem | null;
   onClose: () => void;
 }) {
+  const { t } = useTranslation();
   const title =
-    left && right ? `对比 #${left.history.id} 与 #${right.history.id}` : "对比";
+    left && right
+      ? t("对比 #{{a}} 与 #{{b}}", {
+          a: left.history.id,
+          b: right.history.id,
+        })
+      : t("对比");
   return (
     <Dialog
       open={open}
@@ -199,11 +209,11 @@ export default function CompareDialog({
         if (!v) onClose();
       }}
       title={title}
-      description="滑动模式拖动分隔线（或按 ← →）查看两图差异"
+      description={t("滑动模式拖动分隔线（或按 ← →）查看两图差异")}
       size="lg"
       footer={
         <Button variant="primary" onClick={onClose}>
-          关闭
+          {t("关闭")}
         </Button>
       }
     >

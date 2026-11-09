@@ -1,4 +1,5 @@
 import * as SelectPrimitive from "@radix-ui/react-select";
+import { useTranslation } from "react-i18next";
 import { IconCheck, IconChevron } from "../Icons";
 import { cn } from "./cn";
 
@@ -34,7 +35,7 @@ export function Select({
   value,
   onValueChange,
   options,
-  placeholder = "请选择",
+  placeholder,
   disabled,
   label,
   id,
@@ -42,6 +43,7 @@ export function Select({
   widthClass,
   className,
 }: SelectProps) {
+  const { t } = useTranslation();
   return (
     <SelectPrimitive.Root
       value={toRadix(value)}
@@ -66,7 +68,7 @@ export function Select({
           className,
         )}
       >
-        <SelectPrimitive.Value placeholder={placeholder} />
+        <SelectPrimitive.Value placeholder={placeholder ?? t("请选择")} />
         <SelectPrimitive.Icon className="text-tertiary">
           <IconChevron size={14} />
         </SelectPrimitive.Icon>

@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { api, PresetInput, PromptFavorite, WorkflowPreset } from "../lib/api";
+import i18n from "../i18n";
 import { genAttachmentId } from "../lib/file";
 import { toast } from "../lib/notify";
 import { useAppStore, GenPrefs, SIZE_MAX, SIZE_MIN } from "./appStore";
@@ -84,7 +85,7 @@ export const usePromptAssetsStore = create<PromptAssetsState>((set, get) => ({
       ]);
       set({ favorites, presets, loaded: true });
     } catch {
-      toast("加载提示词资产失败，请稍后重试", "error");
+      toast(i18n.t("加载提示词资产失败，请稍后重试"), "error");
     } finally {
       set({ loading: false });
     }
@@ -101,7 +102,7 @@ export const usePromptAssetsStore = create<PromptAssetsState>((set, get) => ({
       }));
       return existed ? "updated" : "created";
     } catch (e) {
-      toast(`收藏失败：${String(e)}`, "error");
+      toast(i18n.t("收藏失败：{{error}}", { error: String(e) }), "error");
       return null;
     }
   },
@@ -111,7 +112,7 @@ export const usePromptAssetsStore = create<PromptAssetsState>((set, get) => ({
       await api.deleteFavorite(id);
       set((s) => ({ favorites: s.favorites.filter((f) => f.id !== id) }));
     } catch (e) {
-      toast(`删除收藏失败：${String(e)}`, "error");
+      toast(i18n.t("删除收藏失败：{{error}}", { error: String(e) }), "error");
     }
   },
 
@@ -123,7 +124,7 @@ export const usePromptAssetsStore = create<PromptAssetsState>((set, get) => ({
       }));
       return saved;
     } catch (e) {
-      toast(`保存预设失败：${String(e)}`, "error");
+      toast(i18n.t("保存预设失败：{{error}}", { error: String(e) }), "error");
       return null;
     }
   },
@@ -133,7 +134,7 @@ export const usePromptAssetsStore = create<PromptAssetsState>((set, get) => ({
       await api.deletePreset(id);
       set((s) => ({ presets: s.presets.filter((p) => p.id !== id) }));
     } catch (e) {
-      toast(`删除预设失败：${String(e)}`, "error");
+      toast(i18n.t("删除预设失败：{{error}}", { error: String(e) }), "error");
     }
   },
 
@@ -165,7 +166,10 @@ export const usePromptAssetsStore = create<PromptAssetsState>((set, get) => ({
       }
     }
     if (skipped > 0) {
-      toast(`已应用预设，${skipped} 张参考图不可用被跳过`, "error");
+      toast(
+        i18n.t("已应用预设，{{n}} 张参考图不可用被跳过", { n: skipped }),
+        "error",
+      );
     }
   },
 }));
