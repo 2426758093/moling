@@ -2,7 +2,13 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { TransformTarget, useAppStore } from "../stores/appStore";
 import { useProviderStore } from "../stores/providerStore";
-import { api, adapterErrorTitle, parseAdapterError, isUnconfirmedError, AdapterError } from "../lib/api";
+import {
+  api,
+  adapterErrorTitle,
+  parseAdapterError,
+  isUnconfirmedError,
+  AdapterError,
+} from "../lib/api";
 import { deliverEditResult } from "../lib/deliverEditResult";
 import { ensureRasterDataUrl } from "../lib/file";
 import { toast } from "../lib/notify";
@@ -124,7 +130,9 @@ function TransformBody({
     try {
       const outcome = await api.recoverImageRequestByClient(requestId);
       const suffix =
-        outcome.failed > 0 ? t("（{{n}} 张仍失败）", { n: outcome.failed }) : "";
+        outcome.failed > 0
+          ? t("（{{n}} 张仍失败）", { n: outcome.failed })
+          : "";
       toast(
         t("已恢复 {{n}} 张到画廊", { n: outcome.recovered }) + suffix,
         outcome.failed > 0 ? "error" : "info",
@@ -141,154 +149,154 @@ function TransformBody({
   return (
     <>
       <Dialog
-      open
-      onOpenChange={(open) => {
-        if (!open) close();
-      }}
-      title={isUpscale ? t("高清放大") : t("风格转换")}
-      description={
-        isUpscale
-          ? t("按倍数重新绘制，放大结果会保留原图作为父记录")
-          : t("按风格描述重新绘制，构图与主体保持不变")
-      }
-      footer={
-        <>
-          <Button variant="ghost" size="sm" onClick={close}>
-            {t("取消")}
-          </Button>
-          <Button
-            variant="primary"
-            size="sm"
-            loading={busy}
-            disabled={!canSubmit}
-            onClick={() => void submit()}
-          >
-            {t("开始处理")}
-          </Button>
-        </>
-      }
-    >
-      <div className="flex flex-col gap-4 pb-2">
-        <div className="flex items-start gap-3">
-          <SafeImg
-            src={target.dataUrl}
-            alt={t("待处理图片")}
-            className="h-24 w-24 shrink-0 rounded-card border border-line object-cover"
-          />
-          <p className="min-w-0 flex-1 text-footnote text-tertiary">
-            {target.prompt || t("（无提示词）")}
-          </p>
-        </div>
-
-        <div className="flex flex-col gap-1.5">
-          <span className="text-caption text-tertiary">{t("模型")}</span>
-          <Select
-            label={t("模型")}
-            value={model}
-            onValueChange={setModel}
-            placeholder={t("（未选择）")}
-            disabled={models.length === 0}
-            options={models.map((m) => ({ value: m, label: m }))}
-          />
-        </div>
-
-        {isUpscale ? (
+        open
+        onOpenChange={(open) => {
+          if (!open) close();
+        }}
+        title={isUpscale ? t("高清放大") : t("风格转换")}
+        description={
+          isUpscale
+            ? t("按倍数重新绘制，放大结果会保留原图作为父记录")
+            : t("按风格描述重新绘制，构图与主体保持不变")
+        }
+        footer={
           <>
-            <div className="flex items-center justify-between gap-3">
-              <span className="text-caption text-tertiary">{t("倍数")}</span>
-              <SegmentedControl
-                label={t("放大倍数")}
-                value={scale}
-                onValueChange={(v) => setScale(v)}
-                size="sm"
-                options={[
-                  { value: "2", label: "2x" },
-                  { value: "4", label: "4x" },
-                ]}
-              />
-            </div>
-            <div className="flex items-center justify-between gap-3">
-              <span className="text-caption text-tertiary">{t("模式")}</span>
-              <SegmentedControl
-                label={t("放大模式")}
-                value={mode}
-                onValueChange={(v) => setMode(v)}
-                size="sm"
-                options={[
-                  { value: "detail", label: t("细节增强") },
-                  { value: "faithful", label: t("忠实还原") },
-                ]}
-              />
-            </div>
+            <Button variant="ghost" size="sm" onClick={close}>
+              {t("取消")}
+            </Button>
+            <Button
+              variant="primary"
+              size="sm"
+              loading={busy}
+              disabled={!canSubmit}
+              onClick={() => void submit()}
+            >
+              {t("开始处理")}
+            </Button>
           </>
-        ) : (
-          <>
-            <div className="flex flex-col gap-1.5">
-              <span className="text-caption text-tertiary">{t("风格")}</span>
-              <div className="flex flex-wrap gap-1.5">
-                {stylePresets.map((p) => (
-                  <Button
-                    key={p.id}
-                    size="sm"
-                    variant={preset === p.prompt ? "secondary" : "ghost"}
-                    aria-pressed={preset === p.prompt}
-                    onClick={() =>
-                      setPreset(preset === p.prompt ? "" : p.prompt)
-                    }
-                  >
-                    {p.label}
-                  </Button>
-                ))}
-              </div>
-            </div>
-            <Input
-              label={t("补充描述（可选）")}
-              value={extra}
-              onChange={(e) => setExtra(e.target.value)}
-              placeholder={t("例如：暖色调、柔和光线…")}
+        }
+      >
+        <div className="flex flex-col gap-4 pb-2">
+          <div className="flex items-start gap-3">
+            <SafeImg
+              src={target.dataUrl}
+              alt={t("待处理图片")}
+              className="h-24 w-24 shrink-0 rounded-card border border-line object-cover"
             />
-          </>
-        )}
-
-        {error && (
-          <div
-            role="alert"
-            className="flex flex-col gap-1.5 rounded-card border border-danger/25 bg-danger/10 px-3 py-2 text-footnote text-danger"
-          >
-            <span>{error}</span>
-            {unconfirmed && (
-              <span className="text-warning">
-                {t("可能已计费，重试会再次扣费")}
-              </span>
-            )}
-            {requestId && (
-              <div className="flex flex-wrap items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    void navigator.clipboard
-                      .writeText(requestId)
-                      .then(() => toast(t("已复制请求 ID")))
-                      .catch(() => toast(t("复制失败"), "error"));
-                  }}
-                  className="break-all text-left transition-colors hover:text-primary"
-                  title={t("复制请求 ID（对账用）")}
-                >
-                  {t("请求 ID：{{id}}", { id: requestId })}
-                </button>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  loading={recovering}
-                  onClick={() => void recover()}
-                >
-                  {t("尝试恢复")}
-                </Button>
-              </div>
-            )}
+            <p className="min-w-0 flex-1 text-footnote text-tertiary">
+              {target.prompt || t("（无提示词）")}
+            </p>
           </div>
-        )}
-      </div>
+
+          <div className="flex flex-col gap-1.5">
+            <span className="text-caption text-tertiary">{t("模型")}</span>
+            <Select
+              label={t("模型")}
+              value={model}
+              onValueChange={setModel}
+              placeholder={t("（未选择）")}
+              disabled={models.length === 0}
+              options={models.map((m) => ({ value: m, label: m }))}
+            />
+          </div>
+
+          {isUpscale ? (
+            <>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-caption text-tertiary">{t("倍数")}</span>
+                <SegmentedControl
+                  label={t("放大倍数")}
+                  value={scale}
+                  onValueChange={(v) => setScale(v)}
+                  size="sm"
+                  options={[
+                    { value: "2", label: "2x" },
+                    { value: "4", label: "4x" },
+                  ]}
+                />
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <span className="text-caption text-tertiary">{t("模式")}</span>
+                <SegmentedControl
+                  label={t("放大模式")}
+                  value={mode}
+                  onValueChange={(v) => setMode(v)}
+                  size="sm"
+                  options={[
+                    { value: "detail", label: t("细节增强") },
+                    { value: "faithful", label: t("忠实还原") },
+                  ]}
+                />
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="flex flex-col gap-1.5">
+                <span className="text-caption text-tertiary">{t("风格")}</span>
+                <div className="flex flex-wrap gap-1.5">
+                  {stylePresets.map((p) => (
+                    <Button
+                      key={p.id}
+                      size="sm"
+                      variant={preset === p.prompt ? "secondary" : "ghost"}
+                      aria-pressed={preset === p.prompt}
+                      onClick={() =>
+                        setPreset(preset === p.prompt ? "" : p.prompt)
+                      }
+                    >
+                      {p.label}
+                    </Button>
+                  ))}
+                </div>
+              </div>
+              <Input
+                label={t("补充描述（可选）")}
+                value={extra}
+                onChange={(e) => setExtra(e.target.value)}
+                placeholder={t("例如：暖色调、柔和光线…")}
+              />
+            </>
+          )}
+
+          {error && (
+            <div
+              role="alert"
+              className="flex flex-col gap-1.5 rounded-card border border-danger/25 bg-danger/10 px-3 py-2 text-footnote text-danger"
+            >
+              <span>{error}</span>
+              {unconfirmed && (
+                <span className="text-warning">
+                  {t("可能已计费，重试会再次扣费")}
+                </span>
+              )}
+              {requestId && (
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      void navigator.clipboard
+                        .writeText(requestId)
+                        .then(() => toast(t("已复制请求 ID")))
+                        .catch(() => toast(t("复制失败"), "error"));
+                    }}
+                    className="break-all text-left transition-colors hover:text-primary"
+                    title={t("复制请求 ID（对账用）")}
+                  >
+                    {t("请求 ID：{{id}}", { id: requestId })}
+                  </button>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    loading={recovering}
+                    onClick={() => void recover()}
+                  >
+                    {t("尝试恢复")}
+                  </Button>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
       </Dialog>
 
       <ConfirmDialog

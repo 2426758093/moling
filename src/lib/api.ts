@@ -62,12 +62,21 @@ export type AdapterError =
   | { type: "unsupported"; message: string }
   | { type: "upstream"; message: string; status?: number }
   | { type: "body_interrupted"; message: string }
-  | { type: "unconfirmed"; message: string; request_id?: string; artifact?: string }
+  | {
+      type: "unconfirmed";
+      message: string;
+      request_id?: string;
+      artifact?: string;
+    }
   | { type: "other"; message: string };
 
 /** 可能已计费：重试前必须让用户先对账，否则会重复扣费 */
 export function isUnconfirmedError(e: AdapterError): boolean {
-  return e.type === "unconfirmed" || e.type === "upstream" || e.type === "body_interrupted";
+  return (
+    e.type === "unconfirmed" ||
+    e.type === "upstream" ||
+    e.type === "body_interrupted"
+  );
 }
 
 export function parseAdapterError(raw: string): AdapterError {
@@ -181,7 +190,8 @@ export interface RecoverOutcome {
   failed: number;
 }
 
-export interface MediaMigrationReport {  from: string;
+export interface MediaMigrationReport {
+  from: string;
   to: string;
   filesCopied: number;
   bytesCopied: number;
@@ -630,7 +640,9 @@ export const api = {
   recoverImageRequest: (id: number) =>
     invoke<RecoverOutcome>("recover_image_request", { id }),
   recoverImageRequestByClient: (clientRequestId: string) =>
-    invoke<RecoverOutcome>("recover_image_request_by_client", { clientRequestId }),
+    invoke<RecoverOutcome>("recover_image_request_by_client", {
+      clientRequestId,
+    }),
   abandonImageRequest: (id: number) =>
     invoke<void>("abandon_image_request", { id }),
   getRequestsDir: () => invoke<string>("get_requests_dir"),

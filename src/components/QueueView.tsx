@@ -247,9 +247,7 @@ function JobRow({ job }: { job: QueueJob }) {
           <span className="min-w-0 flex-1 truncate text-callout text-primary">
             {job.prompt}
           </span>
-          {billingUnconfirmed && (
-            <Badge tone="warning">{t("待确认")}</Badge>
-          )}
+          {billingUnconfirmed && <Badge tone="warning">{t("待确认")}</Badge>}
           {backoffLeft > 0 && (
             <Badge tone="warning">{t("限流 {{n}}s", { n: backoffLeft })}</Badge>
           )}
@@ -344,40 +342,40 @@ function JobRow({ job }: { job: QueueJob }) {
             (job.status === "failed" ||
               job.status === "canceled" ||
               job.status === "interrupted") && (
-            <div className="mt-2.5">
-              <button
-                type="button"
-                onClick={() => setErrorOpen((v) => !v)}
-                aria-expanded={errorOpen}
-                className="pressable flex w-full items-center gap-1.5 rounded-btn px-1 py-0.5 text-left text-footnote text-danger transition-colors hover:bg-danger/8"
-              >
-                <IconAlert size={13} />
-                <span className="truncate font-medium">
-                  {adapterErrorTitle(error)}
-                </span>
-                <IconChevron
-                  direction={errorOpen ? "down" : "right"}
-                  size={11}
-                  className="ml-auto shrink-0"
-                />
-              </button>
-              {errorOpen && (
-                <div className="mt-1 rounded-btn bg-danger/8 px-2.5 py-2">
-                  <div className="max-h-24 overflow-y-auto break-all text-footnote text-secondary">
-                    {error.message}
+              <div className="mt-2.5">
+                <button
+                  type="button"
+                  onClick={() => setErrorOpen((v) => !v)}
+                  aria-expanded={errorOpen}
+                  className="pressable flex w-full items-center gap-1.5 rounded-btn px-1 py-0.5 text-left text-footnote text-danger transition-colors hover:bg-danger/8"
+                >
+                  <IconAlert size={13} />
+                  <span className="truncate font-medium">
+                    {adapterErrorTitle(error)}
+                  </span>
+                  <IconChevron
+                    direction={errorOpen ? "down" : "right"}
+                    size={11}
+                    className="ml-auto shrink-0"
+                  />
+                </button>
+                {errorOpen && (
+                  <div className="mt-1 rounded-btn bg-danger/8 px-2.5 py-2">
+                    <div className="max-h-24 overflow-y-auto break-all text-footnote text-secondary">
+                      {error.message}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => copy(error.message, t("错误详情已复制"))}
+                      className="pressable mt-1 flex h-6 items-center gap-1 rounded-chip px-1.5 text-caption text-secondary transition-colors hover:bg-hover hover:text-primary"
+                    >
+                      <IconCopy size={12} />
+                      {t("复制错误")}
+                    </button>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => copy(error.message, t("错误详情已复制"))}
-                    className="pressable mt-1 flex h-6 items-center gap-1 rounded-chip px-1.5 text-caption text-secondary transition-colors hover:bg-hover hover:text-primary"
-                  >
-                    <IconCopy size={12} />
-                    {t("复制错误")}
-                  </button>
-                </div>
-              )}
-            </div>
-          )}
+                )}
+              </div>
+            )}
         </div>
       )}
       <ConfirmDialog

@@ -60,7 +60,10 @@ export default function RequestsSection() {
       })
       .catch((e) => {
         if (alive) {
-          toast(t("加载请求记录失败：{{error}}", { error: String(e) }), "error");
+          toast(
+            t("加载请求记录失败：{{error}}", { error: String(e) }),
+            "error",
+          );
         }
       });
     return () => {

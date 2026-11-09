@@ -447,7 +447,8 @@ export const useChatStore = create<ChatState>((set, get) => {
       // 3. 停止/取消语义：已生成的图片保留并照常持久化，assistant 消息标记 stopped。
       //    若这次请求以「可能已计费」结束，即使已停止也要如实提示结果未确认。
       if (cancelled || get().stopRequested) {
-        const unconfirmed = genError && isUnconfirmedError(genError) ? genError : null;
+        const unconfirmed =
+          genError && isUnconfirmedError(genError) ? genError : null;
         updateAssistant({
           status: unconfirmed ? "error" : "stopped",
           error: unconfirmed,
@@ -459,7 +460,10 @@ export const useChatStore = create<ChatState>((set, get) => {
         });
         await persistAssistant(images, false);
         if (unconfirmed) {
-          toast(i18n.t("已停止等待，但结果未确认，请先到服务商后台核对是否计费"), "error");
+          toast(
+            i18n.t("已停止等待，但结果未确认，请先到服务商后台核对是否计费"),
+            "error",
+          );
         } else if (images.length > 0) {
           toast(i18n.t("已停止等待，结果已保存"));
         }

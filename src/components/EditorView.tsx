@@ -3,7 +3,13 @@ import { motion, useReducedMotion } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import { useAppStore } from "../stores/appStore";
 import { useProviderStore } from "../stores/providerStore";
-import { api, parseAdapterError, adapterErrorTitle, isUnconfirmedError, AdapterError } from "../lib/api";
+import {
+  api,
+  parseAdapterError,
+  adapterErrorTitle,
+  isUnconfirmedError,
+  AdapterError,
+} from "../lib/api";
 import { deliverEditResult } from "../lib/deliverEditResult";
 import { toast } from "../lib/notify";
 import { DUR, EASE } from "../lib/motion";
@@ -178,7 +184,9 @@ export default function EditorView() {
     try {
       const outcome = await api.recoverImageRequestByClient(requestId);
       const suffix =
-        outcome.failed > 0 ? t("（{{n}} 张仍失败）", { n: outcome.failed }) : "";
+        outcome.failed > 0
+          ? t("（{{n}} 张仍失败）", { n: outcome.failed })
+          : "";
       toast(
         t("已恢复 {{n}} 张到画廊", { n: outcome.recovered }) + suffix,
         outcome.failed > 0 ? "error" : "info",
@@ -406,7 +414,9 @@ export default function EditorView() {
         >
           <span className="min-w-0 flex-1">{error}</span>
           {unconfirmed && (
-            <span className="text-warning">{t("可能已计费，重试会再次扣费")}</span>
+            <span className="text-warning">
+              {t("可能已计费，重试会再次扣费")}
+            </span>
           )}
           {requestId && (
             <button

@@ -99,7 +99,9 @@ export default memo(function MessageItem({
       ? isUnconfirmedError(message.error)
       : false;
   const requestId =
-    message.error?.type === "unconfirmed" ? message.error.request_id : undefined;
+    message.error?.type === "unconfirmed"
+      ? message.error.request_id
+      : undefined;
 
   const requestRetry = () => {
     if (unconfirmed) setConfirmRetry(true);
