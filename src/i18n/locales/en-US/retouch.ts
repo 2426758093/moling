@@ -15,6 +15,13 @@ const retouch = {
   美颜: "Beauty",
   "AI 消除": "AI erase",
   一句话改图: "One-line edit",
+  换背景: "Replace background",
+  高清: "Upscale",
+  扩图: "Outpaint",
+  裁剪调色: "Crop & tone",
+  风格: "Style",
+  局部重绘: "Inpaint",
+  多区域: "Multi-region",
   改图: "Edit",
   开始改图: "Start editing",
   应用: "Apply",
@@ -35,6 +42,33 @@ const retouch = {
   "描述你想怎么改，例如：把背景换成海边日落":
     "Describe the change, e.g. swap the background for a seaside sunset",
   修图面板: "Retouch panels",
+  "涂抹要替换的背景区域，也可先「自动选中背景」再修整":
+    "Paint the background to replace, or auto-select it first and then refine",
+  "纯色 / 渐变 / AI 描述": "Solid / gradient / AI description",
+  应用换背景: "Apply background",
+
+  // 扩图面板
+  "按比例向外扩展画面，AI 补全内容":
+    "Extend the frame outward by ratio and let AI fill it in",
+  原始: "Original",
+  "1:1": "1:1",
+  "4:3": "4:3",
+  "3:4": "3:4",
+  "16:9": "16:9",
+  "9:16": "9:16",
+  "目标尺寸 {{w}} × {{h}}": "Target {{w}} × {{h}}",
+  保持原尺寸: "Keep original size",
+  请选择一个更大的目标比例: "Pick a larger target ratio",
+
+  // 蒙版工具
+  自动选中: "Auto-select",
+
+  // 高清面板
+  "按倍数重新绘制，细节更清晰": "Redraw at a higher scale for more detail",
+  开始放大: "Start upscale",
+
+  // 错误条
+  关闭提示: "Dismiss",
 
   // 分析建议
   偏暗: "Too dark",

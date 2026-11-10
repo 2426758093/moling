@@ -7,7 +7,9 @@ import { useModelCaps } from "../../lib/useModelCaps";
 import {
   api,
   adapterErrorTitle,
+  isUnconfirmedError,
   parseAdapterError,
+  type AdapterError,
   type HistoryRowView,
   type RetouchAnalysis,
   type RetouchOp,
@@ -23,6 +25,7 @@ import {
   DEFAULT_AUTO_STRENGTH,
   DEFAULT_BEAUTY_AMOUNT,
   isCloudRetouchAction,
+  mayBillRetouchAction,
   outputStepDims,
   resolveEditInputSize,
   retouchActionReason,
@@ -33,19 +36,32 @@ import {
   type RetouchGateReason,
   type RetouchStepLabel,
 } from "../../lib/retouchActions";
-import { ERASE_PROMPT } from "../../lib/retouchPrompts";
+import { ERASE_PROMPT, OUTPAINT_PROMPT } from "../../lib/retouchPrompts";
+import {
+  outpaintOffsets,
+  outpaintTargetSize,
+  type OutpaintRatio,
+} from "../../lib/retouchGeometry";
+import { padImageToSize } from "../../lib/retouchCanvas";
 import type { MaskCanvasHandle } from "../MaskCanvas";
 import { Button } from "../ui/Button";
+import { ConfirmDialog } from "../ui/Dialog";
 import { EmptyState } from "../ui/EmptyState";
 import { IconImage } from "../Icons";
 import RetouchHeader from "./RetouchHeader";
 import RetouchStage from "./RetouchStage";
+import RetouchErrorNotice from "./RetouchErrorNotice";
 import ActionRail from "./ActionRail";
 import StepStrip, { type RetouchStep } from "./StepStrip";
 import AutoPanel from "./panels/AutoPanel";
 import BeautyPanel from "./panels/BeautyPanel";
+import BackgroundPanel, {
+  type BackgroundOptions,
+} from "./panels/BackgroundPanel";
 import ErasePanel from "./panels/ErasePanel";
 import InstructionPanel from "./panels/InstructionPanel";
+import OutpaintPanel from "./panels/OutpaintPanel";
+import UpscalePanel from "./panels/UpscalePanel";
 
 /** 专家模式滑杆预览的防抖：拖滑块时每 250ms 最多算一次 */
 const PREVIEW_DEBOUNCE_MS = 250;
@@ -266,7 +282,18 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
     null,
   );
   const [online, setOnline] = useState(() => navigator.onLine !== false);
+  /** 上一次提交的失败（保留到下一次成功）：未确认时要能对账与恢复 */
+  const [lastError, setLastError] = useState<AdapterError | null>(null);
+  const [recovering, setRecovering] = useState(false);
+  const [confirmRetry, setConfirmRetry] = useState(false);
+  /** 当前步的实测尺寸：扩图面板要拿它算目标画布 */
+  const [measured, setMeasured] = useState<{
+    src: string;
+    size: PixelSize;
+  } | null>(null);
   const maskRef = useRef<MaskCanvasHandle | null>(null);
+  /** 用户确认「仍然重新生成」后要执行的那次提交 */
+  const pendingRetry = useRef<(() => void) | null>(null);
   const previewTimer = useRef<number | null>(null);
   const previewSeq = useRef(0);
   /** 已还原过步骤链的 historyId：换底图会重建实例，同一实例只还原一次 */
@@ -409,6 +436,21 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
   const root = steps[0];
   const title = target.title ?? t("修图");
 
+  // 扩图面板要按当前步的真实像素算目标画布；量不到就显示「保持原尺寸」。
+  // 结果连同 src 一起记：换步后旧测量自然失效，不需要在 effect 里同步清状态。
+  useEffect(() => {
+    let alive = true;
+    const src = cur.dataUrl;
+    void measureImageSize(src).then((size) => {
+      if (alive && size) setMeasured({ src, size });
+    });
+    return () => {
+      alive = false;
+    };
+  }, [cur.dataUrl]);
+  const inputSize =
+    measured && measured.src === cur.dataUrl ? measured.size : null;
+
   /// 懒加载某一步的全图：已有就原样返回；同一 key 的并发请求只发一次。
   /// 还原出来的旧步只带缩略图，真要拿它当底图（提交 / 预览 / 对比左图）时才读全图。
   const ensureFullStep = (step: RetouchStep): Promise<RetouchStep> => {
@@ -478,6 +520,13 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
     beauty: retouchActionReason("beauty", gate),
     erase: retouchActionReason("erase", gate),
     instruction: retouchActionReason("instruction", gate),
+    background: retouchActionReason("background", gate),
+    upscale: retouchActionReason("upscale", gate),
+    outpaint: retouchActionReason("outpaint", gate),
+    crop: retouchActionReason("crop", gate),
+    style: retouchActionReason("style", gate),
+    inpaint: retouchActionReason("inpaint", gate),
+    region: retouchActionReason("region", gate),
   };
   const analysisResult =
     analysis && analysis.src === target.dataUrl ? analysis.result : null;
@@ -515,11 +564,26 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
 
   /// 提交动作：统一 busy / 报错 / 清预览；返回是否成功（失败时保留输入）。
   /// `run` 拿到的是「保证带全图」的那一步：还原出来的旧步会先懒加载。
+  /// `force` 只由「确认重新生成」弹窗传来：跳过未确认计费的拦截。
   const commit = async (
     action: RetouchActionId,
     label: RetouchStepLabel,
     run: (src: RetouchStep) => Promise<StepResult>,
+    force = false,
   ): Promise<boolean> => {
+    // 上一次未确认 + 这次可能扣费 + 不是用户确认后的重试 → 先弹确认，不发请求
+    if (
+      !force &&
+      lastError &&
+      isUnconfirmedError(lastError) &&
+      mayBillRetouchAction(action)
+    ) {
+      pendingRetry.current = () => {
+        void commit(action, label, run, true);
+      };
+      setConfirmRetry(true);
+      return false;
+    }
     setBusy(action);
     setPreview(null);
     // 防抖里的预览必须就地取消：只清预览图的话，250ms 后的全尺寸请求
@@ -572,8 +636,13 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
           toast(t("回写画布失败：{{error}}", { error: String(e) }), "error");
         }
       }
+      setLastError(null);
       return true;
     } catch (error) {
+      const parsed = parseAdapterError(
+        error instanceof Error ? error.message : String(error),
+      );
+      setLastError(parsed);
       toast(describeError(error), "error");
       return false;
     } finally {
@@ -714,6 +783,143 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
     });
   };
 
+  const requestId =
+    lastError?.type === "unconfirmed" ? lastError.request_id : undefined;
+
+  /// 未确认的请求按 client request id 对账：命中的结果直接补进画廊
+  const recover = async () => {
+    if (!requestId) return;
+    setRecovering(true);
+    try {
+      const outcome = await api.recoverImageRequestByClient(requestId);
+      const suffix =
+        outcome.failed > 0
+          ? t("（{{n}} 张仍失败）", { n: outcome.failed })
+          : "";
+      toast(
+        t("已恢复 {{n}} 张到画廊", { n: outcome.recovered }) + suffix,
+        outcome.failed > 0 ? "error" : "info",
+      );
+      setLastError(null);
+    } catch (e) {
+      toast(t("恢复失败：{{error}}", { error: String(e) }), "error");
+    } finally {
+      setRecovering(false);
+    }
+  };
+
+  /// 换背景：纯色 / 渐变在本地合成，AI 描述才走服务商（面板已提示计费口径）
+  const applyBackground = (options: BackgroundOptions) => {
+    if (busy) return;
+    const providerId = defaultProviderId;
+    const modelId = model;
+    if (options.kind === "ai" && (providerId == null || !modelId)) {
+      toast(t("请先在设置中配置服务商"), "error");
+      return;
+    }
+    void commit("background", "换背景", async (src) => {
+      const mask = maskRef.current;
+      if (!mask?.hasStrokes()) throw new Error(t("请先涂抹要替换的背景区域"));
+      const maskB64 =
+        options.kind === "ai" ? mask.toAlphaPng() : mask.toLumaPng();
+      if (!maskB64) throw new Error(t("请先涂抹要替换的背景区域"));
+      const out = await api.replaceBackground({
+        imageB64: src.dataUrl,
+        maskB64,
+        parentId: src.historyId ?? undefined,
+        kind: options.kind,
+        color: options.color,
+        colorFrom: options.colorFrom,
+        colorTo: options.colorTo,
+        direction: options.direction,
+        prompt: options.kind === "ai" ? options.prompt.trim() : "",
+        providerId: options.kind === "ai" ? providerId : null,
+        model: options.kind === "ai" ? modelId : undefined,
+      });
+      return {
+        historyId: out.historyId,
+        dataUrl: out.dataUrl,
+        filePath: out.filePath,
+        width: out.width,
+        height: out.height,
+      };
+    });
+  };
+
+  /// 高清放大：模型沿用默认模型，不再复刻旧弹窗的模型下拉
+  const applyUpscale = (scale: 2 | 4, upMode: "detail" | "faithful") => {
+    if (busy) return;
+    const reason = reasons.upscale;
+    if (reason) {
+      toast(t(reason), "error");
+      return;
+    }
+    if (defaultProviderId == null || !model) return;
+    const providerId = defaultProviderId;
+    const modelId = model;
+    void commit("upscale", "高清", async (src) => {
+      const out = await api.transformImage({
+        providerId,
+        model: modelId,
+        imageB64: src.dataUrl,
+        scale,
+        mode: upMode,
+        prompt: "",
+        parentId: src.historyId ?? undefined,
+      });
+      return {
+        historyId: out.historyId,
+        dataUrl: out.dataUrl,
+        filePath: out.filePath,
+        width: out.width,
+        height: out.height,
+      };
+    });
+  };
+
+  /// 扩图：把原图居中画到透明大画布上，再交给 editImage 补全（gpt-image-1 口径）
+  const applyOutpaint = (ratio: OutpaintRatio, prompt: string) => {
+    if (busy) return;
+    const reason = reasons.outpaint;
+    if (reason) {
+      toast(t(reason), "error");
+      return;
+    }
+    if (defaultProviderId == null || !model) return;
+    const providerId = defaultProviderId;
+    const modelId = model;
+    void commit("outpaint", "扩图", async (src) => {
+      const size = await editInputSize(src);
+      if (!size) throw new Error(t("图片尺寸读取失败，请重试"));
+      const target = outpaintTargetSize(size, ratio);
+      if (target.width === size.width && target.height === size.height) {
+        throw new Error(t("请选择一个更大的目标比例"));
+      }
+      const padded = await padImageToSize(
+        src.dataUrl,
+        target,
+        outpaintOffsets(size, target),
+      );
+      const out = await api.editImage({
+        providerId,
+        model: modelId,
+        prompt: prompt || OUTPAINT_PROMPT,
+        imageB64: padded,
+        maskB64: null,
+        width: target.width,
+        height: target.height,
+        op: "outpaint",
+        parentId: src.historyId ?? undefined,
+      });
+      if (out.warning) toast(out.warning, "error");
+      return {
+        historyId: out.historyId,
+        dataUrl: out.dataUrl,
+        filePath: out.filePath,
+      };
+    });
+  };
+
   const onAction = (id: RetouchActionId) => {
     if (busy) return;
     const reason = reasons[id];
@@ -800,6 +1006,40 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
         busy={busy}
         onSubmit={applyInstruction}
       />
+    ) : panel === "background" ? (
+      <BackgroundPanel
+        reason={reasons.background}
+        busy={busy}
+        src={cur.dataUrl}
+        maskRef={maskRef}
+        brushSize={brushSize}
+        onBrushSizeChange={setBrushSize}
+        eraser={eraser}
+        onEraserChange={setEraser}
+        onClearMask={() => maskRef.current?.clear()}
+        aiAvailable={defaultProviderId != null && model !== ""}
+        aiReason={
+          defaultProviderId == null
+            ? "请先在设置中配置服务商"
+            : model === ""
+              ? "请先在设置中选择默认模型"
+              : null
+        }
+        onConfirm={applyBackground}
+      />
+    ) : panel === "outpaint" ? (
+      <OutpaintPanel
+        reason={reasons.outpaint}
+        busy={busy}
+        inputSize={inputSize}
+        onConfirm={applyOutpaint}
+      />
+    ) : panel === "upscale" ? (
+      <UpscalePanel
+        reason={reasons.upscale}
+        busy={busy}
+        onConfirm={applyUpscale}
+      />
     ) : null;
 
   return (
@@ -823,12 +1063,28 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
             previewUrl={previewUrl}
             beforeLabel={t(root.label)}
             afterLabel={previewUrl ? t("预览") : t(cur.label)}
-            maskActive={panel === "erase"}
+            maskActive={
+              panel === "erase" ||
+              panel === "background" ||
+              panel === "inpaint" ||
+              panel === "region"
+            }
             brushSize={brushSize}
             eraser={eraser}
             busy={busy !== null}
             maskRef={maskRef}
           />
+
+          {lastError && (
+            <div className="shrink-0 px-3 pt-2">
+              <RetouchErrorNotice
+                error={lastError}
+                recovering={recovering}
+                onRecover={() => void recover()}
+                onDismiss={() => setLastError(null)}
+              />
+            </div>
+          )}
 
           {stacked && panelNode && (
             <div className="max-h-[45vh] shrink-0 overflow-auto border-t border-line">
@@ -837,6 +1093,7 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
           )}
 
           <ActionRail
+            mode={mode}
             panel={panel}
             busy={busy}
             reasons={reasons}
@@ -865,6 +1122,23 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
           </aside>
         )}
       </div>
+
+      <ConfirmDialog
+        open={confirmRetry}
+        onOpenChange={setConfirmRetry}
+        title={t("确认重新生成？")}
+        description={t(
+          "这次请求可能已在服务商侧计费。重新生成会再次扣费，请先到服务商后台确认没有出图。",
+        )}
+        confirmLabel={t("仍然重新生成")}
+        danger
+        onConfirm={() => {
+          setConfirmRetry(false);
+          const retry = pendingRetry.current;
+          pendingRetry.current = null;
+          retry?.();
+        }}
+      />
     </div>
   );
 }

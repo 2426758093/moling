@@ -3,13 +3,38 @@
 
 import type { RetouchAnalysis, RetouchOp, RetouchSuggestion } from "./api";
 
-export type RetouchActionId = "auto" | "beauty" | "erase" | "instruction";
+export type RetouchActionId =
+  | "auto"
+  | "beauty"
+  | "erase"
+  | "instruction"
+  | "background"
+  | "upscale"
+  | "outpaint"
+  | "crop"
+  | "style"
+  | "inpaint"
+  | "region";
 
 /** 动作 Chip 文案（中文即 i18n key，调用方 t() 后再渲染） */
-export type RetouchActionLabel = "一键优化" | "美颜" | "AI 消除" | "一句话改图";
+export type RetouchActionLabel =
+  | "一键优化"
+  | "美颜"
+  | "AI 消除"
+  | "一句话改图"
+  | "换背景"
+  | "高清"
+  | "扩图"
+  | "裁剪调色"
+  | "风格"
+  | "局部重绘"
+  | "多区域";
 
 /** 步骤条文案：首帧是原图，之后每一步都用动作名；血统里认不出的 op 记作「编辑」 */
 export type RetouchStepLabel = RetouchActionLabel | "原图" | "编辑";
+
+/** 简单模式只放常用动作；专家模式补上重活（计划 §7.3） */
+export type RetouchActionTier = "simple" | "expert";
 
 /**
  * 禁用原因全集：数组即来源，`RetouchGateReason` 由它推导 —— 新增原因时
@@ -41,14 +66,23 @@ export interface RetouchActionDef {
   id: RetouchActionId;
   /** 中文键，调用方 t() 后使用 */
   label: RetouchActionLabel;
+  /** 这个动作可能调用服务商计费（门禁另有口径，见 isLocalRetouchAction） */
   cloud: boolean;
+  tier: RetouchActionTier;
 }
 
 export const RETOUCH_ACTIONS: RetouchActionDef[] = [
-  { id: "auto", label: "一键优化", cloud: false },
-  { id: "beauty", label: "美颜", cloud: false },
-  { id: "erase", label: "AI 消除", cloud: true },
-  { id: "instruction", label: "一句话改图", cloud: true },
+  { id: "auto", label: "一键优化", cloud: false, tier: "simple" },
+  { id: "beauty", label: "美颜", cloud: false, tier: "simple" },
+  { id: "erase", label: "AI 消除", cloud: true, tier: "simple" },
+  { id: "instruction", label: "一句话改图", cloud: true, tier: "simple" },
+  { id: "background", label: "换背景", cloud: false, tier: "simple" },
+  { id: "upscale", label: "高清", cloud: true, tier: "simple" },
+  { id: "outpaint", label: "扩图", cloud: true, tier: "expert" },
+  { id: "crop", label: "裁剪调色", cloud: false, tier: "expert" },
+  { id: "style", label: "风格", cloud: true, tier: "expert" },
+  { id: "inpaint", label: "局部重绘", cloud: true, tier: "expert" },
+  { id: "region", label: "多区域", cloud: true, tier: "expert" },
 ];
 
 /// 重开应用时从历史血统还原步骤：`op` 是 Rust 侧写的动作标签
@@ -64,6 +98,18 @@ export function stepLabelForOp(op: string, index: number): RetouchStepLabel {
       return "AI 消除";
     case "retouch":
       return "一句话改图";
+    case "background":
+      return "换背景";
+    case "upscale":
+      return "高清";
+    case "style":
+      return "风格";
+    case "outpaint":
+      return "扩图";
+    case "basic-edit":
+      return "裁剪调色";
+    case "region-edit":
+      return "多区域";
     default:
       return "编辑";
   }
@@ -75,15 +121,29 @@ export const DEFAULT_BEAUTY_AMOUNT = 0.6;
 /** 美颜固定带一点锐化，抵消磨皮后的发糊 */
 export const BEAUTY_SHARPEN_AMOUNT = 0.25;
 
-const LOCAL_ACTIONS = new Set<RetouchActionId>(["auto", "beauty"]);
+/**
+ * 门禁与「不需要服务商」的动作：一键优化 / 美颜 / 换背景 / 裁剪调色。
+ * 换背景的纯色与渐变是本地合成，离线也必须可用。
+ */
+const FREE_ACTIONS = new Set<RetouchActionId>([
+  "auto",
+  "beauty",
+  "background",
+  "crop",
+]);
 
 export function isLocalRetouchAction(id: RetouchActionId): boolean {
-  return LOCAL_ACTIONS.has(id);
+  return FREE_ACTIONS.has(id);
 }
 
-/** 云动作要上报图片尺寸，本地动作不用 */
+/** 云结果尺寸必须现场实测的动作（背景/裁剪的返回里自带宽高，不用测） */
 export function isCloudRetouchAction(id: RetouchActionId): boolean {
   return !isLocalRetouchAction(id);
+}
+
+/** 这次提交有没有可能扣费：本地动作（含纯色/渐变换背景）为 false */
+export function mayBillRetouchAction(id: RetouchActionId): boolean {
+  return id !== "auto" && id !== "beauty" && id !== "crop";
 }
 
 /** 像素尺寸：一律是原图自然宽高 */
@@ -157,7 +217,11 @@ export function retouchActionReason(
   if (id === "instruction") {
     return ctx.instructionEdit ? null : "当前模型不支持指令改图";
   }
-  return ctx.edit ? null : "当前模型不支持局部编辑";
+  if (id === "erase" || id === "inpaint" || id === "region") {
+    return ctx.edit ? null : "当前模型不支持局部编辑";
+  }
+  // upscale / outpaint / style：沿用 TransformDialog 的口径，不额外要求 transform cap
+  return null;
 }
 
 function clamp01(value: number): number {

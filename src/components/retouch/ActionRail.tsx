@@ -1,13 +1,25 @@
 import type { FormEvent, ReactNode } from "react";
 import { useTranslation } from "react-i18next";
-import { IconBrush, IconChat, IconEraser, IconSparkle } from "../Icons";
+import {
+  IconBrush,
+  IconChat,
+  IconCrop,
+  IconEraser,
+  IconExpand,
+  IconGrid,
+  IconImage,
+  IconPalette,
+  IconSparkle,
+} from "../Icons";
 import { Button } from "../ui/Button";
 import { Input } from "../ui/Field";
 import { cn } from "../ui/cn";
 import {
   RETOUCH_ACTIONS,
+  type RetouchActionDef,
   type RetouchActionId,
   type RetouchActionLabel,
+  type RetouchActionTier,
   type RetouchGateReason,
 } from "../../lib/retouchActions";
 
@@ -16,9 +28,18 @@ const ICONS: Record<RetouchActionId, ReactNode> = {
   beauty: <IconBrush size={14} />,
   erase: <IconEraser size={14} />,
   instruction: <IconChat size={14} />,
+  background: <IconImage size={14} />,
+  upscale: <IconSparkle size={14} />,
+  outpaint: <IconExpand size={14} />,
+  crop: <IconCrop size={14} />,
+  style: <IconPalette size={14} />,
+  inpaint: <IconBrush size={14} />,
+  region: <IconGrid size={14} />,
 };
 
 interface Props {
+  /** 简单模式只显示 simple tier 的 Chip */
+  mode: RetouchActionTier;
   /** 当前展开的面板 */
   panel: RetouchActionId | null;
   busy: RetouchActionId | null;
@@ -37,11 +58,13 @@ interface ReasonGroup {
 }
 
 /// 禁用原因按相同文案合并：两个云动作同时离线时只出现一行。
+/// 只统计当前模式可见的动作，否则简单模式会报「扩图：当前离线」。
 function groupedReasons(
   reasons: Record<RetouchActionId, RetouchGateReason | null>,
+  actions: RetouchActionDef[],
 ): ReasonGroup[] {
   const groups = new Map<RetouchGateReason, RetouchActionLabel[]>();
-  for (const action of RETOUCH_ACTIONS) {
+  for (const action of actions) {
     const reason = reasons[action.id];
     if (!reason) continue;
     const labels = groups.get(reason) ?? [];
@@ -65,8 +88,9 @@ function BusyDots() {
   );
 }
 
-/// 底部动作栏：4 个 Chip + 一句话输入框。简单模式也只有这两样。
+/// 底部动作栏：按模式过滤的 Chip + 一句话输入框。简单模式恰好 6 个。
 export default function ActionRail({
+  mode,
   panel,
   busy,
   reasons,
@@ -77,7 +101,10 @@ export default function ActionRail({
   onAction,
 }: Props) {
   const { t } = useTranslation();
-  const groups = groupedReasons(reasons);
+  const visible = RETOUCH_ACTIONS.filter(
+    (action) => mode === "expert" || action.tier === "simple",
+  );
+  const groups = groupedReasons(reasons, visible);
   const instructionReason = reasons.instruction;
   // 一行放不下时靠 title 兜底：完整原因不能被 truncate 吃掉
   const reasonText = groups
@@ -95,7 +122,7 @@ export default function ActionRail({
   return (
     <div className="shrink-0 border-t border-separator px-3 py-2">
       <div className="flex flex-wrap items-center gap-1.5">
-        {RETOUCH_ACTIONS.map((action) => {
+        {visible.map((action) => {
           const reason = reasons[action.id];
           const active = panel === action.id;
           const loading = busy === action.id;

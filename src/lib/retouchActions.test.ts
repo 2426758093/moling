@@ -8,6 +8,7 @@ import {
   DEFAULT_BEAUTY_AMOUNT,
   isCloudRetouchAction,
   isLocalRetouchAction,
+  mayBillRetouchAction,
   outputStepDims,
   resolveEditInputSize,
   retouchActionReason,
@@ -26,29 +27,82 @@ const PERFECT: RetouchGateCtx = {
 };
 
 describe("RETOUCH_ACTIONS", () => {
-  it("只暴露 v2.1.0 的四个动作，本地/云标记正确", () => {
+  it("11 个动作按固定顺序暴露，cloud 标记正确", () => {
     expect(RETOUCH_ACTIONS.map((a) => a.id)).toEqual([
       "auto",
       "beauty",
       "erase",
       "instruction",
+      "background",
+      "upscale",
+      "outpaint",
+      "crop",
+      "style",
+      "inpaint",
+      "region",
     ]);
     expect(RETOUCH_ACTIONS.filter((a) => a.cloud).map((a) => a.id)).toEqual([
       "erase",
       "instruction",
+      "upscale",
+      "outpaint",
+      "style",
+      "inpaint",
+      "region",
     ]);
   });
 
-  it("本地动作判定只认 auto / beauty", () => {
-    expect(isLocalRetouchAction("auto")).toBe(true);
-    expect(isLocalRetouchAction("beauty")).toBe(true);
+  it("简单模式恰好 6 个动作，其余归专家模式", () => {
+    expect(
+      RETOUCH_ACTIONS.filter((a) => a.tier === "simple").map((a) => a.id),
+    ).toEqual([
+      "auto",
+      "beauty",
+      "erase",
+      "instruction",
+      "background",
+      "upscale",
+    ]);
+    expect(
+      RETOUCH_ACTIONS.filter((a) => a.tier === "expert").map((a) => a.id),
+    ).toEqual(["outpaint", "crop", "style", "inpaint", "region"]);
+  });
+
+  it("本地动作判定只认 auto / beauty / background / crop", () => {
+    const local = RETOUCH_ACTIONS.map((a) => a.id).filter((id) =>
+      isLocalRetouchAction(id),
+    );
+    expect(local).toEqual(["auto", "beauty", "background", "crop"]);
     expect(isLocalRetouchAction("erase")).toBe(false);
     expect(isLocalRetouchAction("instruction")).toBe(false);
+    expect(isLocalRetouchAction("upscale")).toBe(false);
+    expect(isLocalRetouchAction("outpaint")).toBe(false);
+  });
+
+  it("可能扣费的判定：纯本地动作 false，换背景等其余动作 true", () => {
+    const billing = RETOUCH_ACTIONS.map((a) => a.id).filter((id) =>
+      mayBillRetouchAction(id),
+    );
+    expect(billing).toEqual([
+      "erase",
+      "instruction",
+      "background",
+      "upscale",
+      "outpaint",
+      "style",
+      "inpaint",
+      "region",
+    ]);
+    expect(mayBillRetouchAction("auto")).toBe(false);
+    expect(mayBillRetouchAction("beauty")).toBe(false);
+    expect(mayBillRetouchAction("crop")).toBe(false);
+    // 换背景门禁放行，但 AI 描述会计费：未确认保护必须生效
+    expect(mayBillRetouchAction("background")).toBe(true);
   });
 });
 
 describe("retouchActionReason", () => {
-  it("服务商/模型/能力齐备时四个动作都可用", () => {
+  it("服务商/模型/能力齐备时全部动作都可用", () => {
     for (const action of RETOUCH_ACTIONS) {
       expect(retouchActionReason(action.id, PERFECT)).toBeNull();
     }
@@ -65,6 +119,9 @@ describe("retouchActionReason", () => {
     };
     expect(retouchActionReason("auto", bare)).toBeNull();
     expect(retouchActionReason("beauty", bare)).toBeNull();
+    // 换背景 / 裁剪调色走本地合成，门禁不能误伤
+    expect(retouchActionReason("background", bare)).toBeNull();
+    expect(retouchActionReason("crop", bare)).toBeNull();
   });
 
   it("动图优先于一切，本地动作也不放行", () => {
@@ -79,12 +136,21 @@ describe("retouchActionReason", () => {
         hasProvider: false,
       }),
     ).toBe("动图暂不支持修图");
+    expect(
+      retouchActionReason("background", {
+        ...gif,
+        online: false,
+        hasProvider: false,
+      }),
+    ).toBe("动图暂不支持修图");
   });
 
   it("云动作按 离线 → 服务商 → 模型 → 能力 的顺序给原因", () => {
     const offline: RetouchGateCtx = { ...PERFECT, online: false };
     expect(retouchActionReason("erase", offline)).toBe("当前离线");
     expect(retouchActionReason("instruction", offline)).toBe("当前离线");
+    expect(retouchActionReason("upscale", offline)).toBe("当前离线");
+    expect(retouchActionReason("outpaint", offline)).toBe("当前离线");
 
     const noProvider: RetouchGateCtx = { ...PERFECT, hasProvider: false };
     expect(retouchActionReason("erase", noProvider)).toBe(
@@ -93,12 +159,24 @@ describe("retouchActionReason", () => {
     expect(retouchActionReason("instruction", noProvider)).toBe(
       "请先在设置中配置服务商",
     );
+    expect(retouchActionReason("upscale", noProvider)).toBe(
+      "请先在设置中配置服务商",
+    );
+    expect(retouchActionReason("outpaint", noProvider)).toBe(
+      "请先在设置中配置服务商",
+    );
 
     const noModel: RetouchGateCtx = { ...PERFECT, hasModel: false };
     expect(retouchActionReason("erase", noModel)).toBe(
       "请先在设置中选择默认模型",
     );
     expect(retouchActionReason("instruction", noModel)).toBe(
+      "请先在设置中选择默认模型",
+    );
+    expect(retouchActionReason("style", noModel)).toBe(
+      "请先在设置中选择默认模型",
+    );
+    expect(retouchActionReason("outpaint", noModel)).toBe(
       "请先在设置中选择默认模型",
     );
   });
@@ -114,10 +192,24 @@ describe("retouchActionReason", () => {
     expect(retouchActionReason("erase", noInstruction)).toBeNull();
   });
 
-  it("edit 只影响 AI 消除", () => {
+  it("edit 影响消除 / 局部重绘 / 多区域", () => {
     const noEdit: RetouchGateCtx = { ...PERFECT, edit: false };
     expect(retouchActionReason("erase", noEdit)).toBe("当前模型不支持局部编辑");
+    expect(retouchActionReason("inpaint", noEdit)).toBe(
+      "当前模型不支持局部编辑",
+    );
+    expect(retouchActionReason("region", noEdit)).toBe(
+      "当前模型不支持局部编辑",
+    );
     expect(retouchActionReason("instruction", noEdit)).toBeNull();
+  });
+
+  it("upscale / outpaint / style 不额外要求 transform 能力", () => {
+    // 沿用 TransformDialog 的口径：只要服务商 + 默认模型在位就放行
+    const noEdit: RetouchGateCtx = { ...PERFECT, edit: false };
+    expect(retouchActionReason("upscale", noEdit)).toBeNull();
+    expect(retouchActionReason("outpaint", noEdit)).toBeNull();
+    expect(retouchActionReason("style", noEdit)).toBeNull();
   });
 });
 
@@ -170,8 +262,13 @@ describe("云端尺寸口径", () => {
   it("本地动作不用上报尺寸，云动作要", () => {
     expect(isCloudRetouchAction("auto")).toBe(false);
     expect(isCloudRetouchAction("beauty")).toBe(false);
+    // 换背景 / 裁剪调色的返回里自带宽高，同样不用现场实测
+    expect(isCloudRetouchAction("background")).toBe(false);
+    expect(isCloudRetouchAction("crop")).toBe(false);
     expect(isCloudRetouchAction("erase")).toBe(true);
     expect(isCloudRetouchAction("instruction")).toBe(true);
+    expect(isCloudRetouchAction("upscale")).toBe(true);
+    expect(isCloudRetouchAction("outpaint")).toBe(true);
   });
 
   it("编辑输入尺寸优先用步骤记录，其次用现场解码结果", () => {
@@ -272,10 +369,18 @@ describe("stepLabelForOp", () => {
     expect(stepLabelForOp("retouch", 4)).toBe("一句话改图");
   });
 
-  it("认不出的 op（画布导出 / 基础编辑等）记作编辑", () => {
-    expect(stepLabelForOp("basic-edit", 1)).toBe("编辑");
+  it("并入修图台的动作各有自己的步骤文案", () => {
+    expect(stepLabelForOp("background", 1)).toBe("换背景");
+    expect(stepLabelForOp("upscale", 2)).toBe("高清");
+    expect(stepLabelForOp("style", 3)).toBe("风格");
+    expect(stepLabelForOp("outpaint", 4)).toBe("扩图");
+    expect(stepLabelForOp("basic-edit", 5)).toBe("裁剪调色");
+    expect(stepLabelForOp("region-edit", 6)).toBe("多区域");
+  });
+
+  it("认不出的 op（画布导出 / 空串等）记作编辑", () => {
     expect(stepLabelForOp("canvas", 2)).toBe("编辑");
-    expect(stepLabelForOp("upscale", 3)).toBe("编辑");
+    expect(stepLabelForOp("generate", 3)).toBe("编辑");
     expect(stepLabelForOp("", 4)).toBe("编辑");
   });
 });

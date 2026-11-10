@@ -1,11 +1,10 @@
 import { useTranslation } from "react-i18next";
-import { IconEraser } from "../../Icons";
 import {
   type RetouchActionId,
   type RetouchGateReason,
 } from "../../../lib/retouchActions";
 import { Button } from "../../ui/Button";
-import { Slider } from "../../ui/Slider";
+import MaskTools from "./MaskTools";
 
 interface Props {
   /** 云动作被禁用时的原因（面板里再写一行，不靠颜色表达） */
@@ -42,42 +41,14 @@ export default function ErasePanel({
         </p>
       </header>
 
-      <div className="flex flex-col gap-1">
-        <div className="flex items-center justify-between text-footnote text-secondary">
-          <span>{t("画笔大小")}</span>
-          <span className="tabular-nums text-tertiary">{brushSize}</span>
-        </div>
-        <Slider
-          value={brushSize}
-          min={8}
-          max={160}
-          step={2}
-          label={t("画笔大小")}
-          disabled={blocked || !!busy}
-          onValueChange={onBrushSizeChange}
-        />
-      </div>
-
-      <div className="flex items-center gap-1.5">
-        <Button
-          size="sm"
-          variant={eraser ? "secondary" : "ghost"}
-          icon={<IconEraser size={14} />}
-          aria-pressed={eraser}
-          disabled={blocked || !!busy}
-          onClick={() => onEraserChange(!eraser)}
-        >
-          {t("橡皮擦")}
-        </Button>
-        <Button
-          size="sm"
-          variant="ghost"
-          disabled={blocked || !!busy}
-          onClick={onClearMask}
-        >
-          {t("清除蒙版")}
-        </Button>
-      </div>
+      <MaskTools
+        brushSize={brushSize}
+        onBrushSizeChange={onBrushSizeChange}
+        eraser={eraser}
+        onEraserChange={onEraserChange}
+        onClear={onClearMask}
+        disabled={blocked || !!busy}
+      />
 
       {reason && <p className="text-footnote text-tertiary">{t(reason)}</p>}
 

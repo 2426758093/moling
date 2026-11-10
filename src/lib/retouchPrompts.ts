@@ -8,3 +8,7 @@ export const GUARD_SUFFIX =
 export const ERASE_PROMPT =
   "Remove the painted object and reconstruct the background naturally." +
   GUARD_SUFFIX;
+
+/** 扩图：把透明 padding 补成自然延续的画面（与旧 OutpaintView 同一句） */
+export const OUTPAINT_PROMPT =
+  "Extend the scene naturally to fill the transparent areas, matching the original style, lighting and content.";

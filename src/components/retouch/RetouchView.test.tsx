@@ -54,7 +54,7 @@ vi.mock("../MaskCanvas", async () => {
           },
           fillAll: () => undefined,
           toAlphaPng: () => "data:image/png;base64,MASK",
-          toLumaPng: () => null,
+          toLumaPng: () => "data:image/png;base64,LUMA",
           hasStrokes: () => handle.strokes,
           applyMask: async () => undefined,
         };
@@ -84,9 +84,27 @@ vi.mock("../../lib/api", async (importOriginal) => {
       historyLineage: vi.fn(),
       getHistoryImage: vi.fn(),
       batchHistoryThumbs: vi.fn(),
+      replaceBackground: vi.fn(),
+      transformImage: vi.fn(),
+      recoverImageRequestByClient: vi.fn(),
+      getSetting: vi.fn(),
+      segmentModelStatus: vi.fn(),
+      segmentSubject: vi.fn(),
     },
   };
 });
+
+// jsdom 不解码图片：`new Image()` 永远不会触发 onload，尺寸测量会白等 5s。
+// 这里给一个立刻「加载完成」的替身（与 RegionEditView 的用例同一手法）。
+class FakeImage {
+  naturalWidth = 400;
+  naturalHeight = 300;
+  onload: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  set src(_value: string) {
+    queueMicrotask(() => this.onload?.());
+  }
+}
 
 import RetouchView from "./RetouchView";
 
@@ -126,6 +144,7 @@ function stepLabels() {
 }
 
 beforeEach(() => {
+  vi.stubGlobal("Image", FakeImage);
   maskHandles.length = 0;
   deliverSpy.mockReset();
   deliverSpy.mockResolvedValue("canvas");
@@ -186,6 +205,44 @@ beforeEach(() => {
     dataUrl: `data:image/png;base64,IMG${id}`,
     filePath: `C:/media/${id}.png`,
   }));
+  vi.mocked(api.getSetting).mockResolvedValue("off");
+  vi.mocked(api.segmentModelStatus).mockResolvedValue({
+    available: false,
+    loaded: false,
+    reason: null,
+  });
+  vi.mocked(api.segmentSubject).mockResolvedValue({
+    dataUrl: "data:image/png;base64,SEG",
+    width: 400,
+    height: 300,
+    covered: 0.4,
+  });
+  vi.mocked(api.editImage).mockReset();
+  vi.mocked(api.replaceBackground).mockReset();
+  vi.mocked(api.replaceBackground).mockResolvedValue({
+    historyId: 9,
+    dataUrl: "data:image/png;base64,BG",
+    filePath: "C:/media/bg.png",
+    width: 400,
+    height: 300,
+    op: "background",
+    parentId: 7,
+  });
+  vi.mocked(api.transformImage).mockReset();
+  vi.mocked(api.transformImage).mockResolvedValue({
+    historyId: 10,
+    dataUrl: "data:image/png;base64,UP",
+    filePath: "C:/media/up.png",
+    width: 800,
+    height: 600,
+    op: "upscale",
+    parentId: 7,
+  });
+  vi.mocked(api.recoverImageRequestByClient).mockReset();
+  vi.mocked(api.recoverImageRequestByClient).mockResolvedValue({
+    recovered: 1,
+    failed: 0,
+  });
 });
 
 function renderStudio() {
@@ -569,5 +626,153 @@ describe("RetouchStudio 重开后还原步骤链", () => {
 
     await screen.findByRole("button", { name: "2. 一句话改图" });
     expect(stepLabels()).toEqual(["1. 原图", "2. 一句话改图"]);
+  });
+});
+
+describe("RetouchStudio 动作 Chip 按模式过滤", () => {
+  it("简单模式恰好 6 个 Chip，专家模式补齐另外 5 个", () => {
+    renderStudio();
+
+    for (const label of [
+      "一键优化",
+      "美颜",
+      "AI 消除",
+      "一句话改图",
+      "换背景",
+      "高清",
+    ]) {
+      expect(screen.getByRole("button", { name: label })).toBeTruthy();
+    }
+    for (const label of ["扩图", "裁剪调色", "风格", "局部重绘", "多区域"]) {
+      expect(screen.queryByRole("button", { name: label })).toBeNull();
+    }
+
+    act(() => useAppStore.setState({ mode: "expert" }));
+    for (const label of ["扩图", "裁剪调色", "风格", "局部重绘", "多区域"]) {
+      expect(screen.getByRole("button", { name: label })).toBeTruthy();
+    }
+  });
+});
+
+describe("RetouchStudio 换背景", () => {
+  it("纯色换背景：参数带 luma 蒙版、无服务商，并落成一步", async () => {
+    renderStudio();
+
+    fireEvent.click(screen.getByRole("button", { name: "换背景" }));
+    fireEvent.click(await screen.findByRole("button", { name: "应用换背景" }));
+
+    await screen.findByRole("button", { name: "2. 换背景" });
+    expect(api.replaceBackground).toHaveBeenCalledWith(
+      expect.objectContaining({
+        kind: "solid",
+        maskB64: "data:image/png;base64,LUMA",
+        providerId: null,
+        prompt: "",
+      }),
+    );
+    expect(historySpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("AI 描述缺服务商时禁用提交并说明原因，纯色仍可提交", async () => {
+    useProviderStore.setState({ defaultProviderId: null, providers: [] });
+    renderStudio();
+
+    fireEvent.click(screen.getByRole("button", { name: "换背景" }));
+    fireEvent.click(await screen.findByRole("radio", { name: "AI 描述" }));
+
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "应用换背景",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    expect(screen.getByText("请先在设置中配置服务商")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("radio", { name: "纯色" }));
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "应用换背景",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
+  });
+});
+
+describe("RetouchStudio 未确认计费保护", () => {
+  /** 一次未确认失败：gateway 超时但可能已在服务商侧出图 */
+  function unconfirmed() {
+    return new Error(
+      JSON.stringify({
+        type: "unconfirmed",
+        message: "gateway timeout",
+        request_id: "req_1",
+      }),
+    );
+  }
+
+  it("未确认要先对账；再次提交必须经确认才发第二次请求", async () => {
+    vi.mocked(api.editImage)
+      .mockRejectedValueOnce(unconfirmed())
+      .mockResolvedValueOnce({
+        historyId: 12,
+        dataUrl: "data:image/png;base64,FIX",
+        filePath: "C:/media/fix.png",
+        op: "erase",
+      });
+    renderStudio();
+
+    fireEvent.click(screen.getByRole("button", { name: "AI 消除" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认消除" }));
+
+    await screen.findByText("请求 ID：req_1");
+    expect(screen.getByText("可能已计费，重试会再次扣费")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "尝试恢复" })).toBeTruthy();
+
+    // 再点一次：只弹确认框，绝不自动重发
+    fireEvent.click(screen.getByRole("button", { name: "确认消除" }));
+    await screen.findByText("确认重新生成？");
+    expect(api.editImage).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "仍然重新生成" }));
+    await waitFor(() => expect(api.editImage).toHaveBeenCalledTimes(2));
+  });
+
+  it("尝试恢复按请求 ID 对账，成功后提示条消失", async () => {
+    vi.mocked(api.editImage).mockRejectedValueOnce(unconfirmed());
+    renderStudio();
+
+    fireEvent.click(screen.getByRole("button", { name: "AI 消除" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认消除" }));
+    await screen.findByText("请求 ID：req_1");
+
+    fireEvent.click(screen.getByRole("button", { name: "尝试恢复" }));
+    await waitFor(() =>
+      expect(api.recoverImageRequestByClient).toHaveBeenCalledWith("req_1"),
+    );
+    await waitFor(() =>
+      expect(screen.queryByText("请求 ID：req_1")).toBeNull(),
+    );
+  });
+});
+
+describe("RetouchStudio 扩图面板", () => {
+  it("专家模式打开扩图：原始比例显示保持原尺寸且不能提交", async () => {
+    useAppStore.setState({ mode: "expert" });
+    renderStudio();
+
+    fireEvent.click(screen.getByRole("button", { name: "扩图" }));
+    expect(await screen.findByText("保持原尺寸")).toBeTruthy();
+    expect(
+      (screen.getByRole("button", { name: "生成扩图" }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+
+    // 选了比例才算出目标画布：400×300 → 16:9 = 533×300
+    fireEvent.click(screen.getByRole("radio", { name: "16:9" }));
+    await waitFor(() =>
+      expect(screen.getByText("目标尺寸 533 × 300")).toBeTruthy(),
+    );
   });
 });
