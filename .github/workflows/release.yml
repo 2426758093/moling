@@ -80,6 +80,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # 附注 tag 的消息要作为更新说明，必须抓 tag 对象；否则 %(contents) 只剩提交标题
+          fetch-tags: true
 
       - uses: pnpm/action-setup@v4
 
