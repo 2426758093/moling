@@ -154,10 +154,11 @@ async function release() {
       );
     }
 
+    // 附注 tag 的 ref 指向 tag 对象而非提交，必须剥离到 ^{commit} 才能与 HEAD 比较
     const existing = await tryGit([
       "rev-parse",
       "--verify",
-      `refs/tags/${tag}`,
+      `refs/tags/${tag}^{commit}`,
     ]);
     if (existing && existing !== head) {
       fail(
