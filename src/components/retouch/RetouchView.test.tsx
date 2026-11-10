@@ -844,6 +844,42 @@ describe("RetouchStudio 未确认计费保护", () => {
     await waitFor(() => expect(api.editImage).toHaveBeenCalledTimes(2));
   });
 
+  it("本地动作成功不清除拦截：一键优化成功后再次消除仍要确认", async () => {
+    vi.mocked(api.editImage)
+      .mockRejectedValueOnce(unconfirmed())
+      .mockResolvedValueOnce({
+        historyId: 12,
+        dataUrl: "data:image/png;base64,FIX",
+        filePath: "C:/media/fix.png",
+        op: "erase",
+      });
+    renderStudio();
+
+    fireEvent.click(screen.getByRole("button", { name: "AI 消除" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认消除" }));
+    await screen.findByText("请求 ID：req_1");
+
+    // 关掉提示条：拦截依据是挂起标记，不是提示条
+    fireEvent.click(screen.getByRole("button", { name: "关闭提示" }));
+    await waitFor(() =>
+      expect(screen.queryByText("请求 ID：req_1")).toBeNull(),
+    );
+
+    // 本地动作（不扣费）成功：只能清报错条，不能清掉还没对账的计费风险
+    fireEvent.click(screen.getByRole("button", { name: "一键优化" }));
+    await waitFor(() => expect(api.applyRetouch).toHaveBeenCalledTimes(1));
+    expect(historySpy).toHaveBeenCalled();
+
+    // 简单模式点动作会自动收起面板，回来再打开消除（画布已重建为新蒙版）
+    fireEvent.click(screen.getByRole("button", { name: "AI 消除" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认消除" }));
+    await screen.findByText("确认重新生成？");
+    expect(api.editImage).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "仍然重新生成" }));
+    await waitFor(() => expect(api.editImage).toHaveBeenCalledTimes(2));
+  });
+
   it("尝试恢复按请求 ID 对账，成功后提示条消失", async () => {
     vi.mocked(api.editImage).mockRejectedValueOnce(unconfirmed());
     renderStudio();

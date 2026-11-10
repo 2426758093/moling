@@ -652,24 +652,30 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
           toast(t("回写画布失败：{{error}}", { error: String(e) }), "error");
         }
       }
+      // 报错条描述的是「上一次失败」，成功就清掉。
+      // 但挂起标记只该被「可能扣费的动作」的成功解除：一键优化 / 美颜走本地，
+      // 它们的成功并不能说明之前那次云端请求有没有出图，清了等于用本地动作绕过拦截。
       setLastError(null);
-      setUnconfirmed(null);
+      if (mayBillRetouchAction(action)) setUnconfirmed(null);
       return true;
     } catch (error) {
       const parsed = parseAdapterError(
         error instanceof Error ? error.message : String(error),
       );
-      // 可能已计费：记下挂起标记（保留最早那次未确认的请求 ID，便于对账）。
+      // 可能已计费：记下挂起标记（保留最早那次「带 ID」的未确认请求，便于对账）。
+      // 上一次记的没有 ID、这次带 ID 时要用新 ID 覆盖：提示条显示的是新请求的
+      // ID，恢复按钮若还拿旧 null 就永远发不出对账请求。
       // 其他错误不改它 —— 一次网络抖动不该顶掉还没对账的计费风险。
       if (isUnconfirmedError(parsed)) {
-        setUnconfirmed(
-          (prev) =>
-            prev ?? {
-              requestId:
-                parsed.type === "unconfirmed"
-                  ? (parsed.request_id ?? null)
-                  : null,
-            },
+        setUnconfirmed((prev) =>
+          prev?.requestId
+            ? prev
+            : {
+                requestId:
+                  parsed.type === "unconfirmed"
+                    ? (parsed.request_id ?? null)
+                    : null,
+              },
         );
       }
       setLastError(parsed);
@@ -832,7 +838,7 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
       );
       // 对账通过：提示条与挂起标记一起解除，下一次提交重新回到正常流程
       setLastError(null);
-      setUnconfirmed(null);
+      if (mayBillRetouchAction(action)) setUnconfirmed(null);
     } catch (e) {
       toast(t("恢复失败：{{error}}", { error: String(e) }), "error");
     } finally {
