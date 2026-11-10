@@ -49,6 +49,11 @@ vi.mock("../../lib/historyEvents", () => ({
   emitHistoryChanged: historySpy,
 }));
 
+// 多区域提交要订阅后端进度事件：jsdom 里没有 Tauri 事件总线，返回一个空 unlisten
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn().mockResolvedValue(() => undefined),
+}));
+
 // 真实画布依赖 canvas 像素 API（jsdom 没有）：用按实例记录笔画的替身，
 // 这样「换步后是不是还挂着一块带旧笔画的画布」可以被断言。
 vi.mock("../MaskCanvas", async () => {
@@ -101,6 +106,8 @@ vi.mock("../../lib/api", async (importOriginal) => {
       getSetting: vi.fn(),
       segmentModelStatus: vi.fn(),
       segmentSubject: vi.fn(),
+      regionEditBatch: vi.fn(),
+      cancelGeneration: vi.fn(),
     },
   };
 });
@@ -267,6 +274,25 @@ beforeEach(() => {
   });
   cropPreviewSpy.mockClear();
   cropPreviewSpy.mockResolvedValue("data:image/png;base64,CROPPREVIEW");
+  vi.mocked(api.regionEditBatch).mockReset();
+  vi.mocked(api.regionEditBatch).mockResolvedValue({
+    groupId: "g",
+    results: [
+      {
+        id: "r1",
+        ok: true,
+        historyId: 9,
+        dataUrl: "data:image/png;base64,REGION",
+        filePath: "C:/media/region.png",
+      },
+    ],
+    cancelled: false,
+    anySucceeded: true,
+    historyId: 9,
+    dataUrl: "data:image/png;base64,REGION",
+  });
+  vi.mocked(api.cancelGeneration).mockReset();
+  vi.mocked(api.cancelGeneration).mockResolvedValue(undefined);
 });
 
 function renderStudio() {
@@ -1124,6 +1150,118 @@ describe("RetouchStudio 局部重绘面板", () => {
     expect(input.prompt.endsWith(GUARD_SUFFIX)).toBe(true);
     expect(input.width).toBe(400);
     expect(input.height).toBe(300);
+  });
+});
+
+describe("RetouchStudio 多区域面板", () => {
+  /** 专家模式打开多区域面板，并等舞台上的蒙版画布挂上 */
+  async function openRegionPanel() {
+    act(() => useAppStore.setState({ mode: "expert" }));
+    renderStudio();
+    fireEvent.click(screen.getByRole("button", { name: "多区域" }));
+    await waitFor(() => expect(maskHandles.length).toBeGreaterThan(0));
+  }
+
+  /** 涂一块（替身默认带笔画）并填提示词收进列表；每次添加后 view 会 clear() */
+  function addOneRegion(prompt: string) {
+    maskHandles[maskHandles.length - 1].strokes = true;
+    fireEvent.change(screen.getByLabelText("区域提示词"), {
+      target: { value: prompt },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "添加区域" }));
+  }
+
+  it("提交 1 个区域：参数带底图与羽化，整图落成一步并清空草稿", async () => {
+    await openRegionPanel();
+    addOneRegion("加一束花");
+    await screen.findByText("区域 1");
+
+    fireEvent.click(screen.getByRole("button", { name: "提交 1 个区域" }));
+    // 逐区计费必须在提交前讲清楚
+    await screen.findByText(/按区域分别计费/);
+    fireEvent.click(screen.getByRole("button", { name: "开始重绘" }));
+
+    await screen.findByRole("button", { name: "2. 多区域" });
+    expect(api.regionEditBatch).toHaveBeenCalledTimes(1);
+    const [input] = vi.mocked(api.regionEditBatch).mock.calls[0];
+    expect(input.baseHistoryId).toBe(7);
+    expect(input.baseB64).toBe("data:image/png;base64,SRC");
+    expect(typeof input.jobId).toBe("string");
+    expect(input.regions).toEqual([
+      {
+        id: expect.any(String),
+        prompt: "加一束花",
+        maskB64: "data:image/png;base64,MASK",
+        feather: 24,
+      },
+    ]);
+    // 成功后草稿清空，列表回到空提示
+    await screen.findByText("请先涂抹区域并填写提示词");
+  });
+
+  it("一批最多 4 个区域：第 5 次时添加按钮禁用", async () => {
+    await openRegionPanel();
+
+    for (let i = 1; i <= 4; i += 1) {
+      addOneRegion(`第 ${i} 个区域`);
+      await screen.findByText(`区域 ${i}`);
+    }
+
+    // 每次添加都会 clear()：这里重新涂上，验证的是「数量上限」而不是空蒙版
+    addOneRegion("第五个区域");
+    const add = screen.getByRole("button", {
+      name: "添加区域",
+    }) as HTMLButtonElement;
+    expect(add.disabled).toBe(true);
+    expect(screen.queryByText("区域 5")).toBeNull();
+  });
+
+  it("取消分区重绘：cancelGeneration 收到提交时用的 jobId", async () => {
+    const pending = deferred<{
+      groupId: string;
+      results: { id: string; ok: boolean; error?: string }[];
+      cancelled: boolean;
+      anySucceeded: boolean;
+      historyId: number | null;
+      dataUrl: string | null;
+    }>();
+    vi.mocked(api.regionEditBatch).mockReturnValueOnce(
+      pending.promise as never,
+    );
+
+    await openRegionPanel();
+    addOneRegion("加一束花");
+    await screen.findByText("区域 1");
+
+    fireEvent.click(screen.getByRole("button", { name: "提交 1 个区域" }));
+    await screen.findByText(/按区域分别计费/);
+    fireEvent.click(screen.getByRole("button", { name: "开始重绘" }));
+
+    const cancel = await screen.findByRole("button", { name: "取消分区重绘" });
+    await waitFor(() => expect(api.regionEditBatch).toHaveBeenCalledTimes(1));
+    const [input] = vi.mocked(api.regionEditBatch).mock.calls[0];
+    expect(input.jobId).toBeTruthy();
+
+    fireEvent.click(cancel);
+    await waitFor(() =>
+      expect(api.cancelGeneration).toHaveBeenCalledWith(input.jobId),
+    );
+
+    // 收尾：后端确认「已取消且全失败」，busy 结束（草稿留给用户补齐）
+    await act(async () => {
+      pending.resolve({
+        groupId: "g",
+        results: [{ id: input.regions[0].id, ok: false, error: "cancelled" }],
+        cancelled: true,
+        anySucceeded: false,
+        historyId: null,
+        dataUrl: null,
+      });
+    });
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "取消分区重绘" })).toBeNull(),
+    );
+    expect(screen.getByText("区域 1")).toBeTruthy();
   });
 });
 

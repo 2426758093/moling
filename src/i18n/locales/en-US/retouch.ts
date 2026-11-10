@@ -84,6 +84,13 @@ const retouch = {
   确认重绘: "Inpaint",
   请先涂抹要重绘的区域: "Paint the area to redraw first",
 
+  // 多区域面板（区域列表 / 计费确认等文案复用 canvasLayers 的既有译文）
+  "涂抹多个区域并分别填写要求，逐区重绘后本地合成":
+    "Paint several regions with their own prompts, then repaint each and composite locally",
+  分区重绘失败: "Region repaint failed",
+  "已取消，已保留 {{done}} 个区域的结果":
+    "Cancelled; kept the results of {{done}} regions",
+
   // 错误条
   关闭提示: "Dismiss",
 

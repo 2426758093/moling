@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
 import { useAppStore, type RetouchTarget } from "../../stores/appStore";
 import { useProviderStore } from "../../stores/providerStore";
@@ -11,6 +12,7 @@ import {
   parseAdapterError,
   type AdapterError,
   type HistoryRowView,
+  type RegionProgressEvent,
   type RetouchAnalysis,
   type RetouchOp,
 } from "../../lib/api";
@@ -69,6 +71,10 @@ import ErasePanel from "./panels/ErasePanel";
 import InpaintPanel from "./panels/InpaintPanel";
 import InstructionPanel from "./panels/InstructionPanel";
 import OutpaintPanel from "./panels/OutpaintPanel";
+import RegionPanel, {
+  MAX_REGION_BATCH,
+  type RegionDraft,
+} from "./panels/RegionPanel";
 import StylePanel from "./panels/StylePanel";
 import UpscalePanel from "./panels/UpscalePanel";
 
@@ -82,6 +88,20 @@ const MEASURE_TIMEOUT_MS = 5000;
  * 更早的历史仍留在库里，只是不进步骤条（缩略图与取出成本都不值当）。
  */
 const LINEAGE_MAX_STEPS = 12;
+/** 多区域合成的羽化半径：与旧 RegionEditView 的 DEFAULT_FEATHER 一致 */
+const REGION_FEATHER = 24;
+
+/** 区域 id 与批次 job id 只在「添加 / 提交」时生成：模块层自增避免渲染期读时钟 */
+let regionSeq = 0;
+function newRegionId(): string {
+  regionSeq += 1;
+  return `region-${Date.now()}-${regionSeq}`;
+}
+let regionJobSeq = 0;
+function newRegionJobId(): string {
+  regionJobSeq += 1;
+  return `region-job-${Date.now()}-${regionJobSeq}`;
+}
 
 /** 提交动作的统一返回形状：本地 RetouchResult 与云端 editImage 都能落成一步 */
 interface StepResult {
@@ -317,7 +337,18 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
     src: string;
     size: PixelSize;
   } | null>(null);
+  /** 多区域：待提交的草稿（蒙版在添加时就固化）、逐区状态与进度 */
+  const [regionDrafts, setRegionDrafts] = useState<RegionDraft[]>([]);
+  const [regionStatus, setRegionStatus] = useState<
+    Record<string, "running" | "ok" | "error">
+  >({});
+  const [regionProgress, setRegionProgress] = useState<{
+    done: number;
+    total: number;
+  } | null>(null);
   const maskRef = useRef<MaskCanvasHandle | null>(null);
+  /** 正在跑的那批多区域 job：取消按钮认的是它（后端 cancelGeneration 认 jobId） */
+  const regionJobRef = useRef<string | null>(null);
   /** 用户确认「仍然重新生成」后要执行的那次提交 */
   const pendingRetry = useRef<(() => void) | null>(null);
   const previewTimer = useRef<number | null>(null);
@@ -530,6 +561,17 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
   useEffect(() => {
     maskRef.current?.clear();
   }, [cur.key]);
+
+  // 多区域的草稿把蒙版固化在「添加时的那张底图」上：换步后必然错位，必须清空。
+  // 只认步骤 key —— 切面板不清（来回看动作名不该丢已经涂好的区域）。
+  // 在渲染期间同步调整（而不是 effect 内 setState）：与本仓 Composer 的草稿同步同一手法。
+  const [regionKey, setRegionKey] = useState(cur.key);
+  if (regionKey !== cur.key) {
+    setRegionKey(cur.key);
+    if (regionDrafts.length > 0) setRegionDrafts([]);
+    if (Object.keys(regionStatus).length > 0) setRegionStatus({});
+    if (regionProgress) setRegionProgress(null);
+  }
 
   // 换面板 = 换语义：消除 / 换背景 / 局部重绘共用同一块画布（同一 src 下不重建），
   // 不清的话刚涂的消除区域会被当成背景蒙版提交，扣的却是另一次费用。
@@ -1103,6 +1145,146 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
     });
   };
 
+  /// 多区域：把当前涂抹 + 提示词收成一块草稿（蒙版导出后立刻清画布，接着涂下一块）
+  const addRegion = (prompt: string): boolean => {
+    const trimmed = prompt.trim();
+    const mask = maskRef.current;
+    if (!trimmed || !mask?.hasStrokes()) {
+      toast(t("请先涂抹区域并填写提示词"), "error");
+      return false;
+    }
+    if (regionDrafts.length >= MAX_REGION_BATCH) {
+      toast(t("一批最多 {{max}} 个区域", { max: MAX_REGION_BATCH }), "error");
+      return false;
+    }
+    const maskB64 = mask.toAlphaPng();
+    if (!maskB64) {
+      toast(t("请先涂抹区域并填写提示词"), "error");
+      return false;
+    }
+    setRegionDrafts((prev) => [
+      ...prev,
+      { id: newRegionId(), prompt: trimmed, maskB64 },
+    ]);
+    mask.clear();
+    return true;
+  };
+
+  const removeRegion = (id: string) => {
+    setRegionDrafts((prev) => prev.filter((item) => item.id !== id));
+    setRegionStatus((prev) => {
+      if (!(id in prev)) return prev;
+      const next = { ...prev };
+      delete next[id];
+      return next;
+    });
+  };
+
+  /// 多区域提交：一批 ≤4 个区域逐区调用服务商，整图由后端本地合成后作为一步追加。
+  /// 逐区计费 —— 面板的确认弹窗先让用户点头，未确认标记的拦截仍由 commit 兜底。
+  const applyRegions = () => {
+    if (busy) return;
+    const reason = reasons.region;
+    if (reason) {
+      toast(t(reason), "error");
+      return;
+    }
+    if (defaultProviderId == null || !model) return;
+    if (regionDrafts.length === 0) return;
+
+    const providerId = defaultProviderId;
+    const modelId = model;
+    const regions = regionDrafts.map((item) => ({ ...item }));
+    const job = newRegionJobId();
+    regionJobRef.current = job;
+    setRegionProgress({ done: 0, total: regions.length });
+    setRegionStatus(
+      Object.fromEntries(regions.map((item) => [item.id, "running" as const])),
+    );
+
+    void commit("region", "多区域", async (src) => {
+      // 底图必须已入库：后端的 baseHistoryId 是这次合成的父节点
+      const baseHistoryId = src.historyId;
+      if (baseHistoryId == null) throw new Error(t("图片读取失败，请重试"));
+      // 同一时刻只允许一批（busy 已保证）：事件按 jobId 认不出来，也不需要过滤
+      const unlisten = await listen<RegionProgressEvent>(
+        "image:region-progress",
+        (event) => {
+          const p = event.payload;
+          setRegionProgress({ done: p.done, total: p.total });
+          if (p.regionId) {
+            const id = p.regionId;
+            setRegionStatus((state) => ({
+              ...state,
+              [id]: p.ok ? "ok" : "error",
+            }));
+          }
+        },
+      );
+      try {
+        const out = await api.regionEditBatch({
+          providerId,
+          model: modelId,
+          negativePrompt: null,
+          baseHistoryId,
+          baseB64: src.dataUrl,
+          jobId: job,
+          regions: regions.map((item) => ({
+            id: item.id,
+            prompt: item.prompt,
+            maskB64: item.maskB64,
+            feather: REGION_FEATHER,
+          })),
+        });
+        // 事件可能丢：以返回结果为准收口每个区域的状态
+        setRegionStatus(
+          Object.fromEntries(
+            out.results.map((item) => [item.id, item.ok ? "ok" : "error"]),
+          ) as Record<string, "running" | "ok" | "error">,
+        );
+        const failures = out.results
+          .filter((item) => !item.ok)
+          .map((item) => item.error)
+          .filter((error): error is string => !!error);
+        if (out.cancelled) {
+          toast(
+            t("已取消，已保留 {{done}} 个区域的结果", {
+              done: out.results.filter((item) => item.ok).length,
+            }),
+            "info",
+          );
+        } else if (failures.length > 0) {
+          toast(t("部分区域失败：{{error}}", { error: failures[0] }), "error");
+        }
+        // 一个都没成或没有合成图：当作失败，交给 commit 的错误条
+        if (!out.anySucceeded || out.historyId == null || out.dataUrl == null) {
+          throw new Error(
+            failures[0]
+              ? t("部分区域失败：{{error}}", { error: failures[0] })
+              : t("分区重绘失败"),
+          );
+        }
+        return { historyId: out.historyId, dataUrl: out.dataUrl };
+      } finally {
+        // 进度与取消句柄在 run 返回前收掉：之后的量尺寸 / 追加步骤 / 回写仍归 commit
+        unlisten();
+        regionJobRef.current = null;
+        setRegionProgress(null);
+      }
+    }).then((ok) => {
+      // 成功才清草稿：失败 / 取消要留着让用户补齐重试
+      if (ok) {
+        setRegionDrafts([]);
+        setRegionStatus({});
+      }
+    });
+  };
+
+  const cancelRegions = () => {
+    const job = regionJobRef.current;
+    if (job) void api.cancelGeneration(job).catch(() => undefined);
+  };
+
   const onAction = (id: RetouchActionId) => {
     if (busy) return;
     const reason = reasons[id];
@@ -1225,6 +1407,23 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
         reason={reasons.upscale}
         busy={busy}
         onConfirm={applyUpscale}
+      />
+    ) : panel === "region" ? (
+      <RegionPanel
+        reason={reasons.region}
+        busy={busy}
+        drafts={regionDrafts}
+        status={regionStatus}
+        progress={regionProgress}
+        brushSize={brushSize}
+        onBrushSizeChange={setBrushSize}
+        eraser={eraser}
+        onEraserChange={setEraser}
+        onClearMask={() => maskRef.current?.clear()}
+        onAdd={addRegion}
+        onRemove={removeRegion}
+        onSubmit={applyRegions}
+        onCancel={cancelRegions}
       />
     ) : panel === "crop" ? (
       <CropPanel
