@@ -106,8 +106,8 @@ const retouch = {
 
   // 对比与步骤
   原图: "Original",
-  // 血统里认不出的 op（编辑 / 画布导出等）
-  编辑: "Edited",
+  // 血统里认不出的 op（编辑 / 画布导出等）；与 settingsSections 的「编辑」同值，避免影子面歧义
+  编辑: "Edit",
   结果: "Result",
   预览: "Preview",
   "{{n}}% {{label}}": "{{n}}% {{label}}",

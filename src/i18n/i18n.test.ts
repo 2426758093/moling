@@ -86,11 +86,14 @@ describe("修图英文译文", () => {
     expect(i18n.t("裁剪调色")).toBe("Crop & tone");
     expect(i18n.t("风格")).toBe("Style");
     expect(i18n.t("多区域")).toBe("Multi-region");
+    // 编辑 同时用于设置页服务商卡片的按钮，retouch 分片不得把它译成 Edited
+    expect(i18n.t("编辑")).toBe("Edit");
     await i18n.changeLanguage("zh-CN");
   });
 
   it("retouch 分片的译文没有残留中文（{{...}} 插值除外）", async () => {
-    const cjk = /[\u4e00-\u9fff]/;
+    // 覆盖汉字、CJK 标点（U+3000–303F）与全角/半角形式区（FF00–FFEF）
+    const cjk = /[\u3000-\u303f\uff00-\uffef\u4e00-\u9fff]/;
     const leftovers: string[] = [];
     for (const [key, value] of Object.entries(
       retouch as Record<string, string>,
