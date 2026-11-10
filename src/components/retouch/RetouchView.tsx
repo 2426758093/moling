@@ -284,6 +284,15 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
   const [online, setOnline] = useState(() => navigator.onLine !== false);
   /** 上一次提交的失败（保留到下一次成功）：未确认时要能对账与恢复 */
   const [lastError, setLastError] = useState<AdapterError | null>(null);
+  /**
+   * 未确认计费的挂起标记：只由提交结果改写，关闭提示条不会清它。
+   * 拦截条件必须挂在这里而不是 lastError 上 —— 提示条只是 UI，用户点「关闭提示」
+   * 只是不想再看这段文案，那次请求的对账结论并没有出来，计费风险仍然存在。
+   * 若跟着提示条一起清掉，关一次提示就能绕过二次扣费确认。
+   */
+  const [unconfirmed, setUnconfirmed] = useState<{
+    requestId: string | null;
+  } | null>(null);
   const [recovering, setRecovering] = useState(false);
   const [confirmRetry, setConfirmRetry] = useState(false);
   /** 当前步的实测尺寸：扩图面板要拿它算目标画布 */
@@ -505,6 +514,17 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
     maskRef.current?.clear();
   }, [cur.key]);
 
+  // 换面板 = 换语义：消除 / 换背景 / 局部重绘共用同一块画布（同一 src 下不重建），
+  // 不清的话刚涂的消除区域会被当成背景蒙版提交，扣的却是另一次费用。
+  // 只处理「面板之间」的切换：从无面板打开时 MaskCanvas 是新建的空画布（面板关着
+  // 它就被卸载了），此时清空没有意义，还会抹掉刚 hydrate 的画布状态。
+  const prevPanel = useRef<RetouchActionId | null>(panel);
+  useEffect(() => {
+    const prev = prevPanel.current;
+    prevPanel.current = panel;
+    if (prev && panel && prev !== panel) maskRef.current?.clear();
+  }, [panel]);
+
   const provider = providers.find((p) => p.provider.id === defaultProviderId);
   const model = provider?.provider.defaultModel ?? "";
   const gate: RetouchGateCtx = {
@@ -572,12 +592,8 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
     force = false,
   ): Promise<boolean> => {
     // 上一次未确认 + 这次可能扣费 + 不是用户确认后的重试 → 先弹确认，不发请求
-    if (
-      !force &&
-      lastError &&
-      isUnconfirmedError(lastError) &&
-      mayBillRetouchAction(action)
-    ) {
+    // 注意读的是 unconfirmed（跨提示条存活），不是 lastError（可被关闭清掉）
+    if (!force && unconfirmed && mayBillRetouchAction(action)) {
       pendingRetry.current = () => {
         void commit(action, label, run, true);
       };
@@ -637,11 +653,25 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
         }
       }
       setLastError(null);
+      setUnconfirmed(null);
       return true;
     } catch (error) {
       const parsed = parseAdapterError(
         error instanceof Error ? error.message : String(error),
       );
+      // 可能已计费：记下挂起标记（保留最早那次未确认的请求 ID，便于对账）。
+      // 其他错误不改它 —— 一次网络抖动不该顶掉还没对账的计费风险。
+      if (isUnconfirmedError(parsed)) {
+        setUnconfirmed(
+          (prev) =>
+            prev ?? {
+              requestId:
+                parsed.type === "unconfirmed"
+                  ? (parsed.request_id ?? null)
+                  : null,
+            },
+        );
+      }
       setLastError(parsed);
       toast(describeError(error), "error");
       return false;
@@ -783,8 +813,8 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
     });
   };
 
-  const requestId =
-    lastError?.type === "unconfirmed" ? lastError.request_id : undefined;
+  /// 对账要用「仍未解除」的那次请求 ID：提示条可能已被关闭，所以读挂起标记
+  const requestId = unconfirmed?.requestId ?? undefined;
 
   /// 未确认的请求按 client request id 对账：命中的结果直接补进画廊
   const recover = async () => {
@@ -800,7 +830,9 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
         t("已恢复 {{n}} 张到画廊", { n: outcome.recovered }) + suffix,
         outcome.failed > 0 ? "error" : "info",
       );
+      // 对账通过：提示条与挂起标记一起解除，下一次提交重新回到正常流程
       setLastError(null);
+      setUnconfirmed(null);
     } catch (e) {
       toast(t("恢复失败：{{error}}", { error: String(e) }), "error");
     } finally {
@@ -817,12 +849,21 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
       toast(t("请先在设置中配置服务商"), "error");
       return;
     }
+    // 蒙版必须在进 commit 之前校验：commit 里会先弹「可能已计费」确认，
+    // 空蒙版放进去等于让用户为一次必然空发的请求确认扣费。
+    const mask = maskRef.current;
+    if (!mask?.hasStrokes()) {
+      toast(t("请先涂抹要替换的背景区域"), "error");
+      return;
+    }
+    // 导出也提前做：失败同样是本地问题，走 toast 而不是常驻的报错条
+    const maskB64 =
+      options.kind === "ai" ? mask.toAlphaPng() : mask.toLumaPng();
+    if (!maskB64) {
+      toast(t("请先涂抹要替换的背景区域"), "error");
+      return;
+    }
     void commit("background", "换背景", async (src) => {
-      const mask = maskRef.current;
-      if (!mask?.hasStrokes()) throw new Error(t("请先涂抹要替换的背景区域"));
-      const maskB64 =
-        options.kind === "ai" ? mask.toAlphaPng() : mask.toLumaPng();
-      if (!maskB64) throw new Error(t("请先涂抹要替换的背景区域"));
       const out = await api.replaceBackground({
         imageB64: src.dataUrl,
         maskB64,
@@ -1017,13 +1058,16 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
         eraser={eraser}
         onEraserChange={setEraser}
         onClearMask={() => maskRef.current?.clear()}
-        aiAvailable={defaultProviderId != null && model !== ""}
+        // AI 模式要发服务商请求：离线时和云动作同口径，一并禁用
+        aiAvailable={online && defaultProviderId != null && model !== ""}
         aiReason={
-          defaultProviderId == null
-            ? "请先在设置中配置服务商"
-            : model === ""
-              ? "请先在设置中选择默认模型"
-              : null
+          !online
+            ? "当前离线"
+            : defaultProviderId == null
+              ? "请先在设置中配置服务商"
+              : model === ""
+                ? "请先在设置中选择默认模型"
+                : null
         }
         onConfirm={applyBackground}
       />
@@ -1081,6 +1125,7 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
                 error={lastError}
                 recovering={recovering}
                 onRecover={() => void recover()}
+                // 只关掉提示条：未确认的挂起标记要留着，否则下一次提交就绕过了确认弹窗
                 onDismiss={() => setLastError(null)}
               />
             </div>

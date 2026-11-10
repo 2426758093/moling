@@ -630,27 +630,36 @@ describe("RetouchStudio 重开后还原步骤链", () => {
 });
 
 describe("RetouchStudio 动作 Chip 按模式过滤", () => {
-  it("简单模式恰好 6 个 Chip，专家模式补齐另外 5 个", () => {
+  const SIMPLE_CHIPS = [
+    "一键优化",
+    "美颜",
+    "AI 消除",
+    "一句话改图",
+    "换背景",
+    "高清",
+  ];
+  const EXPERT_CHIPS = ["扩图", "裁剪调色", "风格", "局部重绘", "多区域"];
+
+  /** 按 DOM 顺序收集动作 Chip：步骤条按钮名带序号，不会混进来 */
+  function chipOrder() {
+    const all = [...SIMPLE_CHIPS, ...EXPERT_CHIPS];
+    return screen
+      .getAllByRole("button")
+      .map((el) => (el.textContent ?? "").trim())
+      .filter((text) => all.includes(text));
+  }
+
+  it("简单模式恰好 6 个 Chip 且顺序与动作表一致，专家模式补在末尾", () => {
     renderStudio();
 
-    for (const label of [
-      "一键优化",
-      "美颜",
-      "AI 消除",
-      "一句话改图",
-      "换背景",
-      "高清",
-    ]) {
-      expect(screen.getByRole("button", { name: label })).toBeTruthy();
-    }
-    for (const label of ["扩图", "裁剪调色", "风格", "局部重绘", "多区域"]) {
+    // 顺序也是契约：动作表改了顺序，这里必须一起改
+    expect(chipOrder()).toEqual(SIMPLE_CHIPS);
+    for (const label of EXPERT_CHIPS) {
       expect(screen.queryByRole("button", { name: label })).toBeNull();
     }
 
     act(() => useAppStore.setState({ mode: "expert" }));
-    for (const label of ["扩图", "裁剪调色", "风格", "局部重绘", "多区域"]) {
-      expect(screen.getByRole("button", { name: label })).toBeTruthy();
-    }
+    expect(chipOrder()).toEqual([...SIMPLE_CHIPS, ...EXPERT_CHIPS]);
   });
 });
 
@@ -698,6 +707,73 @@ describe("RetouchStudio 换背景", () => {
       ).disabled,
     ).toBe(false);
   });
+
+  it("离线时 AI 描述同样禁用（要发服务商请求），纯色本地方案不受影响", async () => {
+    renderStudio();
+    // 先挂载再切离线：组件只在挂载后监听 online / offline
+    act(() => window.dispatchEvent(new Event("offline")));
+
+    fireEvent.click(screen.getByRole("button", { name: "换背景" }));
+    fireEvent.click(await screen.findByRole("radio", { name: "AI 描述" }));
+    // 描述写了也没用：离线这一条优先于其余条件
+    fireEvent.change(screen.getByLabelText("背景描述"), {
+      target: { value: "星空下的霓虹城市" },
+    });
+
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "应用换背景",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    expect(screen.getByText("当前离线")).toBeTruthy();
+    expect(api.replaceBackground).not.toHaveBeenCalled();
+
+    // 恢复在线后 AI 才重新可提交
+    act(() => window.dispatchEvent(new Event("online")));
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "应用换背景",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
+  });
+
+  it("蒙版为空时不发请求、不弹计费确认，只提示先涂抹", async () => {
+    renderStudio();
+
+    fireEvent.click(screen.getByRole("button", { name: "换背景" }));
+    // 替身画布默认带笔画，清除后 hasStrokes() 归零
+    fireEvent.click(await screen.findByRole("button", { name: "清除蒙版" }));
+    fireEvent.click(screen.getByRole("button", { name: "应用换背景" }));
+
+    expect(api.replaceBackground).not.toHaveBeenCalled();
+    // toast 走 portal 挂在 body 上、且同文案去重是异步移除，断言「存在」而非唯一
+    expect(
+      screen.getAllByText("请先涂抹要替换的背景区域").length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByText("确认重新生成？")).toBeNull();
+  });
+
+  it("换面板时清空上一块蒙版：消除涂的笔画不会被当成背景蒙版", async () => {
+    renderStudio();
+
+    fireEvent.click(screen.getByRole("button", { name: "AI 消除" }));
+    await waitFor(() => expect(maskHandles).toHaveLength(1));
+    expect(maskHandles[0].hasStrokes()).toBe(true);
+
+    // 同一个 src 下画布不重建，只能靠面板切换时的显式清理
+    fireEvent.click(screen.getByRole("button", { name: "换背景" }));
+    await waitFor(() => expect(maskHandles[0].hasStrokes()).toBe(false));
+
+    fireEvent.click(screen.getByRole("button", { name: "应用换背景" }));
+    expect(api.replaceBackground).not.toHaveBeenCalled();
+    expect(
+      screen.getAllByText("请先涂抹要替换的背景区域").length,
+    ).toBeGreaterThan(0);
+  });
 });
 
 describe("RetouchStudio 未确认计费保护", () => {
@@ -731,6 +807,35 @@ describe("RetouchStudio 未确认计费保护", () => {
     expect(screen.getByRole("button", { name: "尝试恢复" })).toBeTruthy();
 
     // 再点一次：只弹确认框，绝不自动重发
+    fireEvent.click(screen.getByRole("button", { name: "确认消除" }));
+    await screen.findByText("确认重新生成？");
+    expect(api.editImage).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "仍然重新生成" }));
+    await waitFor(() => expect(api.editImage).toHaveBeenCalledTimes(2));
+  });
+
+  it("关闭提示条不会解除拦截：再次提交仍然要确认才发请求", async () => {
+    vi.mocked(api.editImage)
+      .mockRejectedValueOnce(unconfirmed())
+      .mockResolvedValueOnce({
+        historyId: 12,
+        dataUrl: "data:image/png;base64,FIX",
+        filePath: "C:/media/fix.png",
+        op: "erase",
+      });
+    renderStudio();
+
+    fireEvent.click(screen.getByRole("button", { name: "AI 消除" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认消除" }));
+    await screen.findByText("请求 ID：req_1");
+
+    // 关掉提示条：只是不再显示，计费风险还没对账
+    fireEvent.click(screen.getByRole("button", { name: "关闭提示" }));
+    await waitFor(() =>
+      expect(screen.queryByText("请求 ID：req_1")).toBeNull(),
+    );
+
     fireEvent.click(screen.getByRole("button", { name: "确认消除" }));
     await screen.findByText("确认重新生成？");
     expect(api.editImage).toHaveBeenCalledTimes(1);
