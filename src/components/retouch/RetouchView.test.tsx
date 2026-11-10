@@ -1514,6 +1514,48 @@ describe("RetouchStudio 多区域面板", () => {
     expect(screen.getByText("区域 1")).toBeTruthy();
   });
 
+  it("取消时夹着未确认的失败：仍要挂上计费拦截，不能当成普通取消", async () => {
+    // 取消是在两区之间轮询到的：上一区超时（可能已计费）、下一区前收到取消，
+    // 后端返回 cancelled + anySucceeded:false —— 哨兵会绕开 commit 的成功分支，
+    // 所以标记必须在 run 里就写，否则这次风险再也拦不住。
+    vi.mocked(api.regionEditBatch).mockImplementationOnce(async (input) => ({
+      groupId: "g",
+      results: [
+        {
+          id: input.regions[0].id,
+          ok: false,
+          error: JSON.stringify({
+            type: "unconfirmed",
+            message: "gateway timeout",
+            request_id: "req_9",
+          }),
+        },
+      ],
+      cancelled: true,
+      anySucceeded: false,
+      historyId: null,
+      dataUrl: null,
+    }));
+
+    await openRegionPanel();
+    addOneRegion("加一束花");
+    await screen.findByText("区域 1");
+
+    fireEvent.click(screen.getByRole("button", { name: "提交 1 个区域" }));
+    await screen.findByText(/按区域分别计费/);
+    fireEvent.click(screen.getByRole("button", { name: "开始重绘" }));
+
+    await screen.findByText("结果可能已计费，请在请求记录中确认");
+    expect(screen.queryByText("分区重绘失败")).toBeNull();
+    expect(screen.getByText("区域 1")).toBeTruthy();
+
+    // 拦截生效：下一次可能扣费的动作必须先确认
+    fireEvent.click(screen.getByRole("button", { name: "高清" }));
+    fireEvent.click(await screen.findByRole("button", { name: "开始放大" }));
+    await screen.findByText("确认重新生成？");
+    expect(api.transformImage).not.toHaveBeenCalled();
+  });
+
   it("当前步只有缩略图时不允许固化区域蒙版：提示稍候且不生成草稿", async () => {
     vi.mocked(api.historyLineage).mockResolvedValue([
       lineageRow(4, "paste", null),

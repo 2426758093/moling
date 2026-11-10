@@ -1326,7 +1326,12 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
           failures
             .map((failure) => parseAdapterError(failure))
             .find((parsed) => isUnconfirmedError(parsed)) ?? null;
-        if (out.cancelled) {
+        if (out.cancelled && billingFailure) {
+          // 取消也可能夹着未确认（上一区超时、下一区前才按下取消）：先把计费风险挂上。
+          // 这条路径会抛哨兵、不走 commit 的成功分支，后面没有第二次补写的机会。
+          setUnconfirmed({ requestId: requestIdOf(billingFailure) });
+          toast(t("结果可能已计费，请在请求记录中确认"), "error");
+        } else if (out.cancelled) {
           toast(
             t("已取消，已保留 {{done}} 个区域的结果", {
               done: succeeded.size,
