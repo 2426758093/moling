@@ -1,6 +1,7 @@
 import { afterAll, describe, expect, it } from "vitest";
 import i18n, { applyLocale, isLocale, readLocaleMirror } from "./index";
 import enUS from "./locales/en-US";
+import retouch from "./locales/en-US/retouch";
 import {
   RETOUCH_ACTIONS,
   RETOUCH_GATE_REASONS,
@@ -71,6 +72,34 @@ describe("修图分片", () => {
     );
     expect(i18n.t("打开修图")).toBe("Open retouch");
     await i18n.changeLanguage("zh-CN");
+  });
+});
+
+describe("修图英文译文", () => {
+  it("动作名不再被后置分片影子覆盖", async () => {
+    await i18n.changeLanguage("en-US");
+    expect(i18n.t("换背景")).toBe("Replace background");
+    expect(i18n.t("扩图")).toBe("Outpaint");
+    expect(i18n.t("高清")).toBe("Upscale");
+    expect(i18n.t("AI 消除")).toBe("AI erase");
+    expect(i18n.t("局部重绘")).toBe("Inpaint");
+    expect(i18n.t("裁剪调色")).toBe("Crop & tone");
+    expect(i18n.t("风格")).toBe("Style");
+    expect(i18n.t("多区域")).toBe("Multi-region");
+    await i18n.changeLanguage("zh-CN");
+  });
+
+  it("retouch 分片的译文没有残留中文（{{...}} 插值除外）", async () => {
+    const cjk = /[\u4e00-\u9fff]/;
+    const leftovers: string[] = [];
+    for (const [key, value] of Object.entries(
+      retouch as Record<string, string>,
+    )) {
+      // 插值占位里的中文不算残留：它们是运行时替换的变量名
+      const text = value.replace(/\{\{[^}]*\}\}/g, "");
+      if (cjk.test(text)) leftovers.push(`${key} → ${value}`);
+    }
+    expect(leftovers).toEqual([]);
   });
 });
 

@@ -164,6 +164,17 @@ function stepLabels() {
     .map((el) => el.getAttribute("aria-label"));
 }
 
+/** 一次未确认失败：gateway 超时但可能已在服务商侧出图 */
+function unconfirmed(requestId: string | null = "req_1") {
+  return new Error(
+    JSON.stringify({
+      type: "unconfirmed",
+      message: "gateway timeout",
+      request_id: requestId ?? undefined,
+    }),
+  );
+}
+
 beforeEach(() => {
   vi.stubGlobal("Image", FakeImage);
   maskHandles.length = 0;
@@ -484,6 +495,8 @@ describe("RetouchStudio 画布回写", () => {
       expect.objectContaining({ historyId: 8, width: 400, height: 300 }),
       "一键优化",
     );
+    // 内嵌/独立同一个口径：每步提交后都要广播历史变更
+    expect(historySpy).toHaveBeenCalledTimes(1);
   });
 
   it("回写失败只提示，步骤仍然保留", async () => {
@@ -533,6 +546,45 @@ describe("RetouchStudio 画布回写", () => {
     await screen.findByRole("button", { name: "2. 一键优化" });
 
     expect(historySpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("RetouchStudio 内嵌一致性", () => {
+  it("内嵌模式的计费保护与独立模式同一口径", async () => {
+    // 从画布进入：带 nodeId + embedded，行为与入口无关
+    useAppStore.setState({
+      retouchTarget: {
+        dataUrl: "data:image/png;base64,SRC",
+        historyId: 7,
+        canvasNodeId: "n1",
+        embedded: true,
+      },
+    });
+    vi.mocked(api.editImage)
+      .mockRejectedValueOnce(unconfirmed())
+      .mockResolvedValueOnce({
+        historyId: 12,
+        dataUrl: "data:image/png;base64,FIX",
+        filePath: "C:/media/fix.png",
+        op: "erase",
+      });
+    renderStudio();
+
+    fireEvent.click(screen.getByRole("button", { name: "AI 消除" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认消除" }));
+    await screen.findByText("请求 ID：req_1");
+
+    // 关掉提示条只是不显示：拦截仍在，再提交必须先确认
+    fireEvent.click(screen.getByRole("button", { name: "关闭提示" }));
+    await waitFor(() =>
+      expect(screen.queryByText("请求 ID：req_1")).toBeNull(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "确认消除" }));
+    await screen.findByText("确认重新生成？");
+    expect(api.editImage).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "仍然重新生成" }));
+    await waitFor(() => expect(api.editImage).toHaveBeenCalledTimes(2));
   });
 });
 
@@ -832,17 +884,6 @@ describe("RetouchStudio 换背景", () => {
 });
 
 describe("RetouchStudio 未确认计费保护", () => {
-  /** 一次未确认失败：gateway 超时但可能已在服务商侧出图 */
-  function unconfirmed(requestId: string | null = "req_1") {
-    return new Error(
-      JSON.stringify({
-        type: "unconfirmed",
-        message: "gateway timeout",
-        request_id: requestId ?? undefined,
-      }),
-    );
-  }
-
   it("未确认要先对账；再次提交必须经确认才发第二次请求", async () => {
     vi.mocked(api.editImage)
       .mockRejectedValueOnce(unconfirmed())
@@ -1350,17 +1391,6 @@ describe("RetouchStudio 多区域面板", () => {
 });
 
 describe("RetouchStudio 计费口径（纯色换背景）", () => {
-  /** 一次未确认失败：gateway 超时但可能已在服务商侧出图 */
-  function unconfirmed(requestId = "req_1") {
-    return new Error(
-      JSON.stringify({
-        type: "unconfirmed",
-        message: "gateway timeout",
-        request_id: requestId,
-      }),
-    );
-  }
-
   it("纯色换背景成功不解除拦截：再提交云端动作仍要先确认", async () => {
     vi.mocked(api.editImage)
       .mockRejectedValueOnce(unconfirmed())

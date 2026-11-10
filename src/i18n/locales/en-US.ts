@@ -26,10 +26,11 @@ const enUS = {
   ...gallery,
   ...queue,
   ...editors,
-  ...retouch,
   ...editorsDialogs,
   ...settingsSections,
   ...canvas,
+  /// 修图动作名以 retouch 分片为准：换背景/扩图 曾被后置的 canvas 分片影子覆盖
+  ...retouch,
   ...canvasLayers,
   ...animation,
   ...misc,

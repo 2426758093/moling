@@ -1,6 +1,6 @@
 [package]
 name = "moling"
-version = "2.1.0"
+version = "2.1.1"
 description = "MoLing - AI drawing client for any API"
 authors = ["MoLing Contributors"]
 edition = "2021"
