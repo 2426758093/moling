@@ -81,6 +81,123 @@ export function outpaintOffsets(
   };
 }
 
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function safeNumber(value: number | null | undefined, fallback = 0): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+/** 旋转后的画布尺寸（90/270 互换宽高） */
+export function rotatedSize(
+  size: PixelSize,
+  deg: 0 | 90 | 180 | 270,
+): PixelSize {
+  const base = safeSize(size);
+  return deg % 180 === 0 ? base : { width: base.height, height: base.width };
+}
+
+/** 调色三项：与 BasicEditView 同口径，-100..100，0 表示不改 */
+export interface ToneValues {
+  brightness: number;
+  contrast: number;
+  saturation: number;
+}
+
+export interface CropRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface CropState {
+  deg: 0 | 90 | 180 | 270;
+  flipH: boolean;
+  flipV: boolean;
+  /** 变换后坐标系（rotate/flip 之后的画布） */
+  rect: CropRect;
+  /** 变换后的画布尺寸，用来判断 rect 是否等于全图 */
+  canvas: PixelSize;
+  tone: ToneValues;
+}
+
+/** api.applyEdit 的 ops 形状（与 src/lib/api.ts 的联合类型一致） */
+export type EditOp =
+  | { type: "rotate"; deg: 90 | 180 | 270 }
+  | { type: "flip"; axis: "horizontal" | "vertical" }
+  | { type: "crop"; x: number; y: number; width: number; height: number }
+  | {
+      type: "adjust";
+      brightness: number;
+      contrast: number;
+      saturation: number;
+    };
+
+/** 裁剪框取自变换后坐标：四舍五入后夹进画布，宽高至少 1（缺省即全图） */
+function clampRect(
+  rect: CropRect | null | undefined,
+  canvas: PixelSize,
+): CropRect {
+  const x = clamp(
+    Math.round(safeNumber(rect?.x)),
+    0,
+    Math.max(0, canvas.width - 1),
+  );
+  const y = clamp(
+    Math.round(safeNumber(rect?.y)),
+    0,
+    Math.max(0, canvas.height - 1),
+  );
+  return {
+    x,
+    y,
+    width: clamp(
+      Math.round(safeNumber(rect?.width, canvas.width - x)),
+      1,
+      canvas.width - x,
+    ),
+    height: clamp(
+      Math.round(safeNumber(rect?.height, canvas.height - y)),
+      1,
+      canvas.height - y,
+    ),
+  };
+}
+
+/**
+ * 裁剪调色的 ops：顺序与旧 BasicEditView 一致（rotate → flipH → flipV → crop → adjust）。
+ * 没变的步骤一律省略：空数组表示「什么都不用做」。
+ */
+export function buildCropEditOps(state: CropState): EditOp[] {
+  if (!state) return [];
+  const canvas = safeSize(state.canvas);
+  const ops: EditOp[] = [];
+  const deg =
+    state.deg === 90 || state.deg === 180 || state.deg === 270 ? state.deg : 0;
+  if (deg !== 0) ops.push({ type: "rotate", deg });
+  if (state.flipH) ops.push({ type: "flip", axis: "horizontal" });
+  if (state.flipV) ops.push({ type: "flip", axis: "vertical" });
+
+  const rect = clampRect(state.rect, canvas);
+  const full =
+    rect.x === 0 &&
+    rect.y === 0 &&
+    rect.width === canvas.width &&
+    rect.height === canvas.height;
+  if (!full) ops.push({ type: "crop", ...rect });
+
+  // 三个值原样传出（不夹取）：后端已有校验，这里再截一次等于两套口径
+  const brightness = safeNumber(state.tone?.brightness);
+  const contrast = safeNumber(state.tone?.contrast);
+  const saturation = safeNumber(state.tone?.saturation);
+  if (brightness !== 0 || contrast !== 0 || saturation !== 0) {
+    ops.push({ type: "adjust", brightness, contrast, saturation });
+  }
+  return ops;
+}
+
 /** 目标比例的最大居中裁剪框（变换后坐标系：旋转/翻转之后的画布） */
 export function cropRectForRatio(
   size: PixelSize,

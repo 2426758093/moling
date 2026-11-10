@@ -2,9 +2,11 @@ import { describe, expect, it } from "vitest";
 import {
   CROP_RATIOS,
   OUTPAINT_RATIOS,
+  buildCropEditOps,
   cropRectForRatio,
   outpaintOffsets,
   outpaintTargetSize,
+  rotatedSize,
 } from "./retouchGeometry";
 
 describe("比例选项", () => {
@@ -113,5 +115,106 @@ describe("cropRectForRatio", () => {
     expect(rect.height).toBeGreaterThanOrEqual(1);
     expect(rect.x).toBeGreaterThanOrEqual(0);
     expect(rect.y).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe("rotatedSize", () => {
+  it("90 / 270 互换宽高，0 / 180 原样返回", () => {
+    expect(rotatedSize({ width: 400, height: 300 }, 90)).toEqual({
+      width: 300,
+      height: 400,
+    });
+    expect(rotatedSize({ width: 400, height: 300 }, 180)).toEqual({
+      width: 400,
+      height: 300,
+    });
+    expect(rotatedSize({ width: 400, height: 300 }, 270)).toEqual({
+      width: 300,
+      height: 400,
+    });
+    expect(rotatedSize({ width: 400, height: 300 }, 0)).toEqual({
+      width: 400,
+      height: 300,
+    });
+  });
+
+  it("非法尺寸不返回 0", () => {
+    const size = rotatedSize({ width: Number.NaN, height: -1 }, 90);
+    expect(size.width).toBeGreaterThan(0);
+    expect(size.height).toBeGreaterThan(0);
+  });
+});
+
+describe("buildCropEditOps", () => {
+  it("全默认（不转不翻、全图、无调色）不产出任何 op", () => {
+    expect(
+      buildCropEditOps({
+        deg: 0,
+        flipH: false,
+        flipV: false,
+        rect: { x: 0, y: 0, width: 400, height: 300 },
+        canvas: { width: 400, height: 300 },
+        tone: { brightness: 0, contrast: 0, saturation: 0 },
+      }),
+    ).toEqual([]);
+  });
+
+  it("旋转 + 水平翻转 + 1:1 裁剪 + 调色：顺序与旧 BasicEditView 一致", () => {
+    const canvas = rotatedSize({ width: 400, height: 300 }, 90);
+    expect(canvas).toEqual({ width: 300, height: 400 });
+    const rect = cropRectForRatio(canvas, "1:1");
+    expect(rect).toEqual({ x: 0, y: 50, width: 300, height: 300 });
+
+    expect(
+      buildCropEditOps({
+        deg: 90,
+        flipH: true,
+        flipV: false,
+        rect,
+        canvas,
+        tone: { brightness: 10, contrast: -5, saturation: 20 },
+      }),
+    ).toEqual([
+      { type: "rotate", deg: 90 },
+      { type: "flip", axis: "horizontal" },
+      { type: "crop", x: 0, y: 50, width: 300, height: 300 },
+      { type: "adjust", brightness: 10, contrast: -5, saturation: 20 },
+    ]);
+  });
+
+  it("只有调色 / 只有裁剪时各产出一条", () => {
+    expect(
+      buildCropEditOps({
+        deg: 0,
+        flipH: false,
+        flipV: false,
+        rect: { x: 0, y: 0, width: 400, height: 300 },
+        canvas: { width: 400, height: 300 },
+        tone: { brightness: 0, contrast: 0, saturation: 15 },
+      }),
+    ).toEqual([{ type: "adjust", brightness: 0, contrast: 0, saturation: 15 }]);
+
+    expect(
+      buildCropEditOps({
+        deg: 0,
+        flipH: false,
+        flipV: false,
+        rect: { x: 50, y: 0, width: 300, height: 300 },
+        canvas: { width: 400, height: 300 },
+        tone: { brightness: 0, contrast: 0, saturation: 0 },
+      }),
+    ).toEqual([{ type: "crop", x: 50, y: 0, width: 300, height: 300 }]);
+  });
+
+  it("坐标取整并夹进画布，宽高至少 1，不抛异常", () => {
+    const ops = buildCropEditOps({
+      deg: 0,
+      flipH: false,
+      flipV: false,
+      rect: { x: -20, y: 0.6, width: 1000, height: 0 },
+      canvas: { width: 400, height: 300 },
+      tone: { brightness: 0, contrast: 0, saturation: 0 },
+    });
+    expect(ops).toEqual([{ type: "crop", x: 0, y: 1, width: 400, height: 1 }]);
   });
 });

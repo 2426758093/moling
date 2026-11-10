@@ -67,6 +67,23 @@ const retouch = {
   "按倍数重新绘制，细节更清晰": "Redraw at a higher scale for more detail",
   开始放大: "Start upscale",
 
+  // 裁剪调色面板
+  裁剪比例: "Crop ratio",
+  "旋转、翻转与比例裁剪全在本机完成，不消耗接口额度":
+    "Rotate, flip and crop by ratio — all on this device, no API usage",
+  应用裁剪: "Apply crop",
+
+  // 风格面板
+  应用风格: "Apply style",
+
+  // 局部重绘面板
+  "涂抹要重绘的区域，填写提示词，其余区域保持不变":
+    "Paint the area to redraw, describe the result; everything else stays",
+  重绘要求: "Inpaint instruction",
+  描述该区域要变成什么: "Describe what this area should become",
+  确认重绘: "Inpaint",
+  请先涂抹要重绘的区域: "Paint the area to redraw first",
+
   // 错误条
   关闭提示: "Dismiss",
 

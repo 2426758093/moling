@@ -22,16 +22,26 @@ interface FakeMask {
   applyMask: () => Promise<void>;
 }
 
-const { maskHandles, deliverSpy, historySpy } = vi.hoisted(() => ({
-  maskHandles: [] as FakeMask[],
-  deliverSpy: vi.fn(),
-  historySpy: vi.fn(),
-}));
+const { maskHandles, deliverSpy, historySpy, cropPreviewSpy } = vi.hoisted(
+  () => ({
+    maskHandles: [] as FakeMask[],
+    deliverSpy: vi.fn(),
+    historySpy: vi.fn(),
+    cropPreviewSpy: vi.fn(),
+  }),
+);
 
 // 回写单独测：这里只关心「提交成功后有没有带着 nodeId 调回写」，画布规则在
 // deliverEditResult.test.ts 里覆盖。
 vi.mock("../../lib/deliverEditResult", () => ({
   deliverEditResult: deliverSpy,
+}));
+
+// 画布层依赖 canvas 像素 API（jsdom 没有）：裁剪预览直接给固定 data URL，
+// 扩图垫图也只需要一个不会抛的替身。
+vi.mock("../../lib/retouchCanvas", () => ({
+  padImageToSize: vi.fn(),
+  renderCropPreview: cropPreviewSpy,
 }));
 
 // 历史变更广播：画廊靠它刷新，每步提交后都必须发一次
@@ -86,6 +96,7 @@ vi.mock("../../lib/api", async (importOriginal) => {
       batchHistoryThumbs: vi.fn(),
       replaceBackground: vi.fn(),
       transformImage: vi.fn(),
+      applyEdit: vi.fn(),
       recoverImageRequestByClient: vi.fn(),
       getSetting: vi.fn(),
       segmentModelStatus: vi.fn(),
@@ -107,6 +118,7 @@ class FakeImage {
 }
 
 import RetouchView from "./RetouchView";
+import { GUARD_SUFFIX } from "../../lib/retouchPrompts";
 
 const ANALYSIS = {
   exposureEv: 0.2,
@@ -243,6 +255,18 @@ beforeEach(() => {
     recovered: 1,
     failed: 0,
   });
+  vi.mocked(api.applyEdit).mockReset();
+  vi.mocked(api.applyEdit).mockResolvedValue({
+    historyId: 20,
+    dataUrl: "data:image/png;base64,CROP",
+    filePath: "C:/media/crop.png",
+    width: 300,
+    height: 300,
+    op: "basic-edit",
+    parentId: 7,
+  });
+  cropPreviewSpy.mockClear();
+  cropPreviewSpy.mockResolvedValue("data:image/png;base64,CROPPREVIEW");
 });
 
 function renderStudio() {
@@ -992,5 +1016,140 @@ describe("RetouchStudio 扩图面板", () => {
     await waitFor(() =>
       expect(screen.getByText("目标尺寸 533 × 300")).toBeTruthy(),
     );
+  });
+});
+
+describe("RetouchStudio 裁剪调色面板", () => {
+  it("1:1 裁剪走本地 applyEdit，parentId 是当前步", async () => {
+    useAppStore.setState({ mode: "expert" });
+    renderStudio();
+
+    fireEvent.click(screen.getByRole("button", { name: "裁剪调色" }));
+    // 尺寸实测完成后输出行才有值（原图 400×300 全图）
+    await screen.findByText("输出 400 × 300");
+
+    fireEvent.click(screen.getByRole("radio", { name: "1:1" }));
+    await screen.findByText("输出 300 × 300");
+    // 预览是本地渲染：等它落一次，避免断言期间还有未决状态
+    await waitFor(() => expect(cropPreviewSpy).toHaveBeenCalled());
+
+    const apply = screen.getByRole("button", { name: "应用裁剪" });
+    await waitFor(() => expect(apply.hasAttribute("disabled")).toBe(false));
+    fireEvent.click(apply);
+
+    await screen.findByRole("button", { name: "2. 裁剪调色" });
+    expect(api.applyEdit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        parentId: 7,
+        ops: expect.arrayContaining([
+          expect.objectContaining({
+            type: "crop",
+            x: 50,
+            y: 0,
+            width: 300,
+            height: 300,
+          }),
+        ]),
+      }),
+    );
+  });
+});
+
+describe("RetouchStudio 风格面板", () => {
+  it("补充描述作为 prompt 走 transformImage（scale 1 / detail）", async () => {
+    useAppStore.setState({ mode: "expert" });
+    renderStudio();
+
+    fireEvent.click(screen.getByRole("button", { name: "风格" }));
+    fireEvent.change(await screen.findByLabelText("补充描述（可选）"), {
+      target: { value: "暖色调" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "应用风格" }));
+
+    await screen.findByRole("button", { name: "2. 风格" });
+    expect(api.transformImage).toHaveBeenCalledWith(
+      expect.objectContaining({ scale: 1, mode: "detail", prompt: "暖色调" }),
+    );
+  });
+});
+
+describe("RetouchStudio 局部重绘面板", () => {
+  it("蒙版与加了护栏的提示词走 editImage retouch", async () => {
+    vi.mocked(api.editImage).mockResolvedValueOnce({
+      historyId: 30,
+      dataUrl: "data:image/png;base64,INPAINT",
+      filePath: "C:/media/inpaint.png",
+      op: "retouch",
+    });
+    useAppStore.setState({ mode: "expert" });
+    renderStudio();
+
+    fireEvent.click(screen.getByRole("button", { name: "局部重绘" }));
+    await waitFor(() => expect(maskHandles.length).toBeGreaterThan(0));
+
+    fireEvent.change(await screen.findByLabelText("重绘要求"), {
+      target: { value: "换成一只橘猫" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "确认重绘" }));
+
+    await screen.findByRole("button", { name: "2. 局部重绘" });
+    const [input] = vi.mocked(api.editImage).mock.calls[0];
+    expect(input.maskB64).toBe("data:image/png;base64,MASK");
+    expect(input.op).toBe("retouch");
+    expect(input.prompt.startsWith("换成一只橘猫")).toBe(true);
+    expect(input.prompt.endsWith(GUARD_SUFFIX)).toBe(true);
+    expect(input.width).toBe(400);
+    expect(input.height).toBe(300);
+  });
+});
+
+describe("RetouchStudio 计费口径（纯色换背景）", () => {
+  /** 一次未确认失败：gateway 超时但可能已在服务商侧出图 */
+  function unconfirmed(requestId = "req_1") {
+    return new Error(
+      JSON.stringify({
+        type: "unconfirmed",
+        message: "gateway timeout",
+        request_id: requestId,
+      }),
+    );
+  }
+
+  it("纯色换背景成功不解除拦截：再提交云端动作仍要先确认", async () => {
+    vi.mocked(api.editImage)
+      .mockRejectedValueOnce(unconfirmed())
+      .mockResolvedValueOnce({
+        historyId: 12,
+        dataUrl: "data:image/png;base64,FIX",
+        filePath: "C:/media/fix.png",
+        op: "erase",
+      });
+    renderStudio();
+
+    // 一次云请求未确认失败
+    fireEvent.click(screen.getByRole("button", { name: "AI 消除" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认消除" }));
+    await screen.findByText("请求 ID：req_1");
+    fireEvent.click(screen.getByRole("button", { name: "关闭提示" }));
+    await waitFor(() =>
+      expect(screen.queryByText("请求 ID：req_1")).toBeNull(),
+    );
+
+    // 收起消除面板（顺便重建一块新蒙版），纯色换背景在本地合成并提交成功
+    fireEvent.click(screen.getByRole("button", { name: "AI 消除" }));
+    fireEvent.click(screen.getByRole("button", { name: "换背景" }));
+    fireEvent.click(await screen.findByRole("button", { name: "应用换背景" }));
+    await screen.findByRole("button", { name: "2. 换背景" });
+
+    // 纯色换背景不扣费：它的成功不能解除上一次未确认的计费风险
+    fireEvent.click(screen.getByRole("button", { name: "换背景" }));
+    fireEvent.click(screen.getByRole("button", { name: "AI 消除" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认消除" }));
+
+    await screen.findByText("确认重新生成？");
+    expect(api.editImage).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "仍然重新生成" }));
+    await waitFor(() => expect(api.editImage).toHaveBeenCalledTimes(2));
   });
 });

@@ -36,10 +36,16 @@ import {
   type RetouchGateReason,
   type RetouchStepLabel,
 } from "../../lib/retouchActions";
-import { ERASE_PROMPT, OUTPAINT_PROMPT } from "../../lib/retouchPrompts";
 import {
+  ERASE_PROMPT,
+  OUTPAINT_PROMPT,
+  withGuard,
+} from "../../lib/retouchPrompts";
+import {
+  buildCropEditOps,
   outpaintOffsets,
   outpaintTargetSize,
+  type CropState,
   type OutpaintRatio,
 } from "../../lib/retouchGeometry";
 import { padImageToSize } from "../../lib/retouchCanvas";
@@ -58,9 +64,12 @@ import BeautyPanel from "./panels/BeautyPanel";
 import BackgroundPanel, {
   type BackgroundOptions,
 } from "./panels/BackgroundPanel";
+import CropPanel from "./panels/CropPanel";
 import ErasePanel from "./panels/ErasePanel";
+import InpaintPanel from "./panels/InpaintPanel";
 import InstructionPanel from "./panels/InstructionPanel";
 import OutpaintPanel from "./panels/OutpaintPanel";
+import StylePanel from "./panels/StylePanel";
 import UpscalePanel from "./panels/UpscalePanel";
 
 /** 专家模式滑杆预览的防抖：拖滑块时每 250ms 最多算一次 */
@@ -82,6 +91,13 @@ interface StepResult {
   filePath?: string;
   width?: number;
   height?: number;
+}
+
+interface CommitOptions {
+  /** 只由「确认重新生成」弹窗传入：跳过未确认拦截 */
+  force?: boolean;
+  /** 这次提交是否可能扣费；缺省按 mayBillRetouchAction(action) */
+  billable?: boolean;
 }
 
 /// 解码图片拿自然宽高：失败 / 超时都返回 null，绝不用别的尺寸顶替。
@@ -274,6 +290,7 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
     result: RetouchAnalysis;
   } | null>(null);
   const [instruction, setInstruction] = useState("");
+  const [inpaintPrompt, setInpaintPrompt] = useState("");
   const [autoStrength, setAutoStrength] = useState(DEFAULT_AUTO_STRENGTH);
   const [beautyAmount, setBeautyAmount] = useState(DEFAULT_BEAUTY_AMOUNT);
   const [brushSize, setBrushSize] = useState(36);
@@ -584,18 +601,21 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
 
   /// 提交动作：统一 busy / 报错 / 清预览；返回是否成功（失败时保留输入）。
   /// `run` 拿到的是「保证带全图」的那一步：还原出来的旧步会先懒加载。
-  /// `force` 只由「确认重新生成」弹窗传来：跳过未确认计费的拦截。
+  /// `options.force` 只由「确认重新生成」弹窗传来：跳过未确认计费的拦截。
   const commit = async (
     action: RetouchActionId,
     label: RetouchStepLabel,
     run: (src: RetouchStep) => Promise<StepResult>,
-    force = false,
+    options: CommitOptions = {},
   ): Promise<boolean> => {
+    const billable = options.billable ?? mayBillRetouchAction(action);
     // 上一次未确认 + 这次可能扣费 + 不是用户确认后的重试 → 先弹确认，不发请求
-    // 注意读的是 unconfirmed（跨提示条存活），不是 lastError（可被关闭清掉）
-    if (!force && unconfirmed && mayBillRetouchAction(action)) {
+    // 注意读的是 unconfirmed（跨提示条存活），不是 lastError（可被关闭清掉）。
+    // 拦截条件用 billable 而不是动作分类：纯色 / 渐变换背景不扣费，
+    // 不该被上一次云请求的未确认标记拦住。
+    if (!options.force && unconfirmed && billable) {
       pendingRetry.current = () => {
-        void commit(action, label, run, true);
+        void commit(action, label, run, { ...options, force: true });
       };
       setConfirmRetry(true);
       return false;
@@ -654,9 +674,10 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
       }
       // 报错条描述的是「上一次失败」，成功就清掉。
       // 但挂起标记只该被「可能扣费的动作」的成功解除：一键优化 / 美颜走本地，
-      // 它们的成功并不能说明之前那次云端请求有没有出图，清了等于用本地动作绕过拦截。
+      // 纯色 / 渐变换背景也不扣费 —— 它们的成功并不能说明之前那次云端请求有没有
+      // 出图，清了等于用本地动作绕过拦截。
       setLastError(null);
-      if (mayBillRetouchAction(action)) setUnconfirmed(null);
+      if (billable) setUnconfirmed(null);
       return true;
     } catch (error) {
       const parsed = parseAdapterError(
@@ -866,28 +887,34 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
       toast(t("请先涂抹要替换的背景区域"), "error");
       return;
     }
-    void commit("background", "换背景", async (src) => {
-      const out = await api.replaceBackground({
-        imageB64: src.dataUrl,
-        maskB64,
-        parentId: src.historyId ?? undefined,
-        kind: options.kind,
-        color: options.color,
-        colorFrom: options.colorFrom,
-        colorTo: options.colorTo,
-        direction: options.direction,
-        prompt: options.kind === "ai" ? options.prompt.trim() : "",
-        providerId: options.kind === "ai" ? providerId : null,
-        model: options.kind === "ai" ? modelId : undefined,
-      });
-      return {
-        historyId: out.historyId,
-        dataUrl: out.dataUrl,
-        filePath: out.filePath,
-        width: out.width,
-        height: out.height,
-      };
-    });
+    void commit(
+      "background",
+      "换背景",
+      async (src) => {
+        const out = await api.replaceBackground({
+          imageB64: src.dataUrl,
+          maskB64,
+          parentId: src.historyId ?? undefined,
+          kind: options.kind,
+          color: options.color,
+          colorFrom: options.colorFrom,
+          colorTo: options.colorTo,
+          direction: options.direction,
+          prompt: options.kind === "ai" ? options.prompt.trim() : "",
+          providerId: options.kind === "ai" ? providerId : null,
+          model: options.kind === "ai" ? modelId : undefined,
+        });
+        return {
+          historyId: out.historyId,
+          dataUrl: out.dataUrl,
+          filePath: out.filePath,
+          width: out.width,
+          height: out.height,
+        };
+      },
+      // 纯色 / 渐变在本地合成：不扣费，也就不该被未确认标记拦住、更不该解除它
+      { billable: options.kind === "ai" },
+    );
   };
 
   /// 高清放大：模型沿用默认模型，不再复刻旧弹窗的模型下拉
@@ -961,6 +988,118 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
         dataUrl: out.dataUrl,
         filePath: out.filePath,
       };
+    });
+  };
+
+  /// 裁剪调色：本地像素运算，永不计费（billable: false 显式声明，
+  /// 免得以后动作分类口径变化时被上一次云请求的未确认标记误伤）
+  const applyCrop = (state: CropState) => {
+    if (busy) return;
+    const reason = reasons.crop;
+    if (reason) {
+      toast(t(reason), "error");
+      return;
+    }
+    const ops = buildCropEditOps(state);
+    if (ops.length === 0) return;
+    void commit(
+      "crop",
+      "裁剪调色",
+      async (src) => {
+        const out = await api.applyEdit({
+          imageB64: src.dataUrl,
+          ops,
+          parentId: src.historyId ?? undefined,
+        });
+        return {
+          historyId: out.historyId,
+          dataUrl: out.dataUrl,
+          filePath: out.filePath,
+          width: out.width,
+          height: out.height,
+        };
+      },
+      { billable: false },
+    );
+  };
+
+  /// 风格：scale=1 + 提示词即风格转换，模型沿用默认模型
+  const applyStyle = (prompt: string) => {
+    if (busy) return;
+    const reason = reasons.style;
+    if (reason) {
+      toast(t(reason), "error");
+      return;
+    }
+    if (defaultProviderId == null || !model) return;
+    const providerId = defaultProviderId;
+    const modelId = model;
+    void commit("style", "风格", async (src) => {
+      const out = await api.transformImage({
+        providerId,
+        model: modelId,
+        imageB64: src.dataUrl,
+        scale: 1,
+        mode: "detail",
+        prompt,
+        parentId: src.historyId ?? undefined,
+      });
+      return {
+        historyId: out.historyId,
+        dataUrl: out.dataUrl,
+        filePath: out.filePath,
+        width: out.width,
+        height: out.height,
+      };
+    });
+  };
+
+  /// 局部重绘：蒙版 + 用户提示词（追加护栏）走 editImage retouch。
+  const applyInpaint = (prompt: string) => {
+    if (busy) return;
+    const reason = reasons.inpaint;
+    if (reason) {
+      toast(t(reason), "error");
+      return;
+    }
+    if (defaultProviderId == null || !model) return;
+    // 蒙版校验放在 commit 之前：空蒙版不可能扣费，不能触发计费确认或常驻错误条
+    const mask = maskRef.current;
+    if (!mask?.hasStrokes()) {
+      toast(t("请先涂抹要重绘的区域"), "error");
+      return;
+    }
+    const maskB64 = mask.toAlphaPng();
+    if (!maskB64) {
+      toast(t("请先涂抹要重绘的区域"), "error");
+      return;
+    }
+    const providerId = defaultProviderId;
+    const modelId = model;
+    const fullPrompt = withGuard(prompt);
+    void commit("inpaint", "局部重绘", async (src) => {
+      const size = await editInputSize(src);
+      if (!size) throw new Error(t("图片尺寸读取失败，请重试"));
+      const out = await api.editImage({
+        providerId,
+        model: modelId,
+        prompt: fullPrompt,
+        imageB64: src.dataUrl,
+        maskB64,
+        width: size.width,
+        height: size.height,
+        op: "retouch",
+        parentId: src.historyId ?? undefined,
+      });
+      if (out.warning) toast(out.warning, "error");
+      return {
+        historyId: out.historyId,
+        dataUrl: out.dataUrl,
+        filePath: out.filePath,
+      };
+    }).then((ok) => {
+      // 失败时保留输入，方便改一改重试
+      if (ok) setInpaintPrompt("");
     });
   };
 
@@ -1086,6 +1225,30 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
         reason={reasons.upscale}
         busy={busy}
         onConfirm={applyUpscale}
+      />
+    ) : panel === "crop" ? (
+      <CropPanel
+        reason={reasons.crop}
+        busy={busy}
+        src={cur.dataUrl}
+        inputSize={inputSize}
+        onPreview={(url) => setPreview(url ? { key: previewKey, url } : null)}
+        onConfirm={applyCrop}
+      />
+    ) : panel === "style" ? (
+      <StylePanel reason={reasons.style} busy={busy} onConfirm={applyStyle} />
+    ) : panel === "inpaint" ? (
+      <InpaintPanel
+        reason={reasons.inpaint}
+        busy={busy}
+        prompt={inpaintPrompt}
+        onPromptChange={setInpaintPrompt}
+        brushSize={brushSize}
+        onBrushSizeChange={setBrushSize}
+        eraser={eraser}
+        onEraserChange={setEraser}
+        onClearMask={() => maskRef.current?.clear()}
+        onConfirm={applyInpaint}
       />
     ) : null;
 

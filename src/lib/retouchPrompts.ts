@@ -12,3 +12,9 @@ export const ERASE_PROMPT =
 /** 扩图：把透明 padding 补成自然延续的画面（与旧 OutpaintView 同一句） */
 export const OUTPAINT_PROMPT =
   "Extend the scene naturally to fill the transparent areas, matching the original style, lighting and content.";
+
+/** 固定动作的提示词 + 护栏；用户原话（一句话改图）绝不走这里 */
+export function withGuard(prompt: string): string {
+  const trimmed = prompt.trim();
+  return trimmed ? trimmed + GUARD_SUFFIX : trimmed;
+}
