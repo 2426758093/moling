@@ -58,8 +58,10 @@ export async function renderCropPreview(
   const midCtx = midCanvas.getContext("2d");
   if (!midCtx) throw new Error(i18n.t("图片读取失败，请重试"));
   midCtx.translate(midCanvas.width / 2, midCanvas.height / 2);
-  if (input.deg !== 0) midCtx.rotate((input.deg * Math.PI) / 180);
+  // 顺序必须与 buildCropEditOps 一致：先翻转源坐标再旋转（CTM = T·S·R = F·R），
+  // 否则 90/270 加翻转时预览会显示成另一条对角线镜像。
   midCtx.scale(input.flipH ? -1 : 1, input.flipV ? -1 : 1);
+  if (input.deg !== 0) midCtx.rotate((input.deg * Math.PI) / 180);
   midCtx.drawImage(img, -natW / 2, -natH / 2);
 
   const rect = input.rect;

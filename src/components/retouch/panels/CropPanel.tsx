@@ -82,6 +82,8 @@ export default function CropPanel({
     if (!(inputW > 0) || !(inputH > 0)) return;
     const box = rotatedSize({ width: inputW, height: inputH }, deg);
     const crop = cropRectForRatio(box, ratio);
+    // 已经在飞行中的渲染回来时可能面板早已卸载：作废后不再回写预览
+    let cancelled = false;
     const timer = window.setTimeout(() => {
       renderCropPreview(src, {
         deg,
@@ -92,10 +94,15 @@ export default function CropPanel({
         contrast,
         saturation,
       })
-        .then((url) => previewRef.current(url))
+        .then((url) => {
+          if (!cancelled) previewRef.current(url);
+        })
         .catch(() => undefined);
     }, PREVIEW_DEBOUNCE_MS);
-    return () => window.clearTimeout(timer);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, [
     src,
     deg,

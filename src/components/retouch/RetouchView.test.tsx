@@ -904,6 +904,37 @@ describe("RetouchStudio 未确认计费保护", () => {
     await waitFor(() => expect(api.editImage).toHaveBeenCalledTimes(2));
   });
 
+  it("本地裁剪不受未确认拦截：不弹确认、直接 applyEdit 落成一步", async () => {
+    vi.mocked(api.editImage).mockRejectedValueOnce(unconfirmed());
+    renderStudio();
+
+    // 先制造一次未确认失败，再关掉提示条（挂起标记仍留着）
+    fireEvent.click(screen.getByRole("button", { name: "AI 消除" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认消除" }));
+    await screen.findByText("请求 ID：req_1");
+    fireEvent.click(screen.getByRole("button", { name: "关闭提示" }));
+    await waitFor(() =>
+      expect(screen.queryByText("请求 ID：req_1")).toBeNull(),
+    );
+
+    // 专家模式的裁剪调色是纯本地像素运算：永不计费，也就不该被云端标记拦住
+    act(() => useAppStore.setState({ mode: "expert" }));
+    fireEvent.click(screen.getByRole("button", { name: "裁剪调色" }));
+    await screen.findByText("输出 400 × 300");
+    fireEvent.click(screen.getByRole("radio", { name: "1:1" }));
+    await screen.findByText("输出 300 × 300");
+
+    const apply = screen.getByRole("button", { name: "应用裁剪" });
+    await waitFor(() => expect(apply.hasAttribute("disabled")).toBe(false));
+    fireEvent.click(apply);
+
+    // 关键回归：不得出现计费确认，且直接发本地请求
+    expect(screen.queryByText("确认重新生成？")).toBeNull();
+    await waitFor(() => expect(api.applyEdit).toHaveBeenCalledTimes(1));
+    await screen.findByRole("button", { name: "2. 裁剪调色" });
+    expect(api.editImage).toHaveBeenCalledTimes(1);
+  });
+
   it("尝试恢复按请求 ID 对账，成功后提示条消失", async () => {
     vi.mocked(api.editImage).mockRejectedValueOnce(unconfirmed());
     renderStudio();
@@ -1041,15 +1072,8 @@ describe("RetouchStudio 裁剪调色面板", () => {
     expect(api.applyEdit).toHaveBeenCalledWith(
       expect.objectContaining({
         parentId: 7,
-        ops: expect.arrayContaining([
-          expect.objectContaining({
-            type: "crop",
-            x: 50,
-            y: 0,
-            width: 300,
-            height: 300,
-          }),
-        ]),
+        // 不转不翻不调色：ops 精确只有一条 crop，多一条都说明参数被污染
+        ops: [{ type: "crop", x: 50, y: 0, width: 300, height: 300 }],
       }),
     );
   });
