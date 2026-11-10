@@ -1,5 +1,11 @@
-import { describe, expect, it } from "vitest";
-import { adapterErrorTitle, parseAdapterError } from "./api";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { invoke } from "@tauri-apps/api/core";
+import {
+  adapterErrorTitle,
+  api,
+  parseAdapterError,
+  type RetouchOp,
+} from "./api";
 
 describe("parseAdapterError", () => {
   it("解析后端序列化后的结构化错误", () => {
@@ -76,5 +82,63 @@ describe("adapterErrorTitle", () => {
       "请求失败",
     );
     expect(adapterErrorTitle({ type: "other", message: "" })).toBe("请求失败");
+  });
+});
+
+describe("修图接口", () => {
+  const ops: RetouchOp[] = [{ type: "autoEnhance", strength: 0.5 }];
+
+  beforeEach(() => {
+    vi.mocked(invoke).mockReset();
+  });
+
+  it("retouchAnalyze 调用 retouch_analyze 且只传图片", async () => {
+    const analysis = {
+      exposureEv: 0.2,
+      wbCast: 0.05,
+      contrast: 0.4,
+      saturation: 0.5,
+      sharpness: 0.6,
+      skinRatio: 0.1,
+      clipLow: 0.01,
+      clipHigh: 0.02,
+      meanLuma: 0.5,
+      suggestions: ["exposure"],
+    };
+    vi.mocked(invoke).mockResolvedValue(analysis);
+
+    await expect(api.retouchAnalyze("x")).resolves.toBe(analysis);
+    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledWith("retouch_analyze", { imageB64: "x" });
+  });
+
+  it("previewRetouch 与 applyRetouch 走同一个 apply_retouch 命令", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+
+    await api.previewRetouch({
+      imageB64: "x",
+      ops,
+      preview: { maxSide: 1024 },
+    });
+    expect(invoke).toHaveBeenLastCalledWith("apply_retouch", {
+      input: { imageB64: "x", ops, preview: { maxSide: 1024 } },
+    });
+
+    // 预览与提交的唯一区别就是 input 里有没有 preview
+    await api.applyRetouch({ imageB64: "x", parentId: 7, ops });
+    expect(invoke).toHaveBeenLastCalledWith("apply_retouch", {
+      input: { imageB64: "x", parentId: 7, ops },
+    });
+  });
+
+  it("historyLineage 调用 history_lineage 并返回裸历史行（root→current）", async () => {
+    const lineage = [
+      { id: 1, prompt: "", parentId: null, op: "generate" },
+      { id: 3, prompt: "", parentId: 1, op: "retouch" },
+    ];
+    vi.mocked(invoke).mockResolvedValue(lineage);
+
+    await expect(api.historyLineage(3)).resolves.toBe(lineage);
+    expect(invoke).toHaveBeenCalledWith("history_lineage", { historyId: 3 });
   });
 });

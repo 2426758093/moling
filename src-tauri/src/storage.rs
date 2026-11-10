@@ -109,6 +109,7 @@ pub struct HistoryRow {
     #[serde(default)]
     pub parent_id: Option<i64>,
     /// generate | edit | erase | outpaint | upscale | style | background | basic-edit | canvas | paste
+    /// | retouch | beauty | auto-enhance（后三者来自本地修图，见 `retouch::history_op`）
     #[serde(default = "default_op")]
     pub op: String,
 }
@@ -2302,6 +2303,10 @@ fn history_from_row(row: &rusqlite::Row) -> rusqlite::Result<HistoryRow> {
 /// 按 id 取一条历史记录（transform_image 需要父图的尺寸与提示词）
 pub fn history_row(id: i64) -> AppResult<Option<HistoryRow>> {
     let c = conn()?;
+    history_row_in(&c, id)
+}
+
+pub(crate) fn history_row_in(c: &Connection, id: i64) -> AppResult<Option<HistoryRow>> {
     let mut stmt = c.prepare(
         "SELECT id, prompt, negative_prompt, model, provider_name, seed, width, height,
          guidance, steps, style, file_path, favorite, created_at, parent_id, op
@@ -2338,6 +2343,31 @@ pub fn list_derived(id: i64) -> AppResult<Vec<HistoryRow>> {
     )?;
     let rows = stmt.query_map(params![root], history_from_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+/// 步骤链：从当前记录沿 parent_id 上溯到根，返回 root→current 有序列表。
+/// 最多 32 跳防环；记录不存在返回空。
+pub fn history_lineage(id: i64) -> AppResult<Vec<HistoryRow>> {
+    let c = conn()?;
+    history_lineage_in(&c, id)
+}
+
+pub(crate) fn history_lineage_in(c: &Connection, id: i64) -> AppResult<Vec<HistoryRow>> {
+    // 先按 current→root 逆序收集，再 reverse 成 root→current
+    let mut chain = Vec::new();
+    let mut cursor = Some(id);
+    while let Some(current) = cursor {
+        if chain.len() >= 32 {
+            break;
+        }
+        let Some(row) = history_row_in(c, current)? else {
+            break;
+        };
+        cursor = row.parent_id;
+        chain.push(row);
+    }
+    chain.reverse();
+    Ok(chain)
 }
 
 pub fn set_favorite(id: i64, favorite: bool) -> AppResult<()> {
@@ -6295,5 +6325,38 @@ mod tests {
         .unwrap();
         let after = ids(list_history_in(&c, 2, 0, Some(2), "", "", false).unwrap());
         assert_eq!(after, vec![1]);
+    }
+
+    /// 步骤链：root→current 有序，记录不存在返回空，脏数据成环时最多 32 跳
+    #[test]
+    fn history_lineage_walks_to_root_in_order() {
+        let c = mem_conn();
+        let insert = |prompt: &str, parent: Option<i64>| -> i64 {
+            c.execute(
+                "INSERT INTO history (prompt, model, provider_name, style, file_path, favorite,
+                 created_at, op, parent_id)
+                 VALUES (?1, 'm', 'P', '', ?2, 0, '0', 'retouch', ?3)",
+                params![prompt, format!("/tmp/{prompt}.png"), parent],
+            )
+            .unwrap();
+            c.last_insert_rowid()
+        };
+        let a = insert("a", None);
+        let b = insert("b", Some(a));
+        let cc = insert("c", Some(b));
+
+        let ids = |rows: Vec<HistoryRow>| rows.iter().map(|r| r.id).collect::<Vec<_>>();
+        assert_eq!(ids(history_lineage_in(&c, cc).unwrap()), vec![a, b, cc]);
+        assert_eq!(ids(history_lineage_in(&c, b).unwrap()), vec![a, b]);
+        assert_eq!(ids(history_lineage_in(&c, a).unwrap()), vec![a]);
+        assert!(history_lineage_in(&c, 999_999).unwrap().is_empty());
+
+        // 成环：a 指回 c，不能死循环，链长被 32 跳上限截断
+        c.execute(
+            "UPDATE history SET parent_id = ?1 WHERE id = ?2",
+            params![cc, a],
+        )
+        .unwrap();
+        assert_eq!(history_lineage_in(&c, cc).unwrap().len(), 32);
     }
 }

@@ -1,6 +1,31 @@
 import { afterAll, describe, expect, it } from "vitest";
 import i18n, { applyLocale, isLocale, readLocaleMirror } from "./index";
 import enUS from "./locales/en-US";
+import {
+  RETOUCH_ACTIONS,
+  RETOUCH_GATE_REASONS,
+  RETOUCH_SUGGESTION_TEXTS,
+} from "../lib/retouchActions";
+
+/**
+ * 修图相关源码原文：用来把 `t("...")` 字面量全部扫出来。
+ * 用 Vite 的 raw 导入而不是 node:fs —— 仓库没有 @types/node，扫描逻辑不能进 tsc 的绊脚石。
+ */
+const retouchSources = import.meta.glob<string>(
+  ["../components/retouch/**/*.tsx", "../lib/retouch*.ts"],
+  { query: "?raw", import: "default", eager: true },
+);
+
+/** `t("文案")` 里的文案；前面不能是标识符字符，免得把 import("react") 当成 key */
+const LITERAL_T = /(^|[^\w$])t\(\s*"([^"\n]*)"/gm;
+
+const dict = enUS as Record<string, string>;
+
+function resolves(key: string): boolean {
+  return (
+    Object.prototype.hasOwnProperty.call(dict, key) && dict[key].trim() !== ""
+  );
+}
 
 afterAll(() => {
   void i18n.changeLanguage("zh-CN");
@@ -33,5 +58,59 @@ describe("i18n", () => {
     applyLocale("zh-CN");
     expect(document.documentElement.lang).toBe("zh-CN");
     expect(isLocale("fr-FR")).toBe(false);
+  });
+});
+
+describe("修图分片", () => {
+  it("骨架文案已并入词典且英文非空", async () => {
+    await i18n.changeLanguage("en-US");
+    expect(i18n.t("修图")).toBe("Retouch");
+    expect(i18n.t("返回")).toBe("Back");
+    expect(i18n.t("拖入或选择一张图片开始修图")).toBe(
+      "Drop or pick a photo to start retouching",
+    );
+    expect(i18n.t("打开修图")).toBe("Open retouch");
+    await i18n.changeLanguage("zh-CN");
+  });
+});
+
+describe("修图文案全量解析", () => {
+  /** 动态键：t(reason) / t(action.label) / t(step.label) 的取值都来自这四组常量 */
+  const dynamicKeys = [
+    ...new Set([
+      ...RETOUCH_ACTIONS.map((action) => action.label),
+      ...RETOUCH_GATE_REASONS,
+      ...RETOUCH_SUGGESTION_TEXTS,
+      "原图",
+      "编辑",
+    ]),
+  ];
+
+  it("扫到的源码覆盖组件与 lib", () => {
+    const paths = Object.keys(retouchSources);
+    expect(paths.some((path) => path.includes("/components/retouch/"))).toBe(
+      true,
+    );
+    expect(paths.some((path) => path.includes("/lib/retouch"))).toBe(true);
+  });
+
+  it('组件与 lib 里的 t("...") 字面量都能在 en-US 解析', () => {
+    const literalKeys: string[] = [];
+    const missing: string[] = [];
+    for (const [path, source] of Object.entries(retouchSources)) {
+      if (path.endsWith(".test.ts") || path.endsWith(".test.tsx")) continue;
+      for (const match of source.matchAll(LITERAL_T)) {
+        const key = match[2];
+        literalKeys.push(key);
+        if (!resolves(key)) missing.push(`${key} (${path})`);
+      }
+    }
+    // 没有扫到任何 key 说明 glob 或正则坏了，别让这条断言变成空转
+    expect(literalKeys.length).toBeGreaterThan(20);
+    expect(missing).toEqual([]);
+  });
+
+  it("动态键（动作名 / 禁用原因 / 建议文案 / 步骤文案）都能解析", () => {
+    expect(dynamicKeys.filter((key) => !resolves(key))).toEqual([]);
   });
 });

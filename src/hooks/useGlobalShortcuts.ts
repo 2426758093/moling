@@ -9,7 +9,8 @@ const VIEW_KEYS: Record<string, AppView> = {
   "2": "gallery",
   "3": "canvas",
   "4": "queue",
-  "5": "settings",
+  "5": "retouch",
+  "6": "settings",
 };
 
 /// 全局快捷键只在这里挂一次：修饰键组合在任何焦点下生效，
@@ -69,7 +70,7 @@ export function useGlobalShortcuts() {
         return;
       }
 
-      // Ctrl 1–5 切视图：带修饰键，在输入框里也生效
+      // Ctrl 1–6 切视图：带修饰键，在输入框里也生效
       const view = VIEW_KEYS[e.key];
       if (view) {
         e.preventDefault();

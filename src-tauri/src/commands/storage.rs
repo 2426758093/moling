@@ -254,6 +254,13 @@ pub async fn storage_stats(app: tauri::AppHandle) -> Result<StorageStats, String
         .map_err(|e| e.to_string())
 }
 
+/// 步骤链：从当前记录上溯到根，返回 root→current 有序列表（最多 32 跳）。
+/// 与 `list_derived` 一样声明为 `async`：同步命令会占住 IPC 线程做 SQLite 查询。
+#[tauri::command]
+pub async fn history_lineage(history_id: i64) -> Result<Vec<storage::HistoryRow>, String> {
+    storage::history_lineage(history_id).map_err(|e| e.to_string())
+}
+
 fn collect_stats(app: &tauri::AppHandle) -> AppResult<StorageStats> {
     let media_root = paths::media_root(app)?;
     let data_dir = paths::ensure_data_dir(app)?;

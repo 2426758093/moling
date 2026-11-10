@@ -151,7 +151,7 @@ fn decode_edit_image(bytes: &[u8], label: &str) -> Result<image::DynamicImage, A
             message: format!("{label}超过 {}MB 上限", MAX_EDIT_IMAGE_BYTES / 1024 / 1024),
         });
     }
-    let img = crate::image_store::decode_limited(bytes).map_err(|e| AdapterError::Other {
+    let img = crate::exif::decode_oriented(bytes).map_err(|e| AdapterError::Other {
         message: format!("{label}解码失败: {e}"),
     })?;
     if img.width() as u64 * img.height() as u64 > MAX_EDIT_PIXELS {
@@ -162,9 +162,54 @@ fn decode_edit_image(bytes: &[u8], label: &str) -> Result<image::DynamicImage, A
     Ok(img)
 }
 
+/// 重编码时沿用源格式：手机相册里的摆正图几乎都是 JPEG，若一律转 PNG，
+/// 12MP 照片会膨胀到 25~40MB，正好撞上下面的体积上限而被本地拒收。
+fn is_jpeg(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0xFF, 0xD8])
+}
+
+/// 解码校验后按需摆正像素：EXIF 方向 6/8 的原图字节仍带着方向标签、像素是躺倒的，
+/// 而画布蒙版与上送尺寸都已按摆正后的方向计算。直接上传原始字节会让服务商侧
+/// 图像与蒙版错位（常见结果为不可诊断的 400），因此这类图统一转成摆正后的像素；
+/// 输出格式跟随源图（JPEG 源仍编 JPEG，无 Alpha 可丢；其余转 PNG）以控制体积。
+/// 不带方向标签时保持原始字节不变（既不重编码也不损失画质/元数据）。
 fn normalize_edit_image(bytes: Vec<u8>) -> Result<Vec<u8>, AdapterError> {
-    decode_edit_image(&bytes, "参考图")?;
-    Ok(bytes)
+    let img = decode_edit_image(&bytes, "参考图")?;
+    if crate::exif::orientation_of(&bytes) == image::metadata::Orientation::NoTransforms {
+        return Ok(bytes);
+    }
+    use image::ImageEncoder;
+
+    let mut out = std::io::Cursor::new(Vec::new());
+    if is_jpeg(&bytes) {
+        let rgb = img.to_rgb8();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 92)
+            .write_image(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .map_err(|e| AdapterError::Other {
+                message: format!("参考图摆正后转 JPEG 失败: {e}"),
+            })?;
+    } else {
+        img.write_to(&mut out, image::ImageFormat::Png)
+            .map_err(|e| AdapterError::Other {
+                message: format!("参考图摆正后转 PNG 失败: {e}"),
+            })?;
+    }
+    let out = out.into_inner();
+    // 重编码后的体积未必更小（PNG 无损、JPEG 换编码器参数），超限同样在本地拦下
+    if out.len() > MAX_EDIT_IMAGE_BYTES {
+        return Err(AdapterError::Other {
+            message: format!(
+                "参考图摆正后超过 {}MB 上限",
+                MAX_EDIT_IMAGE_BYTES / 1024 / 1024
+            ),
+        });
+    }
+    Ok(out)
 }
 
 /// 蒙版必须是与原图同尺寸、带 Alpha 的 PNG：不满足时不发请求，避免不可诊断的 400
@@ -1050,6 +1095,48 @@ mod tests {
         assert!(err.message().contains("上限"), "{}", err.message());
         let err = normalize_edit_image(b"not an image".to_vec()).unwrap_err();
         assert!(err.message().contains("解码失败"), "{}", err.message());
+    }
+
+    /// EXIF 方向 6：上送前换成摆正后的像素，与摆正蒙版同向同尺寸；
+    /// 源为 JPEG 时仍编 JPEG（否则照片体积会撞上上送上限）；
+    /// 无方向标签的图片保持原始字节不变
+    #[test]
+    fn oriented_edit_image_is_reencoded_upright() {
+        let jpeg = crate::exif::test_fixtures::jpeg_with_orientation(8, 4, 6);
+        assert_eq!(
+            crate::exif::orientation_of(&jpeg),
+            image::metadata::Orientation::Rotate90
+        );
+        let normalized = normalize_edit_image(jpeg).expect("带方向的参考图应通过校验");
+        assert!(
+            normalized.starts_with(&[0xFF, 0xD8]),
+            "JPEG 源应重编码为 JPEG，而不是膨胀成 PNG"
+        );
+        assert!(
+            !normalized.starts_with(&[0x89, b'P', b'N', b'G']),
+            "JPEG 源不应被转成 PNG"
+        );
+        assert!(
+            normalized.len() < 2_000_000,
+            "摆正后体积应远低于 25MB 上限，实际 {} 字节",
+            normalized.len()
+        );
+        assert_eq!(
+            crate::exif::orientation_of(&normalized),
+            image::metadata::Orientation::NoTransforms,
+            "重编码后不应再带方向标签"
+        );
+        let upright = crate::exif::decode_oriented(&normalized).expect("摆正后的 JPEG 应可解码");
+        assert_eq!((upright.width(), upright.height()), (4, 8));
+        // 画布蒙版按摆正方向导出，与新像素尺寸一致
+        assert!(normalize_mask(png_of(4, 8, true), &normalized).is_ok());
+
+        let plain = png_of(6, 5, false);
+        assert_eq!(
+            normalize_edit_image(plain.clone()).unwrap(),
+            plain,
+            "无方向标签时不重编码"
+        );
     }
 
     /// A7：只在错误明确指向单数 image 字段时回退，避免误触发重复请求

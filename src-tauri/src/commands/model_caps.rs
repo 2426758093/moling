@@ -7,6 +7,8 @@ use std::collections::HashMap;
 pub struct ModelCaps {
     pub negative: bool,
     pub edit: bool,
+    /// 是否支持指令式编辑（用自然语言改图，而非蒙版局部重绘）
+    pub instruction_edit: bool,
     pub transform: bool,
     pub max_side: u32,
     pub multi_image: bool,
@@ -21,6 +23,7 @@ impl Default for ModelCaps {
         Self {
             negative: true,
             edit: true,
+            instruction_edit: true,
             transform: true,
             max_side: 1024,
             multi_image: true,
@@ -160,5 +163,25 @@ mod tests {
         assert!(caps.transform);
         assert_eq!(caps.max_side, 1024);
         assert!(caps.multi_image);
+    }
+
+    /// 旧覆盖 JSON（无 instructionEdit）反序列化后默认支持指令编辑；显式 false 可覆盖
+    #[test]
+    fn legacy_caps_json_defaults_instruction_edit_on() {
+        let legacy = r#"{"negative":true,"edit":true,"transform":true,"maxSide":1024,"multiImage":true,"gif":false,"gifMaxFrames":16}"#;
+        let caps: ModelCaps = serde_json::from_str(legacy).unwrap();
+        assert!(caps.instruction_edit, "旧配置缺字段时按默认开启");
+
+        let off: ModelCaps =
+            serde_json::from_str(r#"{"instructionEdit":false,"edit":true}"#).unwrap();
+        assert!(!off.instruction_edit, "显式 false 必须覆盖默认");
+        // 回写再读仍保持同一语义（camelCase 落库）
+        let json = serde_json::to_string(&off).unwrap();
+        assert!(json.contains("\"instructionEdit\":false"), "{json}");
+        assert!(
+            !serde_json::from_str::<ModelCaps>(&json)
+                .unwrap()
+                .instruction_edit
+        );
     }
 }

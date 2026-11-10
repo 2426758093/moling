@@ -185,7 +185,8 @@ fn load_media_image(app: &tauri::AppHandle, path: &str) -> Result<RgbaImage, Str
 
 fn decode_file(path: &str) -> Result<RgbaImage, String> {
     let bytes = std::fs::read(path).map_err(|e| format!("读取图片失败: {e}"))?;
-    Ok(image_store::decode_limited(&bytes)?.to_rgba8())
+    // 外部图片（文件 / 前端传回的原始图）像素可能躺着，必须按 EXIF 摆正后再合成
+    Ok(crate::exif::decode_oriented(&bytes)?.to_rgba8())
 }
 
 /// 媒体根约束：先分别 canonicalize，再按目录边界比较
@@ -337,7 +338,8 @@ pub async fn region_edit_batch(
     let base_bytes = base64::engine::general_purpose::STANDARD
         .decode(&base_raw)
         .map_err(|e| format!("底图 base64 解码失败: {e}"))?;
-    let base = image_store::decode_limited(&base_bytes)
+    // 前端传回的合成底图可能还带着 EXIF 方向（旧记录），与摆正后的蒙版对齐
+    let base = crate::exif::decode_oriented(&base_bytes)
         .map_err(|e| format!("底图解码失败: {e}"))?
         .to_rgba8();
     let (width, height) = base.dimensions();
@@ -372,7 +374,8 @@ pub async fn region_edit_batch(
                 continue;
             }
         };
-        let mask_rgba = match image_store::decode_limited(&mask_bytes) {
+        // 蒙版是 PNG（无 EXIF），走同一入口只是让两条路径口径一致
+        let mask_rgba = match crate::exif::decode_oriented(&mask_bytes) {
             Ok(img) => img.to_rgba8(),
             Err(e) => {
                 results.push(serde_json::json!({

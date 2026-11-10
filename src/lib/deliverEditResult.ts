@@ -15,6 +15,8 @@ export interface EditOutput {
 
 export interface EditSource {
   historyId: number;
+  /** 画布节点 id：带图层的节点 historyId 只指向底图，必须按节点定位 */
+  nodeId?: string;
   host?: EditHost;
   /** 源图像素尺寸；缺省时按“未知”处理，回退为独立节点 */
   width?: number;
@@ -46,9 +48,12 @@ export async function deliverEditResult(
 ): Promise<EditDestination> {
   if (source.host === "canvas") {
     const canvas = useCanvasStore.getState();
-    const from = canvas.nodes.find((n) => n.historyId === source.historyId);
+    const from = source.nodeId
+      ? canvas.nodes.find((n) => n.id === source.nodeId)
+      : canvas.nodes.find((n) => n.historyId === source.historyId);
     // GIF 节点不进图层栈：转静图等结果一律作为独立节点
-    const gif = canvas.gifIds?.[source.historyId] === true;
+    // 按定位到的节点查：带图层的节点 historyId 只指向底图
+    const gif = canvas.gifIds?.[from?.historyId ?? source.historyId] === true;
     if (LAYERED_WRITEBACK && from && !gif && sameSize(source, out)) {
       const name = label.trim().slice(0, 80);
       const layerId = canvas.appendLayer(from.id, {

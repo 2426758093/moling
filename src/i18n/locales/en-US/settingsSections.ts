@@ -79,6 +79,7 @@ const settingsSections = {
   "只影响界面可用项，不改变请求格式":
     "Only changes available UI actions, not the request format",
   编辑能力: "Editing",
+  指令改图: "Instruction edit",
   变换能力: "Transform",
   多参考图: "Multiple references",
   "GIF 输出": "GIF output",

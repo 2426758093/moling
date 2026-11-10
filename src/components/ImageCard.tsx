@@ -52,6 +52,7 @@ export default function ImageCard({
   const openBasicEdit = useAppStore((s) => s.openBasicEdit);
   const openBackground = useAppStore((s) => s.openBackground);
   const openAnimation = useAppStore((s) => s.openAnimation);
+  const openRetouch = useAppStore((s) => s.openRetouch);
   const expert = useAppStore((s) => s.mode) === "expert";
   // 模板服务商只有在配置了编辑模板后才有编辑端点；否则隐藏入口，
   // 避免用户点进去才收到「未配置编辑模板」
@@ -207,7 +208,23 @@ export default function ImageCard({
     }
   };
 
+  /// 修图台：底图直接用会话里的原图；动图也允许进入（台内会禁用并说明）
+  /// 返回视图取点击时的当前视图：ImageCard 在聊天里渲染，不能写死画廊。
+  const retouch = () =>
+    openRetouch({
+      dataUrl: image.dataUrl,
+      historyId: image.historyId,
+      title: prompt,
+      returnView: useAppStore.getState().view,
+    });
+
   const menuItems: MenuItem[] = [
+    {
+      id: "retouch",
+      label: t("修图"),
+      icon: <IconSparkle size={14} />,
+      onSelect: retouch,
+    },
     {
       id: "copy",
       label: copied ? t("已复制提示词") : t("复制提示词"),
@@ -329,6 +346,16 @@ export default function ImageCard({
                   className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent transition-colors hover:bg-on-accent/15"
                 >
                   <IconExpand size={13} />
+                </button>
+              </Tooltip>
+              <Tooltip label={t("修图")} side="top">
+                <button
+                  type="button"
+                  onClick={retouch}
+                  aria-label={t("修图")}
+                  className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent transition-colors hover:bg-on-accent/15"
+                >
+                  <IconSparkle size={13} />
                 </button>
               </Tooltip>
               <Tooltip

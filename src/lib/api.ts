@@ -48,6 +48,8 @@ export interface ProviderItem {
 export interface ModelCaps {
   negative: boolean;
   edit: boolean;
+  /** 模型是否支持一句话指令改图，仅驱动界面开关 */
+  instructionEdit: boolean;
   transform: boolean;
   maxSide: number;
   multiImage: boolean;
@@ -177,6 +179,62 @@ export interface HistoryItem {
   thumbUrl: string;
   /** 动图元数据（列表接口按需填充；静态图为空） */
   animation?: AnimationInfo | null;
+}
+
+/** history_lineage 返回的裸历史行（不是 HistoryItem 包装） */
+export interface HistoryRowView {
+  id: number;
+  prompt: string;
+  model: string;
+  width: number;
+  height: number;
+  filePath: string;
+  parentId: number | null;
+  op: string;
+  createdAt: string;
+}
+
+/** 修图建议：分析结果里的可执行项，驱动界面高亮 */
+export type RetouchSuggestion =
+  "exposure" | "whiteBalance" | "contrast" | "saturation" | "skin" | "clipping";
+
+/** 本地修图操作：按数组顺序逐条应用，只改色彩不改尺寸 */
+export type RetouchOp =
+  | { type: "autoEnhance"; strength: number }
+  | { type: "whiteBalance"; temp: number; tint: number }
+  | {
+      type: "toneCurve";
+      contrast: number;
+      brightness: number;
+      saturation: number;
+    }
+  | { type: "skinSmooth"; amount: number }
+  | { type: "sharpen"; amount: number }
+  | { type: "denoise"; amount: number };
+
+/** 本地分析结果：全部由 Rust 侧像素统计得出，不联网 */
+export interface RetouchAnalysis {
+  exposureEv: number;
+  wbCast: number;
+  contrast: number;
+  saturation: number;
+  sharpness: number;
+  skinRatio: number;
+  clipLow: number;
+  clipHigh: number;
+  meanLuma: number;
+  suggestions: RetouchSuggestion[];
+}
+
+/** 提交结果：historyId 是派生行 id，parentId 指向步骤链上一张 */
+export interface RetouchResult {
+  historyId: number;
+  dataUrl: string;
+  filePath: string;
+  width: number;
+  height: number;
+  op: string;
+  parentId: number | null;
 }
 
 export interface GeneratedImage {
@@ -532,8 +590,8 @@ export const api = {
     maskB64?: string | null;
     width: number;
     height: number;
-    /** edit | erase | outpaint | anim-frame（血统用；缺省按后端推断） */
-    op?: "edit" | "erase" | "outpaint" | "anim-frame";
+    /** edit | erase | outpaint | anim-frame | retouch（血统用；缺省按后端推断） */
+    op?: "edit" | "erase" | "outpaint" | "anim-frame" | "retouch";
     /** 原图记录 id */
     parentId?: number | null;
     /** "png" = 结果必须可被本地位图管线解码（单帧修复）；省略即常规编辑 */
@@ -591,6 +649,34 @@ export const api = {
       op: string;
       parentId: number | null;
     }>("apply_edit", { input }),
+  /** 本地分析：曝光/白平衡/对比/饱和/肤色占比与建议 */
+  retouchAnalyze: (imageB64: string) =>
+    invoke<RetouchAnalysis>("retouch_analyze", { imageB64 }),
+  /** 预览：只返回缩放后的 dataUrl，不写历史、不写盘 */
+  previewRetouch: (input: {
+    imageB64: string;
+    ops: RetouchOp[];
+    preview: { maxSide: number };
+  }) =>
+    invoke<{ dataUrl: string; width: number; height: number }>(
+      "apply_retouch",
+      {
+        input,
+      },
+    ),
+  /** 应用：落盘 + 写历史派生行 */
+  applyRetouch: (input: {
+    imageB64: string;
+    parentId?: number | null;
+    ops: RetouchOp[];
+  }) => invoke<RetouchResult>("apply_retouch", { input }),
+  /**
+   * 步骤链：root→current。
+   * 返回的是裸历史行（与 getHistoryItem 同形），不含 thumbUrl 包装 —— 后端
+   * `history_lineage` 直接序列化 `Vec<HistoryRow>`。
+   */
+  historyLineage: (historyId: number) =>
+    invoke<HistoryRowView[]>("history_lineage", { historyId }),
   /** 换背景：纯色 / 渐变本地合成，ai 走服务商编辑接口 */
   replaceBackground: (input: {
     imageB64: string;

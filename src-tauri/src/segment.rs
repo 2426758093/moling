@@ -438,7 +438,7 @@ pub fn decode_data_url(data_url: &str) -> Result<image::DynamicImage, String> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(raw)
         .map_err(|e| format!("图片 base64 解码失败: {e}"))?;
-    crate::image_store::decode_limited(&bytes)
+    crate::exif::decode_oriented(&bytes)
 }
 
 pub fn mask_to_png_data_url(mask: &GrayImage) -> Result<String, String> {

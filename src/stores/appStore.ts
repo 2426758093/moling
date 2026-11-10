@@ -25,7 +25,8 @@ import {
   writeTransparencyMirror,
 } from "../lib/theme";
 
-export type AppView = "chat" | "gallery" | "canvas" | "queue" | "settings";
+export type AppView =
+  "chat" | "gallery" | "retouch" | "canvas" | "queue" | "settings";
 
 export interface GenPrefs {
   ratio: string;
@@ -116,6 +117,23 @@ export interface RegionTarget {
   host?: EditHost;
 }
 
+/** 修图台：底图 + 步骤链父节点；结果按来源回写画廊 / 画布 */
+export interface RetouchTarget {
+  /** 底图（data URL），修图台首帧直接显示 */
+  dataUrl: string;
+  /** 已入库的来源记录，作为步骤链父节点 */
+  historyId?: number | null;
+  width?: number;
+  height?: number;
+  title?: string;
+  /** 画布来源节点 id：结果按画布规则回写 */
+  canvasNodeId?: string;
+  /** 从画布内嵌打开：不切换全局视图，由 CanvasView 渲染 */
+  embedded?: boolean;
+  /** 关闭修图台后回到哪个视图（缺省 gallery） */
+  returnView?: AppView;
+}
+
 interface AppState {
   view: AppView;
   theme: ThemeMode;
@@ -136,6 +154,7 @@ interface AppState {
   backgroundTarget: BackgroundTarget | null;
   animationTarget: AnimationTarget | null;
   regionTarget: RegionTarget | null;
+  retouchTarget: RetouchTarget | null;
   setView: (view: AppView) => void;
   setTheme: (theme: ThemeMode) => void;
   setGlass: (glass: GlassAppearance) => void;
@@ -163,6 +182,8 @@ interface AppState {
   closeAnimation: () => void;
   openRegionEdit: (target: RegionTarget) => void;
   closeRegionEdit: () => void;
+  openRetouch: (target: RetouchTarget) => void;
+  closeRetouch: () => void;
 }
 
 const BASE = 1024;
@@ -274,7 +295,7 @@ function readCanvasInline(): boolean {
   }
 }
 
-export const useAppStore = create<AppState>((set) => ({
+export const useAppStore = create<AppState>((set, get) => ({
   view: "chat",
   theme: "system",
   glass: "standard",
@@ -293,6 +314,7 @@ export const useAppStore = create<AppState>((set) => ({
   backgroundTarget: null,
   animationTarget: null,
   regionTarget: null,
+  retouchTarget: null,
   setView: (view) => set({ view }),
   setTheme: (theme) => {
     set({ theme });
@@ -383,7 +405,7 @@ export const useAppStore = create<AppState>((set) => ({
     set((s) => ({
       prefs: { ...s.prefs, ratio: "custom", ...snapSize(width, height) },
     })),
-  // 同一时刻只允许一个编辑实例：打开任一入口都先关掉其余六个
+  // 同一时刻只允许一个编辑实例：打开任一入口都先关掉其余七个（含修图台）
   openEditor: (editTarget) =>
     set({
       editTarget,
@@ -393,6 +415,7 @@ export const useAppStore = create<AppState>((set) => ({
       backgroundTarget: null,
       animationTarget: null,
       regionTarget: null,
+      retouchTarget: null,
     }),
   closeEditor: () => set({ editTarget: null }),
   openOutpaint: (outpaintTarget) =>
@@ -404,6 +427,7 @@ export const useAppStore = create<AppState>((set) => ({
       backgroundTarget: null,
       animationTarget: null,
       regionTarget: null,
+      retouchTarget: null,
     }),
   closeOutpaint: () => set({ outpaintTarget: null }),
   openTransform: (transformTarget) =>
@@ -415,6 +439,7 @@ export const useAppStore = create<AppState>((set) => ({
       backgroundTarget: null,
       animationTarget: null,
       regionTarget: null,
+      retouchTarget: null,
     }),
   closeTransform: () => set({ transformTarget: null }),
   openBasicEdit: (basicEditTarget) =>
@@ -426,6 +451,7 @@ export const useAppStore = create<AppState>((set) => ({
       backgroundTarget: null,
       animationTarget: null,
       regionTarget: null,
+      retouchTarget: null,
     }),
   closeBasicEdit: () => set({ basicEditTarget: null }),
   openBackground: (backgroundTarget) =>
@@ -437,6 +463,7 @@ export const useAppStore = create<AppState>((set) => ({
       basicEditTarget: null,
       animationTarget: null,
       regionTarget: null,
+      retouchTarget: null,
     }),
   closeBackground: () => set({ backgroundTarget: null }),
   openAnimation: (animationTarget) =>
@@ -448,6 +475,7 @@ export const useAppStore = create<AppState>((set) => ({
       basicEditTarget: null,
       backgroundTarget: null,
       regionTarget: null,
+      retouchTarget: null,
     }),
   closeAnimation: () => set({ animationTarget: null }),
   openRegionEdit: (regionTarget) =>
@@ -459,6 +487,36 @@ export const useAppStore = create<AppState>((set) => ({
       basicEditTarget: null,
       backgroundTarget: null,
       animationTarget: null,
+      retouchTarget: null,
     }),
   closeRegionEdit: () => set({ regionTarget: null }),
+  // 修图台与浮层编辑器同属"同一时刻只允许一个编辑实例"：
+  // 打开时关掉其余七个；内嵌模式不动全局视图，交给 CanvasView 就地渲染。
+  // 内嵌只是请求方（画布节点）的意图，最终是否内嵌由 canvasInline 决定：
+  // 用户关掉内嵌偏好时退回全屏浮层，与其它画布编辑入口保持一致。
+  openRetouch: (retouchTarget) => {
+    const embedded = !!retouchTarget.embedded && get().canvasInline;
+    set((s) => ({
+      retouchTarget: { ...retouchTarget, embedded },
+      editTarget: null,
+      outpaintTarget: null,
+      transformTarget: null,
+      basicEditTarget: null,
+      backgroundTarget: null,
+      animationTarget: null,
+      regionTarget: null,
+      view: embedded ? s.view : "retouch",
+    }));
+  },
+  // 关闭即回到来源视图：内嵌模式下 view 本来就不是 retouch，这里只清 target；
+  // 非内嵌才按 returnView 回退（内嵌 target 不该改写用户所在视图）。
+  closeRetouch: () =>
+    set((s) => {
+      const embedded = s.retouchTarget?.embedded === true;
+      const returnView = s.retouchTarget?.returnView ?? "gallery";
+      return {
+        retouchTarget: null,
+        view: embedded || s.view !== "retouch" ? s.view : returnView,
+      };
+    }),
 }));

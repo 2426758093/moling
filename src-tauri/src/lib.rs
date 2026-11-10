@@ -6,6 +6,7 @@ mod billing_journal;
 mod commands;
 mod compositor;
 mod error;
+mod exif;
 mod image_gc;
 mod image_store;
 mod key_pool;
@@ -14,6 +15,7 @@ mod media_gate;
 mod paths;
 mod redact;
 mod reference;
+mod retouch;
 mod segment;
 mod storage;
 
@@ -152,9 +154,12 @@ pub fn run() {
             commands::edit_image,
             commands::transform_image,
             commands::apply_edit,
+            commands::retouch_analyze,
+            commands::apply_retouch,
             commands::import_image,
             commands::replace_background,
             commands::list_derived,
+            commands::history_lineage,
             commands::list_history,
             commands::get_history_image,
             commands::save_history_image,

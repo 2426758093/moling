@@ -11,6 +11,7 @@ import misc from "./en-US/misc";
 import miscData from "./en-US/miscData";
 import miscLib from "./en-US/miscLib";
 import queue from "./en-US/queue";
+import retouch from "./en-US/retouch";
 import settings from "./en-US/settings";
 import settingsSections from "./en-US/settingsSections";
 import shell from "./en-US/shell";
@@ -25,6 +26,7 @@ const enUS = {
   ...gallery,
   ...queue,
   ...editors,
+  ...retouch,
   ...editorsDialogs,
   ...settingsSections,
   ...canvas,

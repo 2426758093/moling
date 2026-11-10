@@ -11,8 +11,8 @@ export const SHORTCUTS: ShortcutDef[] = [
   { keys: "Ctrl B", label: "折叠 / 展开侧栏", group: "全局" },
   { keys: "Ctrl N", label: "新建对话", group: "全局" },
   {
-    keys: "Ctrl 1–5",
-    label: "切换聊天 / 画廊 / 画布 / 队列 / 设置",
+    keys: "Ctrl 1–6",
+    label: "切换聊天 / 画廊 / 画布 / 队列 / 修图 / 设置",
     group: "全局",
   },
   { keys: "Ctrl ,", label: "打开设置", group: "全局" },

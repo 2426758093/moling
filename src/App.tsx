@@ -11,6 +11,7 @@ import Sidebar from "./components/Sidebar";
 import ChatView from "./components/ChatView";
 import GalleryView from "./components/GalleryView";
 import CanvasView from "./components/CanvasView";
+import RetouchView from "./components/retouch/RetouchView";
 import QueueView from "./components/QueueView";
 import SettingsView from "./components/SettingsView";
 import SettingsRail from "./components/SettingsRail";
@@ -173,6 +174,8 @@ function AppShell() {
     if (app.basicEditTarget?.host === "canvas") app.closeBasicEdit();
     if (app.backgroundTarget?.host === "canvas") app.closeBackground();
     if (app.animationTarget?.host === "canvas") app.closeAnimation();
+    // 修图台没有 host 字段：内嵌标记本身就说明它挂在画布上
+    if (app.retouchTarget?.embedded) app.closeRetouch();
   }, [view]);
 
   return (
@@ -251,9 +254,11 @@ function AppShell() {
                   <CanvasView />
                 ) : view === "queue" ? (
                   <QueueView />
-                ) : (
+                ) : view === "retouch" ? (
+                  <RetouchView />
+                ) : view === "settings" ? (
                   <SettingsView />
-                )}
+                ) : null}
               </motion.div>
             </AnimatePresence>
           </div>

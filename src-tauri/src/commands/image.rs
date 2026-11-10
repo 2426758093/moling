@@ -807,6 +807,7 @@ fn normalize_edit_op(op: Option<&str>, erase: bool) -> &'static str {
         Some("erase") => "erase",
         Some("outpaint") => "outpaint",
         Some("edit") => "edit",
+        Some("retouch") => "retouch",
         Some("anim-frame") => "anim-frame",
         _ if erase => "erase",
         _ => "edit",
@@ -1269,7 +1270,7 @@ pub async fn apply_edit(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(raw)
         .map_err(|e| format!("图片 base64 解码失败: {e}"))?;
-    let img = image_store::decode_limited(&bytes).map_err(|e| format!("图片解码失败: {e}"))?;
+    let img = crate::exif::decode_oriented(&bytes).map_err(|e| format!("图片解码失败: {e}"))?;
     let out = crate::basic_edit::apply_ops(img, &input.ops)?;
     let (width, height) = (out.width(), out.height());
     let mut cursor = std::io::Cursor::new(Vec::new());
@@ -1384,13 +1385,13 @@ pub async fn replace_background(
         .decode(&base_raw)
         .map_err(|e| format!("图片 base64 解码失败: {e}"))?;
     let base =
-        image_store::decode_limited(&base_bytes).map_err(|e| format!("图片解码失败: {e}"))?;
+        crate::exif::decode_oriented(&base_bytes).map_err(|e| format!("图片解码失败: {e}"))?;
     let mask_raw = image_store::strip_data_url(&input.mask_b64);
     let mask_bytes = base64::engine::general_purpose::STANDARD
         .decode(&mask_raw)
         .map_err(|e| format!("蒙版 base64 解码失败: {e}"))?;
     let mask_img =
-        image_store::decode_limited(&mask_bytes).map_err(|e| format!("蒙版解码失败: {e}"))?;
+        crate::exif::decode_oriented(&mask_bytes).map_err(|e| format!("蒙版解码失败: {e}"))?;
     // 本地合成用「白 = 替换」口径；AI 路径沿用 inpainting 的透明孔口径
     let mask = mask_img.to_luma8();
     let painted = if input.kind == "ai" {
@@ -1642,7 +1643,7 @@ pub async fn import_image(
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(image_store::strip_data_url(&data_url))
         .map_err(|e| format!("图片 base64 解码失败: {e}"))?;
-    let (width, height) = image_store::decode_limited(&bytes)
+    let (width, height) = crate::exif::decode_oriented(&bytes)
         .map_err(|e| format!("图片解码失败: {e}"))?
         .dimensions();
     let now = storage::timestamp_millis();
@@ -1727,6 +1728,15 @@ pub async fn delete_history(id: i64) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// retouch 是本地修图的落库 op：显式传入时不能被改写成 edit / erase
+    #[test]
+    fn normalize_edit_op_keeps_retouch() {
+        assert_eq!(normalize_edit_op(Some("retouch"), false), "retouch");
+        assert_eq!(normalize_edit_op(Some("retouch"), true), "retouch");
+        assert_eq!(normalize_edit_op(Some("edit"), true), "edit");
+        assert_eq!(normalize_edit_op(None, true), "erase");
+    }
 
     /// 网关可能忽略 output_format / frame_count：静图与少帧都要给提示，帧数对得上则静默
     #[test]

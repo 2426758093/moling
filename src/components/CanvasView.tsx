@@ -18,6 +18,7 @@ import BasicEditView from "./BasicEditView";
 import BackgroundView from "./BackgroundView";
 import AnimationView from "./AnimationView";
 import RegionEditView from "./RegionEditView";
+import RetouchView from "./retouch/RetouchView";
 import { IconBrush, IconChevron, IconPlus, IconTrash } from "./Icons";
 
 function NameDialog({
@@ -107,6 +108,7 @@ export default function CanvasView() {
   const backgroundTarget = useAppStore((s) => s.backgroundTarget);
   const animationTarget = useAppStore((s) => s.animationTarget);
   const regionTarget = useAppStore((s) => s.regionTarget);
+  const retouchTarget = useAppStore((s) => s.retouchTarget);
 
   const [addOpen, setAddOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
@@ -127,6 +129,8 @@ export default function CanvasView() {
     <AnimationView />
   ) : regionTarget?.host === "canvas" ? (
     <RegionEditView />
+  ) : retouchTarget?.embedded ? (
+    <RetouchView embedded />
   ) : null;
 
   useEffect(() => {

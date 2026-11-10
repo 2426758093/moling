@@ -91,6 +91,15 @@ export const COMMANDS: Command[] = [
     run: () => app().setView("queue"),
   },
   {
+    id: "nav.retouch",
+    title: "打开修图",
+    group: "导航",
+    icon: "sparkle",
+    shortcut: "Ctrl 5",
+    keywords: ["修图", "美化", "retouch", "photo"],
+    run: () => app().setView("retouch"),
+  },
+  {
     id: "nav.settings",
     title: "打开设置",
     group: "导航",

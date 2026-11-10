@@ -116,20 +116,32 @@ const MAX_DECODE_EDGE: u32 = 8192;
 const MAX_DECODE_PIXELS: u64 = 40_000_000;
 const MAX_DECODE_ALLOC: u64 = 512 * 1024 * 1024;
 
+/// 与 `decode_limited` 同一套上限：需要自定义解码流程（如 EXIF 摆正）时复用，
+/// 避免那几条路径悄悄放宽解压炸弹的防线。
+pub(crate) fn decode_limits() -> image::Limits {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DECODE_EDGE);
+    limits.max_image_height = Some(MAX_DECODE_EDGE);
+    limits.max_alloc = Some(MAX_DECODE_ALLOC);
+    limits
+}
+
+/// 解码后的像素总量复查（Limits 只管边长，40MP 上限要自己算）
+pub(crate) fn ensure_pixel_budget(width: u32, height: u32) -> Result<(), String> {
+    if u64::from(width) * u64::from(height) > MAX_DECODE_PIXELS {
+        return Err("图片像素过大（上限 4000 万），请压缩后再试".into());
+    }
+    Ok(())
+}
+
 /// 带资源上限的图片解码：缩略图、粘贴图、编辑/蒙版等所有外部输入统一走这里
 pub fn decode_limited(bytes: &[u8]) -> Result<image::DynamicImage, String> {
     let mut reader = image::ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .map_err(|e| format!("图片格式无法识别: {e}"))?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_DECODE_EDGE);
-    limits.max_image_height = Some(MAX_DECODE_EDGE);
-    limits.max_alloc = Some(MAX_DECODE_ALLOC);
-    reader.limits(limits);
+    reader.limits(decode_limits());
     let img = reader.decode().map_err(|e| format!("图片解码失败: {e}"))?;
-    if img.width() as u64 * img.height() as u64 > MAX_DECODE_PIXELS {
-        return Err("图片像素过大（上限 4000 万），请压缩后再试".into());
-    }
+    ensure_pixel_budget(img.width(), img.height())?;
     Ok(img)
 }
 
@@ -174,7 +186,8 @@ pub fn ensure_thumb(source: &Path) -> Option<PathBuf> {
 
 fn write_thumb(source: &Path, thumb: &Path) -> Result<(), String> {
     let bytes = std::fs::read(source).map_err(|e| e.to_string())?;
-    let img = decode_limited(&bytes)?;
+    // 缩略图必须与主图同方向：导入的手机照片带 EXIF 旋转，缩略图不摆正会横躺
+    let img = crate::exif::decode_oriented(&bytes)?;
     let resized = img.thumbnail(THUMB_MAX_EDGE, THUMB_MAX_EDGE);
     // JPEG 无透明通道：先把透明像素合成到白底，避免黑边/黑块
     let rgb = if resized.color().has_alpha() {

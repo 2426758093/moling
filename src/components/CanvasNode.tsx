@@ -173,7 +173,10 @@ function CanvasNodeCard({
         historyId: node.historyId,
         dataUrl,
         prompt: row?.prompt ?? "",
-        ...(row ? { width: row.width, height: row.height } : {}),
+        // 自动尺寸记录是 0×0：当「未知」处理，否则会被误判成同尺寸 / 异尺寸
+        ...(row && row.width > 0 && row.height > 0
+          ? { width: row.width, height: row.height }
+          : {}),
       });
     } catch (e) {
       toast(t("图片不可用：{{error}}", { error: String(e) }), "error");
@@ -311,6 +314,29 @@ function CanvasNodeCard({
   };
 
   const menuItems: MenuItem[] = [
+    // 修图台：底图沿用 withTarget 的合成结果（有图层栈时先合成），
+    // 保证「看到什么就修什么」；结果按 canvasNodeId 回写本节点。
+    // 动图同样置灰：修图台只会保留首帧，必须显式转静图。
+    gifBlocked({
+      id: "retouch",
+      label: t("修图"),
+      icon: <IconSparkle size={14} />,
+      onSelect: () =>
+        void withTarget((target) => {
+          useAppStore.getState().openRetouch({
+            dataUrl: target.dataUrl,
+            historyId: target.historyId,
+            // withTarget 只在尺寸已知时带宽高：未知尺寸不能当 0×0 传下去
+            ...(target.width != null && target.height != null
+              ? { width: target.width, height: target.height }
+              : {}),
+            title: target.prompt || undefined,
+            canvasNodeId: node.id,
+            embedded: true,
+            returnView: "canvas",
+          });
+        }),
+    }),
     ...editItems,
     ...(expert
       ? [

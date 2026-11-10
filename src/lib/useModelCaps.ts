@@ -8,6 +8,7 @@ import { useProviderStore } from "../stores/providerStore";
 export const DEFAULT_MODEL_CAPS: ModelCaps = {
   negative: true,
   edit: true,
+  instructionEdit: true,
   transform: true,
   maxSide: 1024,
   multiImage: true,

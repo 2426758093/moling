@@ -20,6 +20,7 @@ import {
   IconCanvas,
   IconQueue,
   IconGear,
+  IconSparkle,
   IconClose,
   IconSun,
   IconMoon,
@@ -30,6 +31,7 @@ import {
 } from "./Icons";
 
 const NAV_ITEMS = [
+  { id: "retouch", label: "修图", icon: IconSparkle },
   { id: "canvas", label: "画布", icon: IconCanvas },
   { id: "gallery", label: "画廊", icon: IconGrid },
   { id: "queue", label: "队列", icon: IconQueue },

@@ -10,6 +10,7 @@ import type { WindowPlatform } from "../../hooks/useWindowState";
 const VIEW_TITLE = {
   chat: "聊天",
   gallery: "画廊",
+  retouch: "修图",
   canvas: "画布",
   queue: "队列",
   settings: "设置",

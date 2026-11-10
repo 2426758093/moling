@@ -13,7 +13,10 @@ const mocks = vi.hoisted(() => ({
 vi.mock("../stores/canvasStore", () => ({
   useCanvasStore: {
     getState: () => ({
-      nodes: [{ id: "n1", historyId: 7, x: 0, y: 0, width: 220 }],
+      nodes: [
+        { id: "n1", historyId: 7, x: 0, y: 0, width: 220 },
+        { id: "n2", historyId: 7, x: 0, y: 0, width: 220 },
+      ],
       addHistoryNode: mocks.addHistoryNode,
       addEdge: mocks.addEdge,
       appendLayer: mocks.appendLayer,
@@ -77,6 +80,32 @@ describe("deliverEditResult", () => {
     expect(mocks.addHistoryNode).not.toHaveBeenCalled();
     expect(mocks.addEdge).not.toHaveBeenCalled();
     expect(mocks.toast).toHaveBeenCalledWith("已作为新图层加入");
+  });
+
+  it("resolves the source node by nodeId instead of historyId", async () => {
+    // 两个节点共用同一张底图（图层节点）：只有 nodeId 能定位到真正要回写的那个
+    const dest = await deliverEditResult(
+      { historyId: 7, nodeId: "n2", host: "canvas", width: 1024, height: 1024 },
+      { ...out, width: 1024, height: 1024 },
+      "美颜",
+    );
+    expect(dest).toBe("canvas");
+    expect(mocks.appendLayer).toHaveBeenCalledWith(
+      "n2",
+      expect.objectContaining({ historyId: 9, kind: "image", name: "美颜" }),
+    );
+    expect(mocks.addHistoryNode).not.toHaveBeenCalled();
+  });
+
+  it("does not fall back to historyId when the nodeId is stale", async () => {
+    const dest = await deliverEditResult(
+      { historyId: 7, nodeId: "gone", host: "canvas" },
+      out,
+      "修图",
+    );
+    expect(dest).toBe("canvas");
+    expect(mocks.addHistoryNode).toHaveBeenCalledWith(9);
+    expect(mocks.addEdge).not.toHaveBeenCalled();
   });
 
   it("creates a child node when the result size changes", async () => {

@@ -25,6 +25,7 @@ const STEPS = ["基本信息", "拉取模型", "完成"] as const;
 const CAP_FIELDS = [
   { key: "negative", label: "负向提示词" },
   { key: "edit", label: "编辑能力" },
+  { key: "instructionEdit", label: "指令改图" },
   { key: "transform", label: "变换能力" },
   { key: "multiImage", label: "多参考图" },
   { key: "gif", label: "GIF 输出" },

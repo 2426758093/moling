@@ -31,6 +31,7 @@ import {
   IconRotate,
   IconClose,
   IconImage,
+  IconSparkle,
 } from "./Icons";
 
 const PAGE_SIZE = 90;
@@ -487,6 +488,25 @@ export default function GalleryView() {
     toast(existed ? t("该作品已在画布中") : t("已加入画布"));
   };
 
+  /// 修图：列表里只有缩略图，必须按 id 读原图再进台（同一张图可继续叠加步骤）
+  const retouchOne = async (item: HistoryItem) => {
+    try {
+      const img = await api.getHistoryImage(item.history.id);
+      const width = Number(item.history.width);
+      const height = Number(item.history.height);
+      useAppStore.getState().openRetouch({
+        dataUrl: img.dataUrl,
+        historyId: item.history.id,
+        // 自动尺寸记录是 0×0：当“未知”处理，不参与画布同尺寸判定
+        ...(width > 0 && height > 0 ? { width, height } : {}),
+        title: item.history.prompt,
+        returnView: "gallery",
+      });
+    } catch (e) {
+      toast(t("图片不可用：{{error}}", { error: String(e) }), "error");
+    }
+  };
+
   return (
     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
       <PageHeader
@@ -681,6 +701,16 @@ export default function GalleryView() {
                         )}
                         <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center p-2 opacity-0 transition-opacity duration-200 group-focus-within:opacity-100 group-hover:opacity-100">
                           <div className="glass-media pointer-events-auto flex items-center gap-0.5 rounded-pill p-0.5">
+                            <Tooltip label={t("修图")} side="top">
+                              <button
+                                type="button"
+                                onClick={() => void retouchOne(item)}
+                                aria-label={t("修图")}
+                                className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent hover:bg-on-accent/15"
+                              >
+                                <IconSparkle size={13} />
+                              </button>
+                            </Tooltip>
                             <Tooltip label={t("复用参数")} side="top">
                               <button
                                 type="button"
