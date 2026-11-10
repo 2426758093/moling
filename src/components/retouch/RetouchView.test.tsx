@@ -1271,6 +1271,82 @@ describe("RetouchStudio 多区域面板", () => {
     );
     expect(screen.getByText("区域 1")).toBeTruthy();
   });
+
+  it("部分取消：只留未成功的草稿，合成步骤不清空，再次提交只带剩下的区域", async () => {
+    vi.mocked(api.regionEditBatch).mockImplementationOnce(async (input) => ({
+      groupId: "g1",
+      results: [
+        {
+          id: input.regions[0].id,
+          ok: true,
+          historyId: 9,
+          dataUrl: "data:image/png;base64,REGION",
+          filePath: "/r.png",
+        },
+        { id: input.regions[1].id, ok: false, error: "quota" },
+      ],
+      cancelled: true,
+      anySucceeded: true,
+      historyId: 9,
+      dataUrl: "data:image/png;base64,REGION",
+    }));
+
+    await openRegionPanel();
+    addOneRegion("加一束花");
+    await screen.findByText("区域 1");
+    addOneRegion("加一棵树");
+    await screen.findByText("区域 2");
+
+    fireEvent.click(screen.getByRole("button", { name: "提交 2 个区域" }));
+    await screen.findByText(/按区域分别计费/);
+    fireEvent.click(screen.getByRole("button", { name: "开始重绘" }));
+
+    // 合成整图追加成第二步：草稿不能被换步清空，只剔除这次真跑成功的那块
+    await screen.findByRole("button", { name: "2. 多区域" });
+    expect(api.regionEditBatch).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("请先涂抹区域并填写提示词")).toBeNull();
+    await screen.findByText("失败");
+    expect(screen.queryByText("加一束花")).toBeNull();
+    expect(screen.queryByText("区域 2")).toBeNull();
+    expect(screen.getByText("区域 1")).toBeTruthy();
+    expect(screen.getByText("加一棵树")).toBeTruthy();
+
+    // 再提交：底图是上次合成的整图（historyId 9），只带剩下的那块
+    vi.mocked(api.regionEditBatch).mockImplementationOnce(async (input) => ({
+      groupId: "g2",
+      results: [
+        {
+          id: input.regions[0].id,
+          ok: true,
+          historyId: 10,
+          dataUrl: "data:image/png;base64,REGION2",
+          filePath: "/r2.png",
+        },
+      ],
+      cancelled: false,
+      anySucceeded: true,
+      historyId: 10,
+      dataUrl: "data:image/png;base64,REGION2",
+    }));
+    fireEvent.click(screen.getByRole("button", { name: "提交 1 个区域" }));
+    await screen.findByText(/按区域分别计费/);
+    fireEvent.click(screen.getByRole("button", { name: "开始重绘" }));
+
+    await screen.findByRole("button", { name: "3. 多区域" });
+    const [, [secondInput]] = vi.mocked(api.regionEditBatch).mock.calls;
+    expect(secondInput.baseHistoryId).toBe(9);
+    expect(secondInput.baseB64).toBe("data:image/png;base64,REGION");
+    expect(secondInput.regions).toEqual([
+      {
+        id: expect.any(String),
+        prompt: "加一棵树",
+        maskB64: "data:image/png;base64,MASK",
+        feather: 24,
+      },
+    ]);
+    // 全部成功才清空列表
+    await screen.findByText("请先涂抹区域并填写提示词");
+  });
 });
 
 describe("RetouchStudio 计费口径（纯色换背景）", () => {
