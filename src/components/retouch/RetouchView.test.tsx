@@ -128,6 +128,7 @@ class FakeImage {
 import RetouchView from "./RetouchView";
 import { listen } from "@tauri-apps/api/event";
 import { GUARD_SUFFIX } from "../../lib/retouchPrompts";
+import { resetPendingBilling } from "../../lib/retouchBilling";
 
 const ANALYSIS = {
   exposureEv: 0.2,
@@ -177,6 +178,8 @@ function unconfirmed(requestId: string | null = "req_1") {
 
 beforeEach(() => {
   vi.stubGlobal("Image", FakeImage);
+  // 挂起标记是模块级单例（要跨「关掉修图台再打开」存活），用例之间必须清零
+  resetPendingBilling();
   maskHandles.length = 0;
   deliverSpy.mockReset();
   deliverSpy.mockResolvedValue("canvas");
@@ -768,6 +771,22 @@ describe("RetouchStudio 动作 Chip 按模式过滤", () => {
     act(() => useAppStore.setState({ mode: "expert" }));
     expect(chipOrder()).toEqual([...SIMPLE_CHIPS, ...EXPERT_CHIPS]);
   });
+
+  it("云端 Chip 带计费信号：高清 title 是「云端计费」，本地动作没有", () => {
+    renderStudio();
+
+    // 高清 与两个免费动作并排时不看图标分不出会扣费，title 是最轻的提示位
+    expect(
+      screen.getByRole("button", { name: "高清" }).getAttribute("title"),
+    ).toBe("云端计费");
+    expect(
+      screen.getByRole("button", { name: "一键优化" }).getAttribute("title"),
+    ).toBeNull();
+    // 纯色 / 渐变是本地合成：与 cloud:false 一致，不该有计费信号
+    expect(
+      screen.getByRole("button", { name: "换背景" }).getAttribute("title"),
+    ).toBeNull();
+  });
 });
 
 describe("RetouchStudio 换背景", () => {
@@ -1100,6 +1119,87 @@ describe("RetouchStudio 未确认计费保护", () => {
     );
     expect(api.recoverImageRequestByClient).not.toHaveBeenCalledWith("req_1");
   });
+
+  it("关掉修图台再打开仍要拦截：未确认标记跨卸载存活", async () => {
+    vi.mocked(api.transformImage).mockRejectedValueOnce(
+      unconfirmed("req_keep"),
+    );
+    const first = renderStudio();
+
+    fireEvent.click(screen.getByRole("button", { name: "高清" }));
+    fireEvent.click(await screen.findByRole("button", { name: "开始放大" }));
+    await screen.findByText("请求 ID：req_keep");
+
+    // 关掉修图台：组件销毁，但那次请求的对账结论并没有出来
+    first.unmount();
+
+    renderStudio();
+    // 重新进来没有任何提示条，拦截依据只能是跨会话存活的挂起标记
+    expect(screen.queryByText("请求 ID：req_keep")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "高清" }));
+    fireEvent.click(await screen.findByRole("button", { name: "开始放大" }));
+
+    await screen.findByText("确认重新生成？");
+    expect(api.transformImage).toHaveBeenCalledTimes(1);
+  });
+
+  it("多区域部分成功 + 某区未确认：合成照常追加，但再次云端提交仍要确认", async () => {
+    vi.mocked(api.regionEditBatch).mockImplementationOnce(async (input) => ({
+      groupId: "g1",
+      results: [
+        {
+          id: input.regions[0].id,
+          ok: true,
+          historyId: 10,
+          dataUrl: "data:image/png;base64,REGION",
+          filePath: "/r.png",
+        },
+        {
+          id: input.regions[1].id,
+          ok: false,
+          error: JSON.stringify({
+            type: "unconfirmed",
+            message: "gateway timeout",
+            request_id: "req_region",
+          }),
+        },
+      ],
+      cancelled: false,
+      anySucceeded: true,
+      historyId: 11,
+      dataUrl: "data:image/png;base64,REGION",
+    }));
+
+    act(() => useAppStore.setState({ mode: "expert" }));
+    renderStudio();
+    fireEvent.click(screen.getByRole("button", { name: "多区域" }));
+    await waitFor(() => expect(maskHandles.length).toBeGreaterThan(0));
+
+    for (const prompt of ["加一束花", "加一棵树"]) {
+      maskHandles[maskHandles.length - 1].strokes = true;
+      fireEvent.change(screen.getByLabelText("区域提示词"), {
+        target: { value: prompt },
+      });
+      fireEvent.click(screen.getByRole("button", { name: "添加区域" }));
+    }
+    await screen.findByText("区域 2");
+
+    fireEvent.click(screen.getByRole("button", { name: "提交 2 个区域" }));
+    await screen.findByText(/按区域分别计费/);
+    fireEvent.click(screen.getByRole("button", { name: "开始重绘" }));
+
+    // 已成功的图照常追加成一步
+    await screen.findByRole("button", { name: "2. 多区域" });
+    // 未确认的失败要讲计费口径，不能把 AdapterError 的 JSON 甩给用户
+    await screen.findByText("结果可能已计费，请在请求记录中确认");
+    expect(screen.queryByText(/\{"type"/)).toBeNull();
+
+    // 关键回归：这一区可能已扣费，换任何云端动作都必须先确认
+    fireEvent.click(screen.getByRole("button", { name: "高清" }));
+    fireEvent.click(await screen.findByRole("button", { name: "开始放大" }));
+    await screen.findByText("确认重新生成？");
+    expect(api.transformImage).not.toHaveBeenCalled();
+  });
 });
 
 describe("RetouchStudio 扩图面板", () => {
@@ -1387,6 +1487,57 @@ describe("RetouchStudio 多区域面板", () => {
     ]);
     // 全部成功才清空列表
     await screen.findByText("请先涂抹区域并填写提示词");
+  });
+
+  it("用户取消不算失败：不弹错误条与错误 toast，草稿留着", async () => {
+    vi.mocked(api.regionEditBatch).mockResolvedValueOnce({
+      groupId: "g",
+      results: [],
+      cancelled: true,
+      anySucceeded: false,
+      historyId: null,
+      dataUrl: null,
+    });
+
+    await openRegionPanel();
+    addOneRegion("加一束花");
+    await screen.findByText("区域 1");
+
+    fireEvent.click(screen.getByRole("button", { name: "提交 1 个区域" }));
+    await screen.findByText(/按区域分别计费/);
+    fireEvent.click(screen.getByRole("button", { name: "开始重绘" }));
+
+    // run 里已经给过「已取消…」的 info 提示，主动取消不该再多一条红色错误
+    await screen.findByText("已取消，已保留 0 个区域的结果");
+    expect(screen.queryByRole("alert")).toBeNull();
+    // 草稿保留：补涂后可以直接重提
+    expect(screen.getByText("区域 1")).toBeTruthy();
+  });
+
+  it("当前步只有缩略图时不允许固化区域蒙版：提示稍候且不生成草稿", async () => {
+    vi.mocked(api.historyLineage).mockResolvedValue([
+      lineageRow(4, "paste", null),
+      lineageRow(5, "auto-enhance", 4),
+    ]);
+    // 当前行读不到全图：步骤只剩缩略图，蒙版画布就是缩略图尺寸
+    vi.mocked(api.getHistoryImage).mockImplementation(async (id: number) => {
+      if (id === 5) throw new Error("file missing");
+      return {
+        historyId: id,
+        dataUrl: `data:image/png;base64,IMG${id}`,
+        filePath: `C:/media/${id}.png`,
+      };
+    });
+
+    act(() => useAppStore.setState({ mode: "expert" }));
+    renderStudio();
+    await screen.findByRole("button", { name: "2. 一键优化" });
+    fireEvent.click(screen.getByRole("button", { name: "多区域" }));
+    await waitFor(() => expect(maskHandles.length).toBeGreaterThan(0));
+
+    addOneRegion("加一束花");
+    await screen.findByText("图片加载中，请稍候");
+    expect(screen.queryByText("区域 1")).toBeNull();
   });
 });
 

@@ -25,6 +25,8 @@ const retouch = {
   改图: "Edit",
   开始改图: "Start editing",
   应用: "Apply",
+  // 云动作 Chip 的计费提示（title）
+  云端计费: "Cloud · billed",
 
   // 面板
   "自动校正曝光、白平衡与对比，只改色彩不动构图":
@@ -83,6 +85,7 @@ const retouch = {
   描述该区域要变成什么: "Describe what this area should become",
   确认重绘: "Inpaint",
   请先涂抹要重绘的区域: "Paint the area to redraw first",
+  "图片加载中，请稍候": "Still loading the image, please wait",
 
   // 多区域面板（区域列表 / 计费确认等文案复用 canvasLayers 的既有译文）
   "涂抹多个区域并分别填写要求，逐区重绘后本地合成":

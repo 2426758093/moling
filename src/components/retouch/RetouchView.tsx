@@ -50,6 +50,12 @@ import {
   type CropState,
   type OutpaintRatio,
 } from "../../lib/retouchGeometry";
+import {
+  forgetPendingBilling,
+  pendingBilling,
+  rememberPendingBilling,
+  type PendingBilling,
+} from "../../lib/retouchBilling";
 import { padImageToSize } from "../../lib/retouchCanvas";
 import type { MaskCanvasHandle } from "../MaskCanvas";
 import { Button } from "../ui/Button";
@@ -101,6 +107,23 @@ let regionJobSeq = 0;
 function newRegionJobId(): string {
   regionJobSeq += 1;
   return `region-job-${Date.now()}-${regionJobSeq}`;
+}
+
+/**
+ * 用户主动取消多区域：不是故障，不能挂红色错误条与错误 toast。
+ * 不导出：只是 commit 与 run 之间的内部信号。
+ */
+class RetouchCancelled extends Error {
+  constructor() {
+    super("cancelled");
+    this.name = "RetouchCancelled";
+  }
+}
+
+/// 未确认结果的 request_id 口径只写在这里：只有 unconfirmed 类型带可对账的 ID，
+/// upstream / body_interrupted 都没有。commit 的 catch 与多区域部分失败共用。
+function requestIdOf(parsed: AdapterError): string | null {
+  return parsed.type === "unconfirmed" ? (parsed.request_id ?? null) : null;
 }
 
 /** 提交动作的统一返回形状：本地 RetouchResult 与云端 editImage 都能落成一步 */
@@ -326,10 +349,20 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
    * 拦截条件必须挂在这里而不是 lastError 上 —— 提示条只是 UI，用户点「关闭提示」
    * 只是不想再看这段文案，那次请求的对账结论并没有出来，计费风险仍然存在。
    * 若跟着提示条一起清掉，关一次提示就能绕过二次扣费确认。
+   *
+   * 初始值取自模块级单例：关掉修图台（或画布内嵌实例）再打开会重建组件，
+   * 组件 state 归零就等于把逃逸口从「点掉提示条」搬到「重新打开」，同样是绕过。
+   * 卸载不清标记 —— 对账结论没出来之前，风险不随视图消失。
    */
-  const [unconfirmed, setUnconfirmed] = useState<{
-    requestId: string | null;
-  } | null>(null);
+  const [unconfirmed, setUnconfirmedState] = useState<PendingBilling | null>(
+    () => pendingBilling(),
+  );
+  /** 本地 helper：所有写入都要同时落到模块单例与组件 state，别在两处各写一份 */
+  const setUnconfirmed = (value: PendingBilling | null) => {
+    if (value) rememberPendingBilling(value);
+    else forgetPendingBilling();
+    setUnconfirmedState(value);
+  };
   const [recovering, setRecovering] = useState(false);
   const [confirmRetry, setConfirmRetry] = useState(false);
   /** 当前步的实测尺寸：扩图面板要拿它算目标画布 */
@@ -734,6 +767,9 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
       if (billable) setUnconfirmed(null);
       return true;
     } catch (error) {
+      // 用户主动取消不是失败：run 里已经给过「已取消…」的 info 提示，
+      // 再挂一条红色错误条等于把主动操作说成故障。草稿保留由调用方的 then 负责。
+      if (error instanceof RetouchCancelled) return false;
       const parsed = parseAdapterError(
         error instanceof Error ? error.message : String(error),
       );
@@ -743,11 +779,9 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
       // 把还能对账的请求顶成 null。
       // 其他错误不改它 —— 一次网络抖动不该顶掉还没对账的计费风险。
       if (isUnconfirmedError(parsed)) {
-        const nextId =
-          parsed.type === "unconfirmed" ? (parsed.request_id ?? null) : null;
-        setUnconfirmed((prev) => ({
-          requestId: nextId ?? prev?.requestId ?? null,
-        }));
+        setUnconfirmed({
+          requestId: requestIdOf(parsed) ?? unconfirmed?.requestId ?? null,
+        });
       }
       setLastError(parsed);
       toast(describeError(error), "error");
@@ -1159,6 +1193,13 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
 
   /// 多区域：把当前涂抹 + 提示词收成一块草稿（蒙版导出后立刻清画布，接着涂下一块）
   const addRegion = (prompt: string): boolean => {
+    // 还原出来的步骤先只有缩略图，全图还在路上：此时舞台与蒙版画布都是缩略图
+    // 尺寸，蒙版却在「添加」时就固化了，而提交时 baseB64 是全图 —— 后端按错误
+    // 比例合成还照常计费。等全图就绪再收这块蒙版。
+    if (!cur.dataUrl) {
+      toast(t("图片加载中，请稍候"), "error");
+      return false;
+    }
     const trimmed = prompt.trim();
     const mask = maskRef.current;
     if (!trimmed || !mask?.hasStrokes()) {
@@ -1210,6 +1251,13 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
     const job = newRegionJobId();
     /** 本次真正跑成功的区域：只有它们能从草稿列表里移除 */
     const succeeded = new Set<string>();
+    /**
+     * 这批里第一个「可能已计费」的单区失败。Rust 把每区的 adapter_error_json
+     * 原样放进 results[].error，只要有一区成功，整批仍走 commit 的成功路径，
+     * 这些字符串就只会被当 toast 文案 —— 不在这里捞出来挂标记，用户能立刻
+     * 重提那一区，再扣一次。
+     */
+    let billingFailure: AdapterError | null = null;
 
     void commit("region", "多区域", async (src) => {
       // 底图必须已入库：后端的 baseHistoryId 是这次合成的父节点
@@ -1273,6 +1321,11 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
           .filter((item) => !item.ok)
           .map((item) => item.error)
           .filter((error): error is string => !!error);
+        // 失败项是 AdapterError 的 JSON：逐个解析，取第一个未确认的当计费风险
+        billingFailure =
+          failures
+            .map((failure) => parseAdapterError(failure))
+            .find((parsed) => isUnconfirmedError(parsed)) ?? null;
         if (out.cancelled) {
           toast(
             t("已取消，已保留 {{done}} 个区域的结果", {
@@ -1280,8 +1333,16 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
             }),
             "info",
           );
+        } else if (billingFailure) {
+          // 不能把 AdapterError 的 JSON 甩给用户：未确认只讲计费口径
+          toast(t("结果可能已计费，请在请求记录中确认"), "error");
         } else if (failures.length > 0) {
           toast(t("部分区域失败：{{error}}", { error: failures[0] }), "error");
+        }
+        // 用户主动取消、且一个都没成：不是失败，别用错误条把取消说成故障
+        // （run 里已经给过「已取消…」的 info 提示）。
+        if (out.cancelled && !out.anySucceeded) {
+          throw new RetouchCancelled();
         }
         // 一个都没成或没有合成图：当作失败，交给 commit 的错误条
         if (!out.anySucceeded || out.historyId == null || out.dataUrl == null) {
@@ -1310,6 +1371,11 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
       // 失败 / 取消要留草稿；成功也只清「这次真跑成功的」——蒙版在添加时就固化了，
       // 失败的草稿被清掉就再也画不回来，用户得从零点一次。
       if (!ok) return;
+      // 顺序依赖：commit 的成功路径会按 billable 清挂起标记（多区域一定可能扣费），
+      // 标记只能等它清完再补写，提前写会被 commit 自己抹掉。
+      if (billingFailure) {
+        setUnconfirmed({ requestId: requestIdOf(billingFailure) });
+      }
       setRegionDrafts((prev) => prev.filter((item) => !succeeded.has(item.id)));
       setRegionStatus(
         (prev) =>

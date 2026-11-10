@@ -176,6 +176,14 @@ export const IconPalette = (p: IconProps) => (
   </svg>
 );
 
+/// 云端计费标记：只做芯片大小的角标（11px），线条要少才不会糊成一团
+export const IconCloud = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M7 18h10.5a3.5 3.5 0 0 0 .4-6.98A5.5 5.5 0 0 0 6.6 9.7 4.15 4.15 0 0 0 7 18Z" />
+    <path d="M9 18h6" />
+  </svg>
+);
+
 export const IconQuote = (p: IconProps) => (
   <svg {...base(p)}>
     <path d="M10 8c-3 0-5 2-5 5v3h5v-5H7.5C7.5 9.6 8.6 8.5 10 8.5ZM19 8c-3 0-5 2-5 5v3h5v-5h-2.5c0-1.4 1.1-2.5 2.5-2.5Z" />

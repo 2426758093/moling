@@ -3,6 +3,7 @@ import { useTranslation } from "react-i18next";
 import {
   IconBrush,
   IconChat,
+  IconCloud,
   IconCrop,
   IconEraser,
   IconExpand,
@@ -133,7 +134,10 @@ export default function ActionRail({
               disabled={!!reason || (!!busy && !loading)}
               aria-pressed={active}
               aria-busy={loading || undefined}
-              title={reason ? t(reason) : undefined}
+              // title 只在没有禁用原因时让位给计费提示：原因更要紧
+              title={
+                reason ? t(reason) : action.cloud ? t("云端计费") : undefined
+              }
               onClick={() => onAction(action.id)}
               className={cn(
                 "pressable inline-flex h-7 items-center gap-1.5 rounded-pill border px-3 text-subhead select-none",
@@ -145,6 +149,10 @@ export default function ActionRail({
             >
               {loading ? <BusyDots /> : ICONS[action.id]}
               {t(action.label)}
+              {/* 云图标只做视觉信号：不加 sr-only / aria-label，可访问名必须保持动作名 */}
+              {action.cloud && (
+                <IconCloud size={11} className="text-tertiary" />
+              )}
             </button>
           );
         })}
