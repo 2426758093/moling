@@ -2,6 +2,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { motion } from "framer-motion";
 import SafeImg from "./SafeImg";
+import { api, AnimationInfo } from "../lib/api";
+import { useAppStore } from "../stores/appStore";
+import { isGifDataUrl } from "../lib/image";
 import { extFromDataUrl, saveDataUrl } from "../lib/save";
 import { DUR, EASE } from "../lib/motion";
 import { toast } from "../lib/notify";
@@ -11,6 +14,7 @@ import {
   IconChevron,
   IconCopy,
   IconDownload,
+  IconImage,
 } from "./Icons";
 
 export interface ViewerImage {
@@ -18,6 +22,8 @@ export interface ViewerImage {
   title?: string;
   /// 生成这张图用的提示词（有则可复制）
   prompt?: string;
+  /// 画廊记录 id：动图元数据按需从这里取，静态图留空
+  historyId?: number;
 }
 
 /// 浮在图片之上的工具栏：clear 玻璃 + 压暗层，保证任何画面上都读得清。
@@ -41,6 +47,8 @@ export default function ImageViewer({
   const [fullscreen, setFullscreen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const dragRef = useRef<{ x: number; y: number } | null>(null);
+  // 动图元数据按 historyId 缓存：翻页来回切换不重复读盘
+  const [animInfos, setAnimInfos] = useState<Record<number, AnimationInfo>>({});
 
   const reset = useCallback(() => {
     setScale(1);
@@ -74,7 +82,28 @@ export default function ImageViewer({
       document.removeEventListener("fullscreenchange", onFullscreenChange);
   }, []);
 
+  // 只给动图查元数据：静态图不产生额外 IO，切回 GIF 时走缓存
+  useEffect(() => {
+    const image = images[index];
+    if (!image || !image.historyId || !isGifDataUrl(image.dataUrl)) return;
+    const id = image.historyId;
+    if (animInfos[id]) return;
+    let cancelled = false;
+    void api
+      .getAnimationInfo(id)
+      .then((info) => {
+        if (!cancelled) setAnimInfos((m) => ({ ...m, [id]: info }));
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [index, images, animInfos]);
+
   const current = images[index];
+  const animation = current?.historyId
+    ? (animInfos[current.historyId] ?? null)
+    : null;
   if (!current) return null;
 
   return (
@@ -97,8 +126,32 @@ export default function ImageViewer({
         <span className="text-subhead tabular-nums text-on-accent/80">
           {index + 1} / {images.length}
           {scale !== 1 && ` · ${Math.round(scale * 100)}%`}
+          {animation &&
+            ` · ${t("动图 {{frames}} 帧 · {{fps}} fps · {{kb}} KB", {
+              frames: animation.frames,
+              fps:
+                animation.totalMs > 0
+                  ? (animation.frames / (animation.totalMs / 1000)).toFixed(1)
+                  : "—",
+              kb: Math.max(1, Math.round(animation.bytes / 1024)),
+            })}`}
         </span>
         <div className="flex items-center gap-1">
+          {animation && current.historyId != null && (
+            <button
+              type="button"
+              onClick={() => {
+                const historyId = current.historyId;
+                if (historyId == null) return;
+                onClose();
+                useAppStore.getState().openAnimation({ historyId });
+              }}
+              aria-label={t("打开动图编辑器")}
+              className={BAR_BTN}
+            >
+              <IconImage size={15} />
+            </button>
+          )}
           {current.prompt && (
             <button
               type="button"

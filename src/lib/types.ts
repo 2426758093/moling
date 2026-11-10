@@ -14,11 +14,21 @@ export {
   RATIO_OPTIONS,
   STYLE_PRESETS,
   QUALITY_OPTIONS,
+  COMPLEXITY_OPTIONS,
+  GIF_FRAME_MIN,
+  GIF_FRAME_MAX,
+  GIF_FRAME_DEFAULT,
+  GIF_FRAME_MS_MIN,
+  GIF_FRAME_MS_MAX,
+  GIF_FRAME_MS_DEFAULT,
   isAutoSize,
   sizeLabel,
   qualityLabel,
+  qualityOptionsFor,
+  complexityLabel,
+  animationSummary,
 } from "./presets";
-export type { ImageQuality } from "./presets";
+export type { ImageQuality, OutputFormat, GifComplexity } from "./presets";
 
 /// 参考图角色：提示词级近似（主流接口没有逐图权重参数）。
 /// previous 是对话上下文专用（上一轮画面），不出现在用户可选的 REFERENCE_ROLES 里。

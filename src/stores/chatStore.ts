@@ -388,11 +388,19 @@ export const useChatStore = create<ChatState>((set, get) => {
           style: prefs.style,
           count,
           quality: prefs.quality === "auto" ? null : prefs.quality,
+          // GIF 参数只在动图模式下透传；静态请求形状与旧版完全一致
+          outputFormat: prefs.outputFormat === "gif" ? "gif" : null,
+          frameCount: prefs.outputFormat === "gif" ? prefs.frameCount : null,
+          frameDurationMs:
+            prefs.outputFormat === "gif" ? prefs.frameDurationMs : null,
+          complexity: prefs.outputFormat === "gif" ? prefs.complexity : null,
           images: inputImages,
           references: inputRefs.length > 0 ? inputRefs : undefined,
           jobId,
         });
         cancelled = Boolean(resp.cancelled);
+        // 动图请求被服务商降级成静图 / 帧数不符：产物照常保留，但要明确告知
+        for (const warning of resp.warnings ?? []) toast(warning, "error");
         // 已停止等待且用户又发了新消息：旧流程不能再写消息列表，
         // 但后端已经落库的图片仍需告知用户去画廊取
         if (!isCurrent()) {
@@ -678,6 +686,16 @@ export const useChatStore = create<ChatState>((set, get) => {
       const model = provider?.provider.defaultModel;
       if (!provider || defaultProviderId == null || !model) {
         toast(i18n.t("请先在「设置」中配置绘图服务商与模型"), "error");
+        return false;
+      }
+      if (
+        useAppStore.getState().prefs.outputFormat === "gif" &&
+        !currentModelCaps().gif
+      ) {
+        toast(
+          i18n.t("当前模型未开通 GIF 输出，请切换模型或改回静态图"),
+          "error",
+        );
         return false;
       }
 

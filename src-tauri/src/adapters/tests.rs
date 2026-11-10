@@ -35,6 +35,7 @@ fn mock_req(prompt: &str) -> GenerateRequest {
         quality: None,
         images: vec![],
         references: vec![],
+        ..Default::default()
     }
 }
 
@@ -270,6 +271,7 @@ fn mock_edit_receives_background_prompt() {
         mask_b64: Some("BBBB".into()),
         width: 64,
         height: 64,
+        ..Default::default()
     };
     let out = block_on(adapter.edit(&mock_config(), &req)).unwrap();
     assert!(out.starts_with("data:image/svg+xml;base64,"));

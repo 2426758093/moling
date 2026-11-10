@@ -68,7 +68,9 @@ where
         let Some(url) = encode(&thumb.to_string_lossy()).or_else(|| encode(&path)) else {
             continue;
         };
-        out.push(serde_json::json!({ "historyId": id, "thumbUrl": url }));
+        // gif 标记让画布节点能挂「动图」角标并置灰静图编辑入口
+        let gif = path.to_ascii_lowercase().ends_with(".gif");
+        out.push(serde_json::json!({ "historyId": id, "thumbUrl": url, "gif": gif }));
     }
     out
 }

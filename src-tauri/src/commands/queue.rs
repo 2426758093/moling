@@ -233,6 +233,11 @@ pub struct JobExtras {
     pub references: Vec<ReferenceSpec>,
     /// 质量档位快照；None = auto（老任务没有该字段，按默认处理）
     pub quality: Option<String>,
+    /// GIF 参数快照：重试必须复现同一组参数，不能读当时的界面状态
+    pub output_format: Option<String>,
+    pub frame_count: Option<u32>,
+    pub frame_duration_ms: Option<u32>,
+    pub complexity: Option<String>,
     /// 429 退避重试次数（持久化，避免重新入队后无限重试）
     #[serde(default)]
     pub quota_retries: u32,
@@ -394,6 +399,10 @@ async fn run_job(app: &tauri::AppHandle, job: &JobRow) -> Result<(), String> {
             Some(extras.references.clone())
         },
         job_id: None,
+        output_format: extras.output_format.clone(),
+        frame_count: extras.frame_count,
+        frame_duration_ms: extras.frame_duration_ms,
+        complexity: extras.complexity.clone(),
     };
 
     let progress_app = app.clone();
@@ -425,9 +434,10 @@ async fn run_job(app: &tauri::AppHandle, job: &JobRow) -> Result<(), String> {
             } else {
                 "done"
             };
-            // 部分图片落盘失败不影响任务成功，但要把原因留在任务上
-            let warning = (!outcome.failed.is_empty()).then(|| {
-                format!(
+            // 部分图片落盘失败 / 动图被服务商降级都不影响任务成功，但要留在任务上
+            let mut notes = outcome.warnings.clone();
+            if !outcome.failed.is_empty() {
+                notes.push(format!(
                     "{} 张图片保存失败：{}",
                     outcome.failed.len(),
                     outcome
@@ -436,8 +446,9 @@ async fn run_job(app: &tauri::AppHandle, job: &JobRow) -> Result<(), String> {
                         .map(|f| format!("第 {} 张 {}", f.index, f.reason))
                         .collect::<Vec<_>>()
                         .join("；")
-                )
-            });
+                ));
+            }
+            let warning = (!notes.is_empty()).then(|| notes.join("；"));
             finish_or_force(job.id, status, &images_json, warning.as_deref())?;
         }
         Err(e) => {
@@ -529,6 +540,14 @@ pub struct EnqueueInput {
     pub reference_paths: Vec<String>,
     #[serde(default)]
     pub references: Vec<ReferenceSpec>,
+    #[serde(default)]
+    pub output_format: Option<String>,
+    #[serde(default)]
+    pub frame_count: Option<u32>,
+    #[serde(default)]
+    pub frame_duration_ms: Option<u32>,
+    #[serde(default)]
+    pub complexity: Option<String>,
 }
 
 #[tauri::command]
@@ -554,6 +573,14 @@ pub async fn enqueue_job(
     }
     // 入队即固化参数快照，之后改默认参数不影响已排队任务
     let reference_paths = normalize_reference_paths(input.reference_paths);
+    let max_frames = super::image::gif_max_frames(input.provider_id, input.model.trim());
+    let (output_format, frame_count, frame_duration_ms, complexity) = super::image::normalize_gif(
+        input.output_format.as_deref(),
+        input.frame_count,
+        input.frame_duration_ms,
+        input.complexity.as_deref(),
+        max_frames,
+    );
     let extras = JobExtras {
         references: input
             .references
@@ -562,6 +589,10 @@ pub async fn enqueue_job(
             .collect(),
         reference_paths,
         quality: normalize_quality(input.quality.as_deref()),
+        output_format,
+        frame_count,
+        frame_duration_ms,
+        complexity,
         quota_retries: 0,
     };
     let input_json = serde_json::to_string(&extras).map_err(|e| e.to_string())?;
@@ -778,6 +809,10 @@ mod tests {
                 strength: Some(80),
             }],
             quality: Some("high".into()),
+            output_format: Some("gif".into()),
+            frame_count: Some(9),
+            frame_duration_ms: Some(200),
+            complexity: Some("high".into()),
             quota_retries: 1,
         };
         let json = serde_json::to_string(&extras).unwrap();

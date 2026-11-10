@@ -16,6 +16,8 @@ import EditorView from "./EditorView";
 import OutpaintView from "./OutpaintView";
 import BasicEditView from "./BasicEditView";
 import BackgroundView from "./BackgroundView";
+import AnimationView from "./AnimationView";
+import RegionEditView from "./RegionEditView";
 import { IconBrush, IconChevron, IconPlus, IconTrash } from "./Icons";
 
 function NameDialog({
@@ -103,6 +105,8 @@ export default function CanvasView() {
   const outpaintTarget = useAppStore((s) => s.outpaintTarget);
   const basicEditTarget = useAppStore((s) => s.basicEditTarget);
   const backgroundTarget = useAppStore((s) => s.backgroundTarget);
+  const animationTarget = useAppStore((s) => s.animationTarget);
+  const regionTarget = useAppStore((s) => s.regionTarget);
 
   const [addOpen, setAddOpen] = useState(false);
   const [createOpen, setCreateOpen] = useState(false);
@@ -119,6 +123,10 @@ export default function CanvasView() {
     <BasicEditView />
   ) : backgroundTarget?.host === "canvas" ? (
     <BackgroundView />
+  ) : animationTarget?.host === "canvas" ? (
+    <AnimationView />
+  ) : regionTarget?.host === "canvas" ? (
+    <RegionEditView />
   ) : null;
 
   useEffect(() => {
@@ -231,7 +239,11 @@ export default function CanvasView() {
         {inlinePanel && (
           <aside
             aria-label={t("画布编辑面板")}
-            className="flex w-[min(440px,46%)] min-w-0 shrink-0 flex-col overflow-hidden rounded-card border border-line bg-base shadow-card"
+            className={`flex ${
+              regionTarget?.host === "canvas"
+                ? "w-[min(560px,52%)]"
+                : "w-[min(440px,46%)]"
+            } min-w-0 shrink-0 flex-col overflow-hidden rounded-card border border-line bg-base shadow-card`}
           >
             {inlinePanel}
           </aside>

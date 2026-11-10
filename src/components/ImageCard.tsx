@@ -6,8 +6,10 @@ import { ChatImage, useChatStore } from "../stores/chatStore";
 import { useAppStore } from "../stores/appStore";
 import { useProviderStore } from "../stores/providerStore";
 import { api } from "../lib/api";
-import { extOf } from "../lib/image";
+import { extOf, isGifDataUrl, isGifPath } from "../lib/image";
 import { extFromDataUrl, saveDataUrl, saveHistoryImage } from "../lib/save";
+import { deliverEditResult } from "../lib/deliverEditResult";
+import { emitHistoryChanged } from "../lib/historyEvents";
 import { useModelCaps } from "../lib/useModelCaps";
 import { DUR, EASE } from "../lib/motion";
 import { toast } from "../lib/notify";
@@ -27,6 +29,7 @@ import {
   IconMore,
   IconCrop,
   IconPalette,
+  IconImage,
 } from "./Icons";
 
 export default function ImageCard({
@@ -48,6 +51,7 @@ export default function ImageCard({
   const openTransform = useAppStore((s) => s.openTransform);
   const openBasicEdit = useAppStore((s) => s.openBasicEdit);
   const openBackground = useAppStore((s) => s.openBackground);
+  const openAnimation = useAppStore((s) => s.openAnimation);
   const expert = useAppStore((s) => s.mode) === "expert";
   // 模板服务商只有在配置了编辑模板后才有编辑端点；否则隐藏入口，
   // 避免用户点进去才收到「未配置编辑模板」
@@ -139,28 +143,34 @@ export default function ImageCard({
     prompt,
   };
 
+  // 动图不走静图编辑链路：带蒙版的编辑会把 GIF 静默压成单帧，必须显式转静图
+  const isGif = isGifPath(image.path) || isGifDataUrl(image.dataUrl);
+  const gifHint = t("动图请用动图编辑器或单帧修复");
+  const gifBlocked = (item: MenuItem): MenuItem =>
+    isGif ? { ...item, disabled: true, hint: gifHint } : item;
+
   const editItems: MenuItem[] =
     editUnsupported || !caps.edit
       ? []
       : [
-          {
+          gifBlocked({
             id: "inpaint",
             label: t("局部重绘"),
             icon: <IconBrush size={14} />,
             onSelect: () => openEditor({ ...baseTarget, mode: "inpaint" }),
-          },
-          {
+          }),
+          gifBlocked({
             id: "erase",
             label: t("AI 消除"),
             icon: <IconEraser size={14} />,
             onSelect: () => openEditor({ ...baseTarget, mode: "erase" }),
-          },
-          {
+          }),
+          gifBlocked({
             id: "outpaint",
             label: t("扩图"),
             icon: <IconExpand size={14} />,
             onSelect: () => openOutpaint(baseTarget),
-          },
+          }),
         ];
 
   // 放大 / 风格转换：服务商有变换端点（模板未配置时隐藏），且模型能力允许
@@ -168,19 +178,34 @@ export default function ImageCard({
     transformUnsupported || !caps.transform
       ? []
       : [
-          {
+          gifBlocked({
             id: "upscale",
             label: t("高清放大"),
             icon: <IconExpand size={14} />,
             onSelect: () => openTransform({ ...baseTarget, kind: "upscale" }),
-          },
-          {
+          }),
+          gifBlocked({
             id: "style",
             label: t("风格转换"),
             icon: <IconSparkle size={14} />,
             onSelect: () => openTransform({ ...baseTarget, kind: "style" }),
-          },
+          }),
         ];
+
+  /// 转静图：首帧另存为 PNG 新记录，再按普通静图结果投递（会话 / 画廊）
+  const convertToStatic = async () => {
+    try {
+      const out = await api.convertAnimationToStatic(image.historyId);
+      await deliverEditResult(
+        { historyId: image.historyId },
+        out,
+        t("已转静图"),
+      );
+      emitHistoryChanged();
+    } catch (e) {
+      toast(t("转静图失败：{{error}}", { error: String(e) }), "error");
+    }
+  };
 
   const menuItems: MenuItem[] = [
     {
@@ -199,21 +224,37 @@ export default function ImageCard({
     // 换背景属于进阶功能：简单模式下不展示
     ...(expert
       ? [
-          {
+          gifBlocked({
             id: "background",
             label: t("换背景"),
             icon: <IconPalette size={14} />,
             onSelect: () => openBackground(baseTarget),
-          },
+          }),
         ]
       : []),
-    {
+    gifBlocked({
       id: "basic-edit",
       label: t("基础编辑"),
       icon: <IconCrop size={14} />,
       onSelect: () => openBasicEdit(baseTarget),
-    },
+    }),
     ...transformItems,
+    ...(isGif
+      ? [
+          {
+            id: "animation",
+            label: t("打开动图编辑器"),
+            icon: <IconImage size={14} />,
+            onSelect: () => openAnimation({ historyId: image.historyId }),
+          },
+          {
+            id: "to-static",
+            label: t("转静图（取首帧）"),
+            icon: <IconCrop size={14} />,
+            onSelect: () => void convertToStatic(),
+          },
+        ]
+      : []),
     {
       id: "download",
       label: t("下载"),
@@ -234,6 +275,7 @@ export default function ImageCard({
     dataUrl: i.dataUrl,
     title: prompt,
     prompt,
+    historyId: i.historyId,
   }));
 
   const openViewer = () =>
@@ -262,10 +304,19 @@ export default function ImageCard({
               className="block w-full object-cover transition-transform duration-300 ease-ios group-hover:scale-[1.015]"
             />
           </button>
-          {image.derivedFrom !== undefined && (
-            <span className="glass-media pointer-events-none absolute left-2 top-2 rounded-pill px-2 py-0.5 text-caption text-on-accent">
-              {t("派生自 #{{id}}", { id: image.derivedFrom })}
-            </span>
+          {(isGif || image.derivedFrom !== undefined) && (
+            <div className="pointer-events-none absolute left-2 top-2 flex flex-col items-start gap-1">
+              {isGif && (
+                <span className="glass-media rounded-pill px-2 py-0.5 text-caption text-on-accent">
+                  {t("动图")}
+                </span>
+              )}
+              {image.derivedFrom !== undefined && (
+                <span className="glass-media rounded-pill px-2 py-0.5 text-caption text-on-accent">
+                  {t("派生自 #{{id}}", { id: image.derivedFrom })}
+                </span>
+              )}
+            </div>
           )}
           <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-center justify-end gap-1 p-2 opacity-0 transition-opacity duration-200 group-focus-within:opacity-100 group-hover:opacity-100">
             {/* 媒体玻璃操作条：图片上的浮标，5 个 28px 圆形按钮 */}

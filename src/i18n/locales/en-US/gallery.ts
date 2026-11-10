@@ -35,6 +35,8 @@ const gallery = {
   取消收藏: "Remove from favorites",
   收藏该作品: "Add to favorites",
   "派生 #{{id}}": "Derived #{{id}}",
+  动图: "Animated",
+  "动图 · {{n}} 帧": "Animated · {{n}} frames",
   复用参数: "Reuse parameters",
   加入画布: "Add to canvas",
   收藏提示词: "Save prompt",

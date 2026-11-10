@@ -14,11 +14,13 @@ beforeEach(() => {
     transformTarget: null,
     basicEditTarget: null,
     backgroundTarget: null,
+    animationTarget: null,
+    regionTarget: null,
   });
 });
 
 describe("编辑入口", () => {
-  it("打开任一入口都会关掉其余四个，保证同一时刻只有一个编辑实例", () => {
+  it("打开任一入口都会关掉其余入口，保证同一时刻只有一个编辑实例", () => {
     const app = useAppStore.getState();
     app.openEditor({ ...target, mode: "inpaint" });
     app.openBackground(target);
@@ -30,6 +32,31 @@ describe("编辑入口", () => {
     state = useAppStore.getState();
     expect(state.backgroundTarget).toBeNull();
     expect(state.transformTarget?.kind).toBe("upscale");
+
+    app.openAnimation({ historyId: 9 });
+    state = useAppStore.getState();
+    expect(state.transformTarget).toBeNull();
+    expect(state.animationTarget).toEqual({ historyId: 9 });
+
+    app.openBasicEdit(target);
+    state = useAppStore.getState();
+    expect(state.animationTarget).toBeNull();
+    expect(state.basicEditTarget).toEqual(target);
+
+    const regionTarget = {
+      nodeId: "n1",
+      baseHistoryId: 3,
+      dataUrl: "data:image/png;base64,CC",
+    };
+    app.openRegionEdit(regionTarget);
+    state = useAppStore.getState();
+    expect(state.basicEditTarget).toBeNull();
+    expect(state.regionTarget).toEqual(regionTarget);
+
+    app.openEditor({ ...target, mode: "inpaint" });
+    state = useAppStore.getState();
+    expect(state.regionTarget).toBeNull();
+    expect(state.editTarget?.mode).toBe("inpaint");
   });
 
   it("画布内嵌偏好只写 localStorage", () => {

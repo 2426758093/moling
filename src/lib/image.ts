@@ -13,3 +13,15 @@ export function extOf(filePath: string) {
   const ext = (filePath.split(".").pop() ?? "").toLowerCase();
   return SAFE_EXT.has(ext) ? ext : "png";
 }
+
+/** 落盘路径是否 GIF（查询串 / 片段不参与判断） */
+export function isGifPath(filePath: string | null | undefined) {
+  if (!filePath) return false;
+  return extOf(filePath.split(/[?#]/, 1)[0]) === "gif";
+}
+
+/** data URL 是否 GIF（MIME 判断，不解析内容） */
+export function isGifDataUrl(url: string | null | undefined) {
+  if (!url) return false;
+  return /^data:image\/gif[;,]/i.test(url);
+}

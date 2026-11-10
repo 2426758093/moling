@@ -1,8 +1,10 @@
+pub mod animation;
 pub mod canvas;
 pub mod chat;
 pub mod diagnostics;
 pub mod files;
 pub mod image;
+pub mod layers;
 pub mod model_caps;
 pub mod network;
 pub mod prompt_assets;
@@ -15,11 +17,13 @@ pub mod storage;
 pub mod thinking;
 pub mod update;
 
+pub use animation::*;
 pub use canvas::*;
 pub use chat::*;
 pub use diagnostics::*;
 pub use files::*;
 pub use image::*;
+pub use layers::*;
 pub use model_caps::*;
 pub use network::*;
 pub use prompt_assets::*;

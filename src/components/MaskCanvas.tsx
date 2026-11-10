@@ -9,10 +9,11 @@ export interface MaskCanvasHandle {
   /** 黑底 + 白笔画：本地合成用的「白 = 替换」口径 */
   toLumaPng: () => string | null;
   hasStrokes: () => boolean;
-  /** 把灰度蒙版（255 = 选中）写入画布：replace 覆盖 / add 叠加 / subtract 减去 */
+  /** 把蒙版写入画布：replace 覆盖 / add 叠加 / subtract 减去；
+   *  alpha = alpha-hole 口径（透明处为选中），用于载入分区蒙版资产 */
   applyMask: (
     dataUrl: string,
-    mode: "replace" | "add" | "subtract",
+    mode: "replace" | "add" | "subtract" | "alpha",
   ) => Promise<void>;
 }
 
@@ -169,9 +170,11 @@ export default function MaskCanvas({
           octx.drawImage(img, 0, 0, off.width, off.height);
           const src = octx.getImageData(0, 0, off.width, off.height);
           let any = false;
+          const hole = mode === "alpha";
           for (let i = 0; i < src.data.length; i += 4) {
-            // 灰度蒙版：R 通道即选中强度；小于 8 视为噪点，避免整张蒙版变灰
-            const v = src.data[i] < 8 ? 0 : src.data[i];
+            // 灰度蒙版：R 通道即选中强度；alpha-hole 蒙版反过来取透明度
+            const raw = hole ? 255 - src.data[i + 3] : src.data[i];
+            const v = raw < 8 ? 0 : raw;
             src.data[i] = 255;
             src.data[i + 1] = 56;
             src.data[i + 2] = 60;

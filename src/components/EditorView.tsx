@@ -157,8 +157,13 @@ export default function EditorView() {
         parentId: source.historyId,
       });
       setResultUrl(out.dataUrl);
+      if (out.warning) toast(out.warning, "error");
       const displayPrompt = isErase ? t("（AI 消除）") : prompt;
-      await deliverEditResult(source, out, displayPrompt);
+      await deliverEditResult(
+        source,
+        { ...out, width: image.naturalWidth, height: image.naturalHeight },
+        displayPrompt,
+      );
       setLastError(null);
     } catch (e) {
       const parsed = parseAdapterError(String(e));

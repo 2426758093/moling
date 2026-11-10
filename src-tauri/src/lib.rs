@@ -1,8 +1,10 @@
 mod adapters;
+mod animation;
 mod background;
 mod basic_edit;
 mod billing_journal;
 mod commands;
+mod compositor;
 mod error;
 mod image_gc;
 mod image_store;
@@ -157,6 +159,15 @@ pub fn run() {
             commands::get_history_image,
             commands::save_history_image,
             commands::export_history_zip,
+            commands::get_animation_info,
+            commands::get_animation_frames,
+            commands::get_animation_frame,
+            commands::optimize_animation,
+            commands::replace_animation_frame,
+            commands::export_animation_zip,
+            commands::compose_animation,
+            commands::convert_animation_to_static,
+            commands::export_sticker,
             commands::write_text_file,
             commands::write_file_base64,
             commands::get_history_item,
@@ -226,6 +237,11 @@ pub fn run() {
             commands::save_canvas_board,
             commands::delete_canvas_board,
             commands::batch_history_thumbs,
+            commands::save_canvas_layer_asset,
+            commands::read_media_image,
+            commands::compose_canvas_node,
+            commands::flatten_canvas_node,
+            commands::region_edit_batch,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

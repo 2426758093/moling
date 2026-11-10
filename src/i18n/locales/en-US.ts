@@ -1,4 +1,6 @@
+import animation from "./en-US/animation";
 import canvas from "./en-US/canvas";
+import canvasLayers from "./en-US/canvasLayers";
 import chat from "./en-US/chat";
 import chatComposer from "./en-US/chatComposer";
 import common from "./en-US/common";
@@ -26,6 +28,8 @@ const enUS = {
   ...editorsDialogs,
   ...settingsSections,
   ...canvas,
+  ...canvasLayers,
+  ...animation,
   ...misc,
   ...miscLib,
   ...miscData,

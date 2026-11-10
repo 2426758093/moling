@@ -100,6 +100,21 @@ export async function exportHistoryZip(
   return api.exportHistoryZip(entries, path);
 }
 
+/** 动图导出（GIF 包 / PNG 序列）；返回 null 表示用户取消。 */
+export async function exportAnimationZip(
+  historyId: number,
+  mode: "gif" | "png-sequence",
+  filename: string,
+): Promise<{ files: string[]; path: string } | null> {
+  const path = await pickPath(
+    filename,
+    filterFor(filename, i18n.t("ZIP 压缩包")),
+  );
+  if (!path) return null;
+  const res = await api.exportAnimationZip(historyId, mode, path);
+  return { files: res.files, path: res.path };
+}
+
 /** 文本 / JSON 导出；返回是否写入。 */
 export async function saveTextFile(
   content: string,

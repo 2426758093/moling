@@ -161,11 +161,14 @@ pub(crate) fn normalize_count(n: u32) -> u32 {
 }
 
 /// 质量档位白名单：auto/未知值一律视为「不发送」，防止任意字符串透传给服务商。
+/// xhigh / max 是 gpt-image 系列的高档位，只有这类模型才下发（适配层再兜一次）。
 pub(crate) fn normalize_quality(q: Option<&str>) -> Option<String> {
     match q.map(str::trim) {
         Some("low") => Some("low".into()),
         Some("medium") => Some("medium".into()),
         Some("high") => Some("high".into()),
+        Some("xhigh") => Some("xhigh".into()),
+        Some("max") => Some("max".into()),
         _ => None,
     }
 }
@@ -182,6 +185,50 @@ pub(crate) fn normalize_generation(width: u32, height: u32, count: u32) -> (u32,
         normalize_size(height),
         normalize_count(count),
     )
+}
+
+/// GIF 参数统一归一化：非 gif 输出时四个字段全部丢弃，保证静态请求形状不变。
+/// 帧数按模型的 `gif_max_frames` 收敛（直连 OpenAI 为 16），时长 20–2000ms 并按 10ms 取整。
+/// 显式 "png" 会原样保留：它只是内部「必须返回位图」的提示（单帧修复 / 分区重绘），
+/// 真实适配器只在 gif 时下发该字段，因此不会改变请求形状。
+pub(crate) fn normalize_gif(
+    output_format: Option<&str>,
+    frame_count: Option<u32>,
+    frame_duration_ms: Option<u32>,
+    complexity: Option<&str>,
+    max_frames: u32,
+) -> (Option<String>, Option<u32>, Option<u32>, Option<String>) {
+    if output_format.is_some_and(|f| f.trim().eq_ignore_ascii_case("png")) {
+        return (Some("png".into()), None, None, None);
+    }
+    if !adapters::wants_gif(output_format) {
+        return (None, None, None, None);
+    }
+    let max_frames = max_frames.clamp(2, 64);
+    let frames = frame_count.unwrap_or(9).clamp(2, max_frames);
+    let rounded = (frame_duration_ms.unwrap_or(200).clamp(20, 2000) + 5) / 10 * 10;
+    let complexity = match complexity.map(str::trim) {
+        Some("low") => Some("low".to_string()),
+        Some("medium") => Some("medium".to_string()),
+        Some("high") => Some("high".to_string()),
+        _ => None,
+    };
+    (Some("gif".into()), Some(frames), Some(rounded), complexity)
+}
+
+/// 取某模型允许的最大 GIF 帧数：用户覆盖值优先，否则按名称启发式
+pub(crate) fn gif_max_frames(provider_id: i64, model: &str) -> u32 {
+    let stored = storage::list_model_caps(provider_id)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|(m, _)| m == model)
+        .and_then(|(_, json)| {
+            serde_json::from_str::<crate::commands::model_caps::ModelCaps>(&json).ok()
+        });
+    stored
+        .map(|caps| caps.gif_max_frames)
+        .filter(|n| *n >= 2)
+        .unwrap_or_else(|| crate::commands::model_caps::heuristic_caps(model).gif_max_frames)
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -207,6 +254,15 @@ pub struct GenerateCommandInput {
     /// RA-06：前端传入的生成任务 id（camelCase 为 jobId），用于取消；不传时行为不变
     #[serde(default)]
     pub job_id: Option<String>,
+    /// "gif" = 动图；其余一律按静态图处理
+    #[serde(default)]
+    pub output_format: Option<String>,
+    #[serde(default)]
+    pub frame_count: Option<u32>,
+    #[serde(default)]
+    pub frame_duration_ms: Option<u32>,
+    #[serde(default)]
+    pub complexity: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -273,6 +329,7 @@ pub async fn generate_images(
         "images": outcome.images,
         "cancelled": outcome.cancelled,
         "failed": outcome.failed,
+        "warnings": outcome.warnings,
     }))
 }
 
@@ -282,6 +339,29 @@ pub(crate) struct GenerateOutcome {
     /// 单张落盘/入库失败明细：部分失败不影响其余图片
     pub failed: Vec<FailedImage>,
     pub cancelled: bool,
+    /// 产物与请求动图参数不符的提示（服务商静默退回静图 / 少给帧数）
+    pub warnings: Vec<String>,
+}
+
+/// 请求动图时核对产物：网关忽略 `output_format` 或 `frame_count` 是真实存在的
+/// 情况（实测有中转在 9/16 帧时静默返回 PNG）。图片已经计费，一律照常保存，
+/// 只把差异交给前端提示，绝不丢弃产物。
+pub(crate) fn animation_mismatch_warning(
+    path: &str,
+    requested_frames: Option<u32>,
+) -> Option<String> {
+    let requested = requested_frames?;
+    match crate::animation::probe_path(std::path::Path::new(path)) {
+        Ok(info) if info.frames == requested => None,
+        Ok(info) => Some(format!(
+            "服务商实际返回 {} 帧（请求 {} 帧），已按动图保存",
+            info.frames, requested
+        )),
+        Err(_) => Some(format!(
+            "服务商返回的是静态图（请求 {} 帧动图），已按静态图片保存",
+            requested
+        )),
+    }
 }
 
 /// 单张图片落盘失败：序号从 1 开始，与用户看到的第几张一致
@@ -293,7 +373,7 @@ pub(crate) struct FailedImage {
 
 /// 缩略图生成要完整解码图片，属于 CPU 密集操作：放到 blocking 线程池，
 /// 避免大图把异步运行时的 worker 卡住（B5）。
-async fn ensure_thumb_async(path: String) {
+pub(crate) async fn ensure_thumb_async(path: String) {
     let _ = tauri::async_runtime::spawn_blocking(move || {
         image_store::ensure_thumb(std::path::Path::new(&path));
     })
@@ -343,6 +423,10 @@ fn param_fingerprint(input: &GenerateCommandInput, req: &GenerateRequest) -> Str
     req.steps.hash(&mut hasher);
     req.seed.hash(&mut hasher);
     req.count.hash(&mut hasher);
+    req.output_format.hash(&mut hasher);
+    req.frame_count.hash(&mut hasher);
+    req.frame_duration_ms.hash(&mut hasher);
+    req.complexity.hash(&mut hasher);
     for img in &req.images {
         img.hash(&mut hasher);
     }
@@ -403,6 +487,14 @@ where
 
     // 尺寸/张数归一化（F-016）：请求、历史记录、进度事件都只用归一化后的值。
     let (width, height, count) = normalize_generation(input.width, input.height, input.count);
+    let max_frames = gif_max_frames(input.provider_id, &input.model);
+    let (output_format, frame_count, frame_duration_ms, complexity) = normalize_gif(
+        input.output_format.as_deref(),
+        input.frame_count,
+        input.frame_duration_ms,
+        input.complexity.as_deref(),
+        max_frames,
+    );
     if (width, height, count) != (input.width, input.height, input.count) {
         tracing::debug!(
             "生成参数已归一化：{}x{}x{} -> {width}x{height}x{count}",
@@ -445,6 +537,10 @@ where
         count,
         images: ref_images,
         references: references.to_vec(),
+        output_format,
+        frame_count,
+        frame_duration_ms,
+        complexity,
     };
 
     let param_hash = param_fingerprint(input, &req);
@@ -545,6 +641,7 @@ where
     let now = storage::timestamp_millis();
     let mut out = Vec::new();
     let mut failed: Vec<FailedImage> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
     if let Some((ctx, images)) = generated {
         let total = images.len();
         // 请求已发出就以拿回产物为先：停止只影响展示与最终标记，
@@ -558,6 +655,13 @@ where
                 let name = image_store::unique_name("", &now, i);
                 let (path, data_url) = image_store::save_b64_image_with_retry(app, b64, &name)
                     .map_err(|e| e.to_string())?;
+                // 记录真实解码尺寸：自动尺寸（0×0）与 GIF 都不能沿用请求尺寸
+                let (decoded_w, decoded_h) = decoded_size(b64);
+                let (record_w, record_h) = if decoded_w > 0 && decoded_h > 0 {
+                    (decoded_w, decoded_h)
+                } else {
+                    (width, height)
+                };
                 let id = storage::add_history(&storage::HistoryRow {
                     id: 0,
                     prompt: full_prompt.clone(),
@@ -565,8 +669,8 @@ where
                     model: input.model.clone(),
                     provider_name: row.name.clone(),
                     seed: seed_val,
-                    width: width as i64,
-                    height: height as i64,
+                    width: record_w as i64,
+                    height: record_h as i64,
                     guidance: input.guidance.unwrap_or(0.0) as f64,
                     steps: input.steps.unwrap_or(0) as i64,
                     style: input.style.clone(),
@@ -583,6 +687,11 @@ where
                 Ok((path, data_url, id)) => {
                     // 生成即建缩略图：画廊首屏只传缩略图，避免每页几十 MB 的原图 base64
                     ensure_thumb_async(path.clone()).await;
+                    if let Some(warning) = animation_mismatch_warning(&path, frame_count) {
+                        if !warnings.contains(&warning) {
+                            warnings.push(warning);
+                        }
+                    }
                     saved_paths.push(path.clone());
                     out.push(GeneratedImage {
                         history_id: id,
@@ -626,6 +735,7 @@ where
                 images: out,
                 failed,
                 cancelled,
+                warnings,
             });
         }
         if out.is_empty() {
@@ -653,6 +763,7 @@ where
         images: out,
         failed,
         cancelled,
+        warnings,
     })
 }
 
@@ -679,6 +790,15 @@ pub struct EditCommandInput {
     /// 原图记录 id（血统）
     #[serde(default)]
     pub parent_id: Option<i64>,
+    /// "gif" = 动图（无蒙版）；其余按静态图
+    #[serde(default)]
+    pub output_format: Option<String>,
+    #[serde(default)]
+    pub frame_count: Option<u32>,
+    #[serde(default)]
+    pub frame_duration_ms: Option<u32>,
+    #[serde(default)]
+    pub complexity: Option<String>,
 }
 
 /// 编辑来源只接受这三种；前端传了别的值也不让脏字符串进库。
@@ -687,25 +807,26 @@ fn normalize_edit_op(op: Option<&str>, erase: bool) -> &'static str {
         Some("erase") => "erase",
         Some("outpaint") => "outpaint",
         Some("edit") => "edit",
+        Some("anim-frame") => "anim-frame",
         _ if erase => "erase",
         _ => "edit",
     }
 }
 
 /// 编辑类请求的对账信息（一次用户动作一条 group）。
-struct EditJournal<'a> {
-    group_id: &'a str,
-    entry: &'a str,
-    op: &'a str,
-    param_hash: &'a str,
-    provider_name: &'a str,
-    model: &'a str,
-    prompt: &'a str,
+pub(crate) struct EditJournal<'a> {
+    pub(crate) group_id: &'a str,
+    pub(crate) entry: &'a str,
+    pub(crate) op: &'a str,
+    pub(crate) param_hash: &'a str,
+    pub(crate) provider_name: &'a str,
+    pub(crate) model: &'a str,
+    pub(crate) prompt: &'a str,
 }
 
 /// 编辑类请求的公共执行段：Key 轮换 + 单次调用（编辑计费，鉴权失败不重发）。
 /// 成功时把 `AttemptCtx` 交给调用方：图片落盘入库后再写终态与产物路径。
-async fn run_edit(
+pub(crate) async fn run_edit(
     provider_id: i64,
     req: &EditRequest,
     journal: &EditJournal<'_>,
@@ -770,7 +891,7 @@ async fn run_edit(
 }
 
 /// 图片落盘 / 入库失败但请求已计费：留底并给出可恢复错误，绝不丢图。
-fn billed_save_error(ctx: &AttemptCtx, b64: &str, reason: String) -> String {
+pub(crate) fn billed_save_error(ctx: &AttemptCtx, b64: &str, reason: String) -> String {
     if let Some(stashed) = billing_journal::stash_b64_artifact(ctx.client_request_id(), 0, b64) {
         ctx.note_artifact(&stashed);
     }
@@ -788,7 +909,7 @@ fn billed_save_error(ctx: &AttemptCtx, b64: &str, reason: String) -> String {
 }
 
 /// 指纹：参数 + 输入图内容；用于阻止连点造成的重复计费。
-fn edit_fingerprint(parts: &[&str]) -> String {
+pub(crate) fn edit_fingerprint(parts: &[&str]) -> String {
     use std::collections::hash_map::DefaultHasher;
     let mut hasher = DefaultHasher::new();
     for part in parts {
@@ -812,6 +933,23 @@ pub async fn edit_image(
     // 尺寸归一化（F-016）：编辑同样走 IPC，不能只信前端
     input.width = normalize_size(input.width);
     input.height = normalize_size(input.height);
+    let max_frames = gif_max_frames(input.provider_id, &input.model);
+    let (output_format, frame_count, frame_duration_ms, complexity) = normalize_gif(
+        input.output_format.as_deref(),
+        input.frame_count,
+        input.frame_duration_ms,
+        input.complexity.as_deref(),
+        max_frames,
+    );
+    let source_b64 = image_store::strip_data_url(&input.image_b64);
+    let wants_animated = adapters::wants_gif(output_format.as_deref());
+    // GIF 静默压成首帧等于丢动图：非动图输出时明确拒绝，让前端走「转静图」显式路径
+    if !wants_animated && source_b64.starts_with("R0lGOD") {
+        return Err("GIF 动图不支持局部编辑，请使用动图编辑器或先「转静图」（取首帧）".into());
+    }
+    if wants_animated && input.mask_b64.is_some() {
+        return Err("服务商不支持带蒙版的 GIF 编辑，请先转静图或改用单帧修复".into());
+    }
     let row =
         storage::get_provider(input.provider_id)?.ok_or_else(|| "服务商不存在".to_string())?;
     let candidates = key_pool::candidates(input.provider_id)?;
@@ -831,6 +969,10 @@ pub async fn edit_image(
         mask_b64: input.mask_b64.as_deref().map(image_store::strip_data_url),
         width: input.width,
         height: input.height,
+        output_format,
+        frame_count,
+        frame_duration_ms,
+        complexity,
     };
     let now = storage::timestamp_millis();
     let op = normalize_edit_op(input.op.as_deref(), erase);
@@ -845,6 +987,10 @@ pub async fn edit_image(
         op,
         &input.width.to_string(),
         &input.height.to_string(),
+        req.output_format.as_deref().unwrap_or(""),
+        &req.frame_count.unwrap_or(0).to_string(),
+        &req.frame_duration_ms.unwrap_or(0).to_string(),
+        req.complexity.as_deref().unwrap_or(""),
     ]);
     let (ctx, b64) = run_edit(
         input.provider_id,
@@ -867,6 +1013,14 @@ pub async fn edit_image(
         Err(e) => return Err(billed_save_error(&ctx, &b64, e.to_string())),
     };
     ensure_thumb_async(path.clone()).await;
+    let animation_warning = animation_mismatch_warning(&path, frame_count);
+    // 记录解码尺寸：GIF 与自动尺寸下请求宽高都不等于成品尺寸
+    let (decoded_w, decoded_h) = decoded_size(&b64);
+    let (record_w, record_h) = if decoded_w > 0 && decoded_h > 0 {
+        (decoded_w, decoded_h)
+    } else {
+        (input.width, input.height)
+    };
     let id = match storage::add_history(&storage::HistoryRow {
         id: 0,
         prompt: input.prompt.clone(),
@@ -874,8 +1028,8 @@ pub async fn edit_image(
         model: input.model.clone(),
         provider_name: row.name.clone(),
         seed: None,
-        width: input.width as i64,
-        height: input.height as i64,
+        width: record_w as i64,
+        height: record_h as i64,
         guidance: 0.0,
         steps: 0,
         style: String::new(),
@@ -899,6 +1053,7 @@ pub async fn edit_image(
         "dataUrl": data_url,
         "filePath": path,
         "op": op,
+        "warning": animation_warning,
     }))
 }
 
@@ -921,7 +1076,7 @@ pub struct TransformCommandInput {
 }
 
 /// 用 image crate 读结果图尺寸；解码失败退回 0（不阻断保存，列表按 0 显示）。
-fn decoded_size(b64: &str) -> (u32, u32) {
+pub(crate) fn decoded_size(b64: &str) -> (u32, u32) {
     use base64::Engine;
     let raw = image_store::strip_data_url(b64);
     let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(raw) else {
@@ -1313,6 +1468,7 @@ pub async fn replace_background(
                 mask_b64: Some(mask_raw.to_string()),
                 width: base_w,
                 height: base_h,
+                ..Default::default()
             };
             let group_id = format!("background-{}", storage::timestamp_millis());
             let param_hash = edit_fingerprint(&[
@@ -1455,10 +1611,17 @@ pub async fn list_history(
         let items: Vec<serde_json::Value> = rows
             .into_iter()
             .map(|r| {
-                let thumb = image_store::thumb_path_for(std::path::Path::new(&r.file_path));
+                let path = std::path::Path::new(&r.file_path);
+                let thumb = image_store::thumb_path_for(path);
                 let thumb_url =
                     image_store::path_to_data_url(&thumb.to_string_lossy()).unwrap_or_default();
-                serde_json::json!({ "history": r, "thumbUrl": thumb_url })
+                // 动图元数据按需探测文件头（不落库、不解码像素）；探测失败不影响列表
+                let animation = if r.file_path.to_ascii_lowercase().ends_with(".gif") {
+                    crate::animation::probe_path(path).ok()
+                } else {
+                    None
+                };
+                serde_json::json!({ "history": r, "thumbUrl": thumb_url, "animation": animation })
             })
             .collect();
         Ok(serde_json::json!({ "items": items }))
@@ -1564,6 +1727,39 @@ pub async fn delete_history(id: i64) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 网关可能忽略 output_format / frame_count：静图与少帧都要给提示，帧数对得上则静默
+    #[test]
+    fn animation_mismatch_warning_reports_static_and_frame_diff() {
+        let dir = std::env::temp_dir().join(format!("moling-anim-warn-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let static_path = dir.join("static.gif");
+        let png = image::RgbaImage::from_pixel(8, 8, image::Rgba([1, 2, 3, 255]));
+        image::DynamicImage::ImageRgba8(png)
+            .save_with_format(&static_path, image::ImageFormat::Png)
+            .unwrap();
+        let warning = animation_mismatch_warning(&static_path.to_string_lossy(), Some(4))
+            .expect("静图必须有提示");
+        assert!(warning.contains("静态图"), "{warning}");
+
+        let frames: Vec<image::RgbaImage> = (0..4)
+            .map(|i| image::RgbaImage::from_pixel(8, 8, image::Rgba([i as u8, 9, 9, 255])))
+            .collect();
+        let bytes = crate::animation::encode(&frames, &[200; 4], gif::Repeat::Infinite).unwrap();
+        let gif_path = dir.join("four.gif");
+        std::fs::write(&gif_path, &bytes).unwrap();
+        assert!(animation_mismatch_warning(&gif_path.to_string_lossy(), Some(4)).is_none());
+        let warning = animation_mismatch_warning(&gif_path.to_string_lossy(), Some(9))
+            .expect("帧数不符必须有提示");
+        assert!(
+            warning.contains("4 帧") && warning.contains("9 帧"),
+            "{warning}"
+        );
+
+        assert!(animation_mismatch_warning(&gif_path.to_string_lossy(), None).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// A6：只有 Network（连接未建立）可重试；Timeout 可能已计费，配额/鉴权/内容拦截/其他一律不重试
     #[test]
@@ -1691,6 +1887,10 @@ mod tests {
             images: None,
             references: None,
             job_id: None,
+            output_format: None,
+            frame_count: None,
+            frame_duration_ms: None,
+            complexity: None,
         };
         let refs = vec![ReferenceSpec {
             role: ReferenceRole::Style,
@@ -1759,5 +1959,113 @@ mod tests {
         assert_eq!(normalize_count(4), 4);
         assert_eq!(normalize_count(9), COUNT_MAX);
         assert_eq!(normalize_generation(0, 100_000, 0), (64, 4096, 1));
+    }
+
+    /// GIF 归一化：非 gif 输出清空全部字段，静态请求形状不变；显式 png 提示只保留格式
+    #[test]
+    fn normalize_gif_clears_non_gif_requests() {
+        assert_eq!(
+            normalize_gif(None, Some(6), Some(120), Some("high"), 16),
+            (None, None, None, None)
+        );
+        assert_eq!(
+            normalize_gif(Some("png"), Some(6), Some(120), Some("high"), 16),
+            (Some("png".into()), None, None, None)
+        );
+        assert_eq!(
+            normalize_gif(Some("PNG"), None, None, None, 16),
+            (Some("png".into()), None, None, None)
+        );
+        assert_eq!(
+            normalize_gif(Some("  "), Some(6), Some(120), Some("high"), 16),
+            (None, None, None, None)
+        );
+        assert_eq!(
+            normalize_gif(Some("jpeg"), Some(6), Some(120), Some("high"), 16),
+            (None, None, None, None)
+        );
+    }
+
+    /// 帧数按模型上限收敛，时长夹到 20–2000ms 并取整到 10ms，复杂度走白名单
+    #[test]
+    fn normalize_gif_clamps_rounds_and_whitelists() {
+        assert_eq!(
+            normalize_gif(Some("GIF"), None, None, None, 16),
+            (Some("gif".into()), Some(9), Some(200), None)
+        );
+        assert_eq!(
+            normalize_gif(Some("gif"), Some(0), Some(1), Some("max"), 16),
+            (Some("gif".into()), Some(2), Some(20), None)
+        );
+        assert_eq!(
+            normalize_gif(Some("gif"), Some(99), Some(9999), Some(" medium "), 16),
+            (
+                Some("gif".into()),
+                Some(16),
+                Some(2000),
+                Some("medium".into())
+            )
+        );
+        // 网关放宽到 32 帧时帧数可透传，但仍受硬上限 64 约束
+        assert_eq!(
+            normalize_gif(Some("gif"), Some(24), Some(125), Some("low"), 32).1,
+            Some(24)
+        );
+        assert_eq!(
+            normalize_gif(Some("gif"), Some(24), Some(125), Some("low"), 999).1,
+            Some(24)
+        );
+        assert_eq!(
+            normalize_gif(Some("gif"), Some(24), Some(125), Some("low"), 1).1,
+            Some(2)
+        );
+        // 125ms 四舍五入到 130ms
+        assert_eq!(
+            normalize_gif(Some("gif"), Some(4), Some(125), None, 16).2,
+            Some(130)
+        );
+    }
+
+    /// 指纹必须随 GIF 参数变化，否则换帧数复用不出新图、请求流水也会误判重复
+    #[test]
+    fn fingerprint_changes_with_gif_fields() {
+        let input = GenerateCommandInput {
+            provider_id: 1,
+            prompt: "p".into(),
+            negative_prompt: None,
+            model: "gpt-image-2.6-flare".into(),
+            width: 512,
+            height: 512,
+            quality: None,
+            guidance: None,
+            steps: None,
+            seed: None,
+            style: String::new(),
+            count: 1,
+            images: None,
+            references: None,
+            job_id: None,
+            output_format: Some("gif".into()),
+            frame_count: Some(6),
+            frame_duration_ms: Some(120),
+            complexity: Some("high".into()),
+        };
+        let mut req = GenerateRequest {
+            model: "gpt-image-2.6-flare".into(),
+            prompt: "p".into(),
+            ..Default::default()
+        };
+        req.output_format = Some("gif".into());
+        req.frame_count = Some(6);
+        req.frame_duration_ms = Some(120);
+        req.complexity = Some("high".into());
+        let base = param_fingerprint(&input, &req);
+        req.frame_count = Some(7);
+        assert_ne!(base, param_fingerprint(&input, &req));
+        req.frame_count = Some(6);
+        req.frame_duration_ms = Some(130);
+        assert_ne!(base, param_fingerprint(&input, &req));
+        req.frame_duration_ms = Some(120);
+        assert_eq!(base, param_fingerprint(&input, &req));
     }
 }

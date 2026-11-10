@@ -1,8 +1,16 @@
-import { memo, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useReducedMotion } from "framer-motion";
 import { api } from "../lib/api";
+import { deliverEditResult } from "../lib/deliverEditResult";
+import { emitHistoryChanged } from "../lib/historyEvents";
 import { toast } from "../lib/notify";
 import { CanvasNode, useCanvasStore } from "../stores/canvasStore";
+import {
+  composeLayerInputs,
+  effectiveLayers,
+  hasOverlayLayers,
+} from "../lib/canvasLayers";
 import { useAppStore } from "../stores/appStore";
 import { useChatStore } from "../stores/chatStore";
 import { useProviderStore } from "../stores/providerStore";
@@ -20,6 +28,8 @@ import {
   IconQuote,
   IconSparkle,
   IconTrash,
+  IconImage,
+  IconLayers,
 } from "./Icons";
 import { cn } from "./ui/cn";
 
@@ -27,11 +37,14 @@ interface NodeTarget {
   historyId: number;
   dataUrl: string;
   prompt: string;
+  width?: number;
+  height?: number;
 }
 
 function CanvasNodeCard({
   node,
   thumbUrl,
+  gif,
   selected,
   wireMode,
   wireArmed,
@@ -40,6 +53,8 @@ function CanvasNodeCard({
 }: {
   node: CanvasNode;
   thumbUrl?: string;
+  /** 源文件是 GIF：缩略图为首帧，静图编辑入口需置灰 */
+  gif?: boolean;
   selected: boolean;
   wireMode: boolean;
   wireArmed: boolean;
@@ -49,6 +64,8 @@ function CanvasNodeCard({
   const { t } = useTranslation();
   const updateNode = useCanvasStore((s) => s.updateNode);
   const removeNode = useCanvasStore((s) => s.removeNode);
+  const selectNode = useCanvasStore((s) => s.selectNode);
+  const setLayerPanelOpen = useCanvasStore((s) => s.setLayerPanelOpen);
   const expert = useAppStore((s) => s.mode) === "expert";
   const caps = useModelCaps();
   const editUnsupported = useProviderStore((s) => {
@@ -78,6 +95,27 @@ function CanvasNodeCard({
     y: number;
   } | null>(null);
   const [dragging, setDragging] = useState(false);
+  const reduceMotion = useReducedMotion() ?? false;
+  const [hovered, setHovered] = useState(false);
+  const [manualPlay, setManualPlay] = useState(false);
+  const [fullGifUrl, setFullGifUrl] = useState<string | null>(null);
+  // 动图只在悬停 / 选中时加载全尺寸文件；减少动态时需用户显式点击角标
+  const shouldPlay =
+    Boolean(gif) && (reduceMotion ? manualPlay : hovered || selected);
+
+  useEffect(() => {
+    if (!shouldPlay || fullGifUrl) return;
+    let alive = true;
+    api
+      .getHistoryImage(node.historyId)
+      .then((img) => {
+        if (alive) setFullGifUrl(img.dataUrl);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [shouldPlay, fullGifUrl, node.historyId]);
 
   const pointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
@@ -117,17 +155,25 @@ function CanvasNodeCard({
     }
   };
 
-  /// 编辑类动作都需要原图 + 提示词：按 id 取一次，失败统一提示
+  /// 编辑类动作都需要原图 + 提示词：多层节点先合成当前画面，再交给编辑器
   const withTarget = async (action: (target: NodeTarget) => void) => {
     try {
-      const [img, row] = await Promise.all([
-        api.getHistoryImage(node.historyId),
+      const [dataUrl, row] = await Promise.all([
+        hasOverlayLayers(node)
+          ? api
+              .composeCanvasNode({
+                baseHistoryId: node.historyId,
+                layers: composeLayerInputs(node),
+              })
+              .then((out) => out.dataUrl)
+          : api.getHistoryImage(node.historyId).then((img) => img.dataUrl),
         api.getHistoryItem(node.historyId),
       ]);
       action({
         historyId: node.historyId,
-        dataUrl: img.dataUrl,
+        dataUrl,
         prompt: row?.prompt ?? "",
+        ...(row ? { width: row.width, height: row.height } : {}),
       });
     } catch (e) {
       toast(t("图片不可用：{{error}}", { error: String(e) }), "error");
@@ -175,11 +221,16 @@ function CanvasNodeCard({
     }
   };
 
+  // 动图的静图编辑会把动画压成单帧，统一置灰并说明出口
+  const gifHint = t("动图请用动图编辑器或单帧修复");
+  const gifBlocked = (item: MenuItem): MenuItem =>
+    gif ? { ...item, disabled: true, hint: gifHint } : item;
+
   const editItems: MenuItem[] =
     editUnsupported || !caps.edit
       ? []
       : [
-          {
+          gifBlocked({
             id: "inpaint",
             label: t("局部重绘"),
             icon: <IconBrush size={14} />,
@@ -189,8 +240,8 @@ function CanvasNodeCard({
                   .getState()
                   .openEditor({ ...target, mode: "inpaint", host: "canvas" });
               }),
-          },
-          {
+          }),
+          gifBlocked({
             id: "erase",
             label: t("AI 消除"),
             icon: <IconEraser size={14} />,
@@ -200,8 +251,8 @@ function CanvasNodeCard({
                   .getState()
                   .openEditor({ ...target, mode: "erase", host: "canvas" });
               }),
-          },
-          {
+          }),
+          gifBlocked({
             id: "outpaint",
             label: t("扩图"),
             icon: <IconExpand size={14} />,
@@ -211,14 +262,14 @@ function CanvasNodeCard({
                   .getState()
                   .openOutpaint({ ...target, host: "canvas" });
               }),
-          },
+          }),
         ];
 
   const transformItems: MenuItem[] =
     transformUnsupported || !caps.transform
       ? []
       : [
-          {
+          gifBlocked({
             id: "upscale",
             label: t("高清放大"),
             icon: <IconExpand size={14} />,
@@ -230,8 +281,8 @@ function CanvasNodeCard({
                   host: "canvas",
                 });
               }),
-          },
-          {
+          }),
+          gifBlocked({
             id: "style",
             label: t("风格转换"),
             icon: <IconSparkle size={14} />,
@@ -241,14 +292,29 @@ function CanvasNodeCard({
                   .getState()
                   .openTransform({ ...target, kind: "style", host: "canvas" });
               }),
-          },
+          }),
         ];
+
+  /// 转静图：首帧另存 PNG，作为子节点落回画布（连线沿用编辑结果的规则）
+  const convertToStatic = async () => {
+    try {
+      const out = await api.convertAnimationToStatic(node.historyId);
+      await deliverEditResult(
+        { historyId: node.historyId, host: "canvas" },
+        out,
+        t("已转静图"),
+      );
+      emitHistoryChanged();
+    } catch (e) {
+      toast(t("转静图失败：{{error}}", { error: String(e) }), "error");
+    }
+  };
 
   const menuItems: MenuItem[] = [
     ...editItems,
     ...(expert
       ? [
-          {
+          gifBlocked({
             id: "background",
             label: t("换背景"),
             icon: <IconPalette size={14} />,
@@ -258,10 +324,10 @@ function CanvasNodeCard({
                   .getState()
                   .openBackground({ ...target, host: "canvas" });
               }),
-          },
+          }),
         ]
       : []),
-    {
+    gifBlocked({
       id: "basic-edit",
       label: t("基础编辑"),
       icon: <IconCrop size={14} />,
@@ -269,8 +335,64 @@ function CanvasNodeCard({
         void withTarget((target) => {
           useAppStore.getState().openBasicEdit({ ...target, host: "canvas" });
         }),
-    },
+    }),
     ...transformItems,
+    ...(!editUnsupported && caps.edit
+      ? [
+          gifBlocked({
+            id: "region",
+            label: t("分区重绘"),
+            icon: <IconLayers size={14} />,
+            separatorBefore: true,
+            onSelect: () =>
+              void withTarget((target) => {
+                useAppStore.getState().openRegionEdit({
+                  nodeId: node.id,
+                  baseHistoryId: node.historyId,
+                  dataUrl: target.dataUrl,
+                  host: "canvas",
+                });
+              }),
+          }),
+        ]
+      : []),
+    ...(gif
+      ? [
+          {
+            id: "animation",
+            label: t("打开动图编辑器"),
+            icon: <IconImage size={14} />,
+            onSelect: () =>
+              useAppStore
+                .getState()
+                .openAnimation({ historyId: node.historyId, host: "canvas" }),
+          },
+          {
+            id: "to-static",
+            label: t("转静图（取首帧）"),
+            icon: <IconCrop size={14} />,
+            onSelect: () => void convertToStatic(),
+          },
+        ]
+      : []),
+    {
+      id: "layers",
+      label: t("图层"),
+      icon: <IconLayers size={14} />,
+      separatorBefore: true,
+      ...(gif
+        ? {
+            disabled: true,
+            hint: t("动图不支持图层"),
+            onSelect: () => {},
+          }
+        : {
+            onSelect: () => {
+              selectNode(node.id);
+              setLayerPanelOpen(true);
+            },
+          }),
+    },
     {
       id: "reference",
       label: t("用作参考图"),
@@ -321,9 +443,11 @@ function CanvasNodeCard({
             : "cursor-grab",
       )}
       style={{ left: node.x, top: node.y, width: node.width }}
+      onPointerEnter={() => setHovered(true)}
+      onPointerLeave={() => setHovered(false)}
     >
       <SafeImg
-        src={thumbUrl ?? ""}
+        src={shouldPlay && fullGifUrl ? fullGifUrl : (thumbUrl ?? "")}
         alt={t("作品 #{{id}}", { id: node.historyId })}
         className="pointer-events-none block aspect-square w-full rounded-card object-cover"
         draggable={false}
@@ -333,6 +457,31 @@ function CanvasNodeCard({
       <span className="glass-media pointer-events-none absolute left-2 top-2 rounded-pill px-2 py-0.5 text-caption text-on-accent">
         #{node.historyId}
       </span>
+      {gif &&
+        (reduceMotion ? (
+          <button
+            type="button"
+            aria-pressed={manualPlay}
+            aria-label={t("播放动图")}
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              setManualPlay((v) => !v);
+            }}
+            className="glass-media pressable absolute bottom-2 left-2 rounded-pill px-2 py-0.5 text-caption text-on-accent"
+          >
+            {manualPlay ? t("暂停动图") : t("播放动图")}
+          </button>
+        ) : (
+          <span className="glass-media pointer-events-none absolute bottom-2 left-2 rounded-pill px-2 py-0.5 text-caption text-on-accent">
+            {t("动图")}
+          </span>
+        ))}
+      {(node.layers?.length ?? 0) > 1 && (
+        <span className="glass-media pointer-events-none absolute bottom-2 right-2 rounded-pill px-2 py-0.5 text-caption text-on-accent">
+          {t("{{count}} 层", { count: effectiveLayers(node).length })}
+        </span>
+      )}
       <div
         className={cn(
           "absolute right-2 top-2 opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100",

@@ -10,7 +10,9 @@ import {
   MIN_ZOOM,
   useCanvasStore,
 } from "../stores/canvasStore";
+import { topVisibleHistoryId } from "../lib/canvasLayers";
 import CanvasNodeCard from "./CanvasNode";
+import LayerPanel from "./LayerPanel";
 import { IconButton } from "./ui/IconButton";
 import { Button } from "./ui/Button";
 import { IconCanvas, IconGrid, IconImage, IconMinus, IconPlus } from "./Icons";
@@ -37,10 +39,15 @@ export default function CanvasBoard({
   const edges = useCanvasStore((s) => s.edges);
   const viewport = useCanvasStore((s) => s.viewport);
   const thumbs = useCanvasStore((s) => s.thumbs);
+  const gifIds = useCanvasStore((s) => s.gifIds);
   const setViewport = useCanvasStore((s) => s.setViewport);
   const addEdge = useCanvasStore((s) => s.addEdge);
   const removeEdge = useCanvasStore((s) => s.removeEdge);
   const removeNode = useCanvasStore((s) => s.removeNode);
+  const selectedNode = useCanvasStore((s) => s.selectedNodeId);
+  const selectNode = useCanvasStore((s) => s.selectNode);
+  const layerPanelOpen = useCanvasStore((s) => s.layerPanelOpen);
+  const setLayerPanelOpen = useCanvasStore((s) => s.setLayerPanelOpen);
 
   const containerRef = useRef<HTMLDivElement>(null);
   const panRef = useRef<{
@@ -51,12 +58,12 @@ export default function CanvasBoard({
     y: number;
   } | null>(null);
   const [panning, setPanning] = useState(false);
-  const [selectedNode, setSelectedNode] = useState<string | null>(null);
   const [selectedEdge, setSelectedEdge] = useState<string | null>(null);
   const [wireFrom, setWireFrom] = useState<string | null>(null);
   const wireSource = wireMode ? wireFrom : null;
 
   const nodeById = useMemo(() => new Map(nodes.map((n) => [n.id, n])), [nodes]);
+  const selectedNodeObj = selectedNode ? nodeById.get(selectedNode) : undefined;
 
   const fit = useCallback(() => {
     const el = containerRef.current;
@@ -166,8 +173,17 @@ export default function CanvasBoard({
         void useCanvasStore.getState().flush();
         return;
       }
+      if (mod && e.key.toLowerCase() === "l") {
+        e.preventDefault();
+        const state = useCanvasStore.getState();
+        const node = state.nodes.find((n) => n.id === state.selectedNodeId);
+        if (node && !state.gifIds[topVisibleHistoryId(node)]) {
+          state.setLayerPanelOpen(!state.layerPanelOpen);
+        }
+        return;
+      }
       if (e.key === "Escape") {
-        setSelectedNode(null);
+        selectNode(null);
         setSelectedEdge(null);
         setWireFrom(null);
         if (wireMode) onWireModeChange(false);
@@ -181,7 +197,7 @@ export default function CanvasBoard({
         } else if (selectedNode) {
           e.preventDefault();
           removeNode(selectedNode);
-          setSelectedNode(null);
+          selectNode(null);
         }
       }
     };
@@ -196,6 +212,7 @@ export default function CanvasBoard({
     onWireModeChange,
     removeNode,
     removeEdge,
+    selectNode,
   ]);
 
   const importPasted = useCallback(
@@ -204,7 +221,7 @@ export default function CanvasBoard({
         const { historyId } = await api.importImage(dataUrl);
         const id = await useCanvasStore.getState().addHistoryNode(historyId);
         if (id) {
-          setSelectedNode(id);
+          useCanvasStore.getState().selectNode(id);
           toast(t("已粘贴图片到画布"));
         }
       } catch {
@@ -273,7 +290,7 @@ export default function CanvasBoard({
 
   const pointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
-    setSelectedNode(null);
+    selectNode(null);
     setSelectedEdge(null);
     e.currentTarget.setPointerCapture(e.pointerId);
     const vp = useCanvasStore.getState().viewport;
@@ -306,10 +323,13 @@ export default function CanvasBoard({
     }
   };
 
-  const selectNode = useCallback((id: string) => {
-    setSelectedNode(id);
-    setSelectedEdge(null);
-  }, []);
+  const selectNodeAndClearEdge = useCallback(
+    (id: string) => {
+      selectNode(id);
+      setSelectedEdge(null);
+    },
+    [selectNode],
+  );
 
   const pickWire = useCallback(
     (id: string) => {
@@ -383,7 +403,7 @@ export default function CanvasBoard({
                   onPointerDown={(e) => {
                     e.stopPropagation();
                     setSelectedEdge(edge.id);
-                    setSelectedNode(null);
+                    selectNode(null);
                   }}
                 />
                 <line
@@ -404,19 +424,33 @@ export default function CanvasBoard({
             );
           })}
         </svg>
-        {nodes.map((node) => (
-          <CanvasNodeCard
-            key={node.id}
-            node={node}
-            thumbUrl={thumbs[node.historyId]}
-            selected={selectedNode === node.id}
-            wireMode={wireMode}
-            wireArmed={wireSource === node.id}
-            onSelect={selectNode}
-            onWirePick={pickWire}
-          />
-        ))}
+        {nodes.map((node) => {
+          const thumbId = topVisibleHistoryId(node);
+          return (
+            <CanvasNodeCard
+              key={node.id}
+              node={node}
+              thumbUrl={thumbs[thumbId]}
+              gif={gifIds[thumbId]}
+              selected={selectedNode === node.id}
+              wireMode={wireMode}
+              wireArmed={wireSource === node.id}
+              onSelect={selectNodeAndClearEdge}
+              onWirePick={pickWire}
+            />
+          );
+        })}
       </div>
+
+      {layerPanelOpen &&
+        !wireMode &&
+        selectedNodeObj &&
+        !gifIds[topVisibleHistoryId(selectedNodeObj)] && (
+          <LayerPanel
+            node={selectedNodeObj}
+            onClose={() => setLayerPanelOpen(false)}
+          />
+        )}
 
       {nodes.length === 0 && (
         <div className="pointer-events-none absolute inset-0 flex flex-col items-center justify-center gap-4 px-6 text-center">

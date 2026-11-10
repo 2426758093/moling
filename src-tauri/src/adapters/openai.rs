@@ -30,6 +30,15 @@ struct GenerationBody {
     quality: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<String>,
+    /// GIF 输出容器；省略即静态图
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frame_count: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frame_duration_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    complexity: Option<String>,
 }
 
 /// 自动尺寸的约定：宽高同时为 0 表示交给服务商（OpenAI 的 size=auto 等价于省略）。
@@ -39,6 +48,7 @@ pub(crate) fn is_auto_size(width: u32, height: u32) -> bool {
 
 /// 质量档位映射：DALL·E 3 只认 standard / hd，其余 gpt-image 兼容档位原样发送。
 /// auto 与不支持 quality 的 DALL·E 2 一律不发字段，避免严格网关 400。
+/// `xhigh` / `max` 只有 gpt-image 系列认，别的模型带上会被 400，因此不外发。
 pub(crate) fn map_quality(model: &str, quality: Option<&str>) -> Option<String> {
     let quality = quality?.trim();
     if quality.is_empty() || quality == "auto" {
@@ -49,6 +59,9 @@ pub(crate) fn map_quality(model: &str, quality: Option<&str>) -> Option<String> 
         return Some(if quality == "high" { "hd" } else { "standard" }.into());
     }
     if model.contains("dall-e") {
+        return None;
+    }
+    if matches!(quality, "xhigh" | "max") && !model.contains("gpt-image") {
         return None;
     }
     Some(quality.to_string())
@@ -323,6 +336,7 @@ impl OpenAiAdapter {
     }
 
     /// 构造并发送 /images/edits 请求（编辑与变换共用同一端点）。
+    #[allow(clippy::too_many_arguments)]
     async fn post_edit(
         config: &ProviderConfig,
         model: &str,
@@ -330,12 +344,27 @@ impl OpenAiAdapter {
         image_bytes: Vec<u8>,
         mask_bytes: Option<Vec<u8>>,
         size: Option<String>,
+        gif: Option<&super::GifParams>,
         ctx: Option<&crate::billing_journal::AttemptCtx>,
     ) -> Result<ImageResponse, AdapterError> {
+        // 官方 GIF 编辑不带蒙版；带蒙版时明确拒绝，绝不静默压成静图
+        if gif.is_some() && mask_bytes.is_some() {
+            return Err(AdapterError::Unsupported {
+                message: "服务商不支持带蒙版的 GIF 编辑，请先转静图或改用单帧修复".into(),
+            });
+        }
         let mut body = serde_json::json!({ "model": model, "prompt": prompt });
         // RA-02：编辑分支同样吸附到服务商支持的尺寸档位，与 generate 保持一致
         if let Some(size) = size {
             body["size"] = serde_json::Value::String(size);
+        }
+        if let Some(gif) = gif {
+            body["output_format"] = serde_json::Value::String(gif.output_format.clone());
+            body["frame_count"] = serde_json::Value::from(gif.frame_count);
+            body["frame_duration_ms"] = serde_json::Value::from(gif.frame_duration_ms);
+            if let Some(complexity) = &gif.complexity {
+                body["complexity"] = serde_json::Value::String(complexity.clone());
+            }
         }
         // A2：上送前本地校验体积/像素；蒙版必须是同尺寸且带 Alpha 的 PNG
         let has_mask = mask_bytes.is_some();
@@ -385,9 +414,10 @@ impl OpenAiAdapter {
     async fn first_image_b64(
         parsed: ImageResponse,
         timeout: std::time::Duration,
+        max_bytes: usize,
     ) -> Result<String, AdapterError> {
         let entry = first_image(&parsed)?;
-        Self::fetch_image_b64(entry, timeout).await
+        Self::fetch_image_b64(entry, timeout, max_bytes).await
     }
 
     /// 取回单张图片：b64 直接返回，URL 走「只重试下载」的下载器。
@@ -395,13 +425,21 @@ impl OpenAiAdapter {
     async fn fetch_image_b64(
         entry: &ImageEntry,
         timeout: std::time::Duration,
+        max_bytes: usize,
     ) -> Result<String, AdapterError> {
         if let Some(b64) = &entry.b64_json {
+            // base64 膨胀 4/3；不真正 decode 就能拦下明显超限的响应
+            let approx = b64.len() / 4 * 3;
+            if approx > max_bytes {
+                return Err(AdapterError::Other {
+                    message: format!("图片体积超过上限 {} MB", max_bytes / 1024 / 1024),
+                });
+            }
             return Ok(b64.clone());
         }
         if let Some(url) = &entry.url {
             // F-011：统一走带状态码 / 体积上限 / 魔数校验的下载函数
-            let bytes = download_with_retry(url, timeout).await?;
+            let bytes = download_with_retry(url, timeout, max_bytes).await?;
             return Ok(base64::engine::general_purpose::STANDARD.encode(&bytes));
         }
         Err(AdapterError::Other {
@@ -430,10 +468,11 @@ pub(crate) fn retryable_download_error(e: &AdapterError) -> bool {
 pub(crate) async fn download_with_retry(
     url: &str,
     timeout: std::time::Duration,
+    max_bytes: usize,
 ) -> Result<Vec<u8>, AdapterError> {
     let mut last: Option<AdapterError> = None;
     for attempt in 0..3u64 {
-        match download_image_bytes(url, timeout).await {
+        match download_image_bytes(url, timeout, max_bytes).await {
             Ok(bytes) => return Ok(bytes),
             Err(e) if retryable_download_error(&e) => {
                 tracing::warn!(
@@ -582,6 +621,12 @@ impl OpenAiAdapter {
         req: &GenerateRequest,
         ctx: Option<&crate::billing_journal::AttemptCtx>,
     ) -> Result<Vec<String>, AdapterError> {
+        let gif = super::GifParams::from_request(
+            req.output_format.as_deref(),
+            req.frame_count,
+            req.frame_duration_ms,
+            req.complexity.as_deref(),
+        );
         let mut body = serde_json::to_value(GenerationBody {
             model: req.model.clone(),
             prompt: prompt_with_negative(&req.prompt, req.negative_prompt.as_deref()),
@@ -590,6 +635,10 @@ impl OpenAiAdapter {
             size: size_for_model(&req.model, req.width, req.height),
             quality: map_quality(&req.model, req.quality.as_deref()),
             response_format: supports_response_format(&req.model).then(|| "b64_json".to_string()),
+            output_format: gif.as_ref().map(|g| g.output_format.clone()),
+            frame_count: gif.as_ref().map(|g| g.frame_count),
+            frame_duration_ms: gif.as_ref().map(|g| g.frame_duration_ms),
+            complexity: gif.as_ref().and_then(|g| g.complexity.clone()),
         })
         .map_err(|e| AdapterError::Other {
             message: e.to_string(),
@@ -674,10 +723,15 @@ impl OpenAiAdapter {
             ctx.mark_billed(status, Some(parsed.data.len() as u32));
         }
         // 逐张取图：单张失败只丢该张（与 Cherry Studio 一致），全部失败才报错
+        let max_bytes = if gif.is_some() {
+            super::MAX_REMOTE_GIF_BYTES
+        } else {
+            super::MAX_REMOTE_IMAGE_BYTES
+        };
         let mut out = Vec::new();
         let mut last_err: Option<AdapterError> = None;
         for entry in &parsed.data {
-            match Self::fetch_image_b64(entry, Self::timeout(config)).await {
+            match Self::fetch_image_b64(entry, Self::timeout(config), max_bytes).await {
                 Ok(b64) => out.push(b64),
                 Err(e) => {
                     tracing::warn!("第 {} 张图片取回失败: {}", out.len() + 1, e.message());
@@ -724,6 +778,12 @@ impl OpenAiAdapter {
             ),
             None => None,
         };
+        let gif = super::GifParams::from_request(
+            req.output_format.as_deref(),
+            req.frame_count,
+            req.frame_duration_ms,
+            req.complexity.as_deref(),
+        );
         let parsed = Self::post_edit(
             config,
             &req.model,
@@ -731,10 +791,16 @@ impl OpenAiAdapter {
             image_bytes,
             mask_bytes,
             size_for_model(&req.model, req.width, req.height),
+            gif.as_ref(),
             ctx,
         )
         .await?;
-        Self::first_image_b64(parsed, Self::timeout(config)).await
+        let max_bytes = if gif.is_some() {
+            super::MAX_REMOTE_GIF_BYTES
+        } else {
+            super::MAX_REMOTE_IMAGE_BYTES
+        };
+        Self::first_image_b64(parsed, Self::timeout(config), max_bytes).await
     }
 
     async fn transform_impl(
@@ -749,9 +815,18 @@ impl OpenAiAdapter {
             })?;
         let size = scaled_size(&image_bytes, req.scale);
         let prompt = transform_prompt(&req.mode, req.scale, &req.prompt);
-        let parsed =
-            Self::post_edit(config, &req.model, &prompt, image_bytes, None, size, ctx).await?;
-        Self::first_image_b64(parsed, Self::timeout(config)).await
+        let parsed = Self::post_edit(
+            config,
+            &req.model,
+            &prompt,
+            image_bytes,
+            None,
+            size,
+            None,
+            ctx,
+        )
+        .await?;
+        Self::first_image_b64(parsed, Self::timeout(config), super::MAX_REMOTE_IMAGE_BYTES).await
     }
 }
 
@@ -828,6 +903,10 @@ mod tests {
                 size: size_for_model(model, 1024, 1024),
                 quality: map_quality(model, None),
                 response_format: supports_response_format(model).then(|| "b64_json".to_string()),
+                output_format: None,
+                frame_count: None,
+                frame_duration_ms: None,
+                complexity: None,
             })
             .unwrap()
         };
@@ -836,6 +915,77 @@ mod tests {
             .get("response_format")
             .is_none());
         assert_eq!(body("dall-e-3")["response_format"], "b64_json");
+    }
+
+    /// GIF 字段只在动图请求里出现；静态请求的形状必须与旧版完全一致
+    #[test]
+    fn generation_body_serializes_gif_fields_only_when_present() {
+        let body = |gif: Option<(&str, u32, u32, &str)>| {
+            serde_json::to_value(GenerationBody {
+                model: "gpt-image-2.6-flare".into(),
+                prompt: "x".into(),
+                n: 1,
+                size: None,
+                quality: None,
+                response_format: None,
+                output_format: gif.map(|g| g.0.to_string()),
+                frame_count: gif.map(|g| g.1),
+                frame_duration_ms: gif.map(|g| g.2),
+                complexity: gif.map(|g| g.3.to_string()),
+            })
+            .unwrap()
+        };
+        let static_body = body(None);
+        assert!(static_body.get("output_format").is_none());
+        assert!(static_body.get("frame_count").is_none());
+        let gif_body = body(Some(("gif", 6, 120, "high")));
+        assert_eq!(gif_body["output_format"], "gif");
+        assert_eq!(gif_body["frame_count"], 6);
+        assert_eq!(gif_body["frame_duration_ms"], 120);
+        assert_eq!(gif_body["complexity"], "high");
+    }
+
+    /// 编辑表单必须把 GIF 参数作为文本字段上送（数字也转字符串）
+    #[test]
+    fn edit_form_fields_carry_gif_params() {
+        let body = serde_json::json!({
+            "model": "gpt-image-2.6-sunburst",
+            "prompt": "x",
+            "output_format": "gif",
+            "frame_count": 4,
+            "frame_duration_ms": 90,
+            "response_format": "b64_json",
+        });
+        let fields: std::collections::HashMap<_, _> = edit_form_fields(&body).into_iter().collect();
+        assert_eq!(fields.get("output_format").map(String::as_str), Some("gif"));
+        assert_eq!(fields.get("frame_count").map(String::as_str), Some("4"));
+        assert_eq!(
+            fields.get("frame_duration_ms").map(String::as_str),
+            Some("90")
+        );
+        assert!(!fields.contains_key("response_format"));
+    }
+
+    /// xhigh/max 只对 gpt-image 系列放行，DALL·E 仍映射到 standard/hd
+    #[test]
+    fn map_quality_gates_new_tiers_by_model() {
+        assert_eq!(
+            map_quality("gpt-image-2.6-flare", Some("xhigh")).as_deref(),
+            Some("xhigh")
+        );
+        assert_eq!(
+            map_quality("gpt-image-2.6-flare", Some("max")).as_deref(),
+            Some("max")
+        );
+        assert_eq!(
+            map_quality("dall-e-3", Some("xhigh")).as_deref(),
+            Some("standard")
+        );
+        assert_eq!(
+            map_quality("dall-e-3", Some("max")).as_deref(),
+            Some("standard")
+        );
+        assert_eq!(map_quality("flux-pro", Some("max")), None);
     }
 
     /// A1：新模型保留用户尺寸，不吸附到 DALL·E 三档

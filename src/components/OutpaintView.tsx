@@ -226,8 +226,13 @@ export default function OutpaintView() {
         op: "outpaint",
         parentId: target.historyId,
       });
+      if (out.warning) toast(out.warning, "error");
       const displayPrompt = t("（扩图 {{w}}×{{h}}）", { w: tw, h: th });
-      await deliverEditResult(target, out, displayPrompt);
+      await deliverEditResult(
+        target,
+        { ...out, width: tw, height: th },
+        displayPrompt,
+      );
       closeOutpaint();
     } catch (e) {
       const parsed = parseAdapterError(String(e));

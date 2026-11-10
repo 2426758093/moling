@@ -10,6 +10,8 @@ export interface MenuItem {
   icon: ReactNode;
   danger?: boolean;
   disabled?: boolean;
+  /// 置灰原因：作为原生 tooltip 展示（Radix 菜单项内再套 Tooltip 会抢焦点）
+  hint?: string;
   /// 在这一项之前画一条分隔线
   separatorBefore?: boolean;
   onSelect: () => void;
@@ -52,6 +54,7 @@ export function ContextMenu({
               <ContextMenuPrimitive.Item
                 disabled={item.disabled}
                 onSelect={item.onSelect}
+                title={item.hint}
                 className={itemClass(item.danger)}
               >
                 <span className="flex h-4 w-4 shrink-0 items-center justify-center [&>svg]:h-4 [&>svg]:w-4">
@@ -101,6 +104,7 @@ export function DropdownMenu({
               <DropdownMenuPrimitive.Item
                 disabled={item.disabled}
                 onSelect={item.onSelect}
+                title={item.hint}
                 className={itemClass(item.danger)}
               >
                 <span className="flex h-4 w-4 shrink-0 items-center justify-center [&>svg]:h-4 [&>svg]:w-4">

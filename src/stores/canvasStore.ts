@@ -1,9 +1,42 @@
 import { create } from "zustand";
 import { api, CanvasBoardMeta } from "../lib/api";
+import { clampOpacity, collectThumbIds } from "../lib/canvasLayers";
 import i18n from "../i18n";
 import { toast } from "../lib/notify";
 
-/** 画布节点：只记 historyId 与布局，绝不存 dataUrl */
+/** 节点图层：图像层引用 historyId，蒙版层引用媒体根下的 alpha-hole PNG */
+export interface CanvasLayer {
+  id: string;
+  kind: "image" | "mask";
+  /** kind=image */
+  historyId?: number;
+  /** kind=mask：媒体根下的文件路径，绝不 base64 */
+  path?: string;
+  name?: string;
+  visible: boolean;
+  /** 0..1 */
+  opacity: number;
+  locked: boolean;
+  /** image 层生效范围引用 mask 层 */
+  maskLayerId?: string;
+  regionId?: string;
+  prompt?: string;
+}
+
+export type CanvasLayerDraft = Omit<CanvasLayer, "id">;
+
+/** 分区重绘区域：蒙版落盘为资产，提示词随区域保存 */
+export interface CanvasRegion {
+  id: string;
+  prompt: string;
+  maskPath: string;
+  /** 0..128，默认 24 */
+  feather: number;
+  appliedHistoryId?: number;
+  appliedLayerId?: string;
+}
+
+/** 画布节点：只记 historyId、图层与布局，绝不存 dataUrl */
 export interface CanvasNode {
   id: string;
   historyId: number;
@@ -11,6 +44,8 @@ export interface CanvasNode {
   y: number;
   /** 节点宽度（世界坐标）；缩略图为正方形 */
   width: number;
+  layers?: CanvasLayer[];
+  regions?: CanvasRegion[];
 }
 
 export interface CanvasEdge {
@@ -26,11 +61,23 @@ export interface CanvasViewport {
 }
 
 export interface CanvasData {
-  version: 1;
+  version: typeof CANVAS_VERSION;
   nodes: CanvasNode[];
   edges: CanvasEdge[];
   viewport: CanvasViewport;
 }
+
+/** 画布文档版本：v1 只有节点；v2 增加节点内图层栈与分区】
+ *  读入兼容 v1/v2，写出一律 v2（旧版打开会丢图层，首次保存前留 data_json_prev 快照） */
+export const CANVAS_VERSION = 2;
+export const MAX_LAYERS_PER_NODE = 24;
+export const MAX_LAYERS_PER_CANVAS = 3000;
+export const MAX_REGIONS_PER_NODE = 8;
+export const MAX_REGION_FEATHER = 128;
+export const DEFAULT_REGION_FEATHER = 24;
+export const MAX_LAYER_NAME_CHARS = 80;
+export const MAX_REGION_PROMPT_CHARS = 2000;
+export const MAX_LAYER_PATH_CHARS = 1024;
 
 export const NODE_WIDTH = 220;
 export const NODE_MIN_WIDTH = 120;
@@ -47,6 +94,102 @@ export function clampZoom(zoom: number): number {
 
 const DEFAULT_VIEWPORT: CanvasViewport = { x: 0, y: 0, zoom: 1 };
 
+function parseLayer(raw: unknown): CanvasLayer | null {
+  if (!raw || typeof raw !== "object") return null;
+  const l = raw as Record<string, unknown>;
+  const id = typeof l.id === "string" ? l.id.trim() : "";
+  const kind = l.kind === "mask" ? "mask" : l.kind === "image" ? "image" : null;
+  if (!id || !kind) return null;
+  const historyId = Number(l.historyId);
+  if (kind === "image" && (!Number.isInteger(historyId) || historyId <= 0)) {
+    return null;
+  }
+  const path = typeof l.path === "string" ? l.path.trim() : "";
+  if (kind === "mask" && (!path || path.length > MAX_LAYER_PATH_CHARS)) {
+    return null;
+  }
+  const opacity = Number(l.opacity);
+  const name =
+    typeof l.name === "string"
+      ? l.name.trim().slice(0, MAX_LAYER_NAME_CHARS)
+      : "";
+  const maskLayerId =
+    typeof l.maskLayerId === "string" ? l.maskLayerId.trim() : "";
+  const regionId = typeof l.regionId === "string" ? l.regionId.trim() : "";
+  const prompt =
+    typeof l.prompt === "string"
+      ? l.prompt.slice(0, MAX_REGION_PROMPT_CHARS)
+      : "";
+  return {
+    id,
+    kind,
+    ...(kind === "image" ? { historyId } : {}),
+    ...(kind === "mask" ? { path } : {}),
+    ...(name ? { name } : {}),
+    visible: l.visible !== false,
+    opacity: Number.isFinite(opacity) ? clampOpacity(opacity) : 1,
+    locked: l.locked === true,
+    ...(maskLayerId ? { maskLayerId } : {}),
+    ...(regionId ? { regionId } : {}),
+    ...(prompt ? { prompt } : {}),
+  };
+}
+
+function parseRegion(raw: unknown): CanvasRegion | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, unknown>;
+  const id = typeof r.id === "string" ? r.id.trim() : "";
+  const maskPath = typeof r.maskPath === "string" ? r.maskPath.trim() : "";
+  if (!id || !maskPath || maskPath.length > MAX_LAYER_PATH_CHARS) return null;
+  const feather = Number(r.feather);
+  const applied = Number(r.appliedHistoryId);
+  const appliedLayerId =
+    typeof r.appliedLayerId === "string" ? r.appliedLayerId.trim() : "";
+  return {
+    id,
+    prompt:
+      typeof r.prompt === "string"
+        ? r.prompt.slice(0, MAX_REGION_PROMPT_CHARS)
+        : "",
+    maskPath,
+    feather: Number.isFinite(feather)
+      ? Math.min(MAX_REGION_FEATHER, Math.max(0, Math.round(feather)))
+      : DEFAULT_REGION_FEATHER,
+    ...(Number.isInteger(applied) && applied > 0
+      ? { appliedHistoryId: applied }
+      : {}),
+    ...(appliedLayerId ? { appliedLayerId } : {}),
+  };
+}
+
+function parseLayers(raw: unknown): CanvasLayer[] {
+  if (!Array.isArray(raw)) return [];
+  const out: CanvasLayer[] = [];
+  const ids = new Set<string>();
+  for (const item of raw) {
+    if (out.length >= MAX_LAYERS_PER_NODE) break;
+    const layer = parseLayer(item);
+    if (!layer || ids.has(layer.id)) continue;
+    ids.add(layer.id);
+    out.push(layer);
+  }
+  return out;
+}
+
+function parseRegions(raw: unknown): CanvasRegion[] {
+  if (!Array.isArray(raw)) return [];
+  const out: CanvasRegion[] = [];
+  const ids = new Set<string>();
+  for (const item of raw) {
+    if (out.length >= MAX_REGIONS_PER_NODE) break;
+    const region = parseRegion(item);
+    if (!region || ids.has(region.id)) continue;
+    ids.add(region.id);
+    out.push(region);
+  }
+  return out;
+}
+
 /** 宽进严出：坏节点 / 悬空边一律丢弃，绝不因为一条脏数据让画布打不开 */
 export function parseCanvasData(json: string): CanvasData {
   let raw: unknown;
@@ -54,7 +197,7 @@ export function parseCanvasData(json: string): CanvasData {
     raw = JSON.parse(json);
   } catch {
     return {
-      version: 1,
+      version: CANVAS_VERSION,
       nodes: [],
       edges: [],
       viewport: { ...DEFAULT_VIEWPORT },
@@ -63,6 +206,7 @@ export function parseCanvasData(json: string): CanvasData {
   const root = (raw ?? {}) as Record<string, unknown>;
   const nodes: CanvasNode[] = [];
   const ids = new Set<string>();
+  let totalLayers = 0;
   if (Array.isArray(root.nodes)) {
     for (const item of root.nodes) {
       if (!item || typeof item !== "object") continue;
@@ -76,6 +220,15 @@ export function parseCanvasData(json: string): CanvasData {
       if (!Number.isInteger(historyId) || historyId <= 0) continue;
       if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
       ids.add(id);
+      let layers = parseLayers(n.layers);
+      if (totalLayers + layers.length > MAX_LAYERS_PER_CANVAS) {
+        layers = layers.slice(
+          0,
+          Math.max(0, MAX_LAYERS_PER_CANVAS - totalLayers),
+        );
+      }
+      totalLayers += layers.length;
+      const regions = parseRegions(n.regions);
       nodes.push({
         id,
         historyId,
@@ -84,6 +237,8 @@ export function parseCanvasData(json: string): CanvasData {
         width: Number.isFinite(width)
           ? Math.min(NODE_MAX_WIDTH, Math.max(NODE_MIN_WIDTH, width))
           : NODE_WIDTH,
+        ...(layers.length > 0 ? { layers } : {}),
+        ...(regions.length > 0 ? { regions } : {}),
       });
     }
   }
@@ -106,7 +261,7 @@ export function parseCanvasData(json: string): CanvasData {
   const vx = Number(vp.x);
   const vy = Number(vp.y);
   return {
-    version: 1,
+    version: CANVAS_VERSION,
     nodes,
     edges,
     viewport: {
@@ -122,7 +277,23 @@ function serialize(
   edges: CanvasEdge[],
   viewport: CanvasViewport,
 ): string {
-  return JSON.stringify({ version: 1, nodes, edges, viewport });
+  return JSON.stringify({
+    version: CANVAS_VERSION,
+    nodes: nodes.map((n) => {
+      const out: Record<string, unknown> = {
+        id: n.id,
+        historyId: n.historyId,
+        x: n.x,
+        y: n.y,
+        width: n.width,
+      };
+      if (n.layers && n.layers.length > 0) out.layers = n.layers;
+      if (n.regions && n.regions.length > 0) out.regions = n.regions;
+      return out;
+    }),
+    edges,
+    viewport,
+  });
 }
 
 function snapshotKey(
@@ -163,6 +334,13 @@ interface CanvasState {
   edges: CanvasEdge[];
   viewport: CanvasViewport;
   thumbs: Record<number, string>;
+  /** 源文件是 GIF 的 historyId（缩略图仍是首帧，角标与编辑守卫用） */
+  gifIds: Record<number, boolean>;
+  /** 当前选中节点（纯界面状态，不落盘） */
+  selectedNodeId: string | null;
+  layerPanelOpen: boolean;
+  selectNode: (id: string | null) => void;
+  setLayerPanelOpen: (open: boolean) => void;
   loaded: boolean;
   loading: boolean;
   dirty: boolean;
@@ -179,6 +357,41 @@ interface CanvasState {
   removeNode: (id: string) => void;
   addEdge: (from: string, to: string) => void;
   removeEdge: (id: string) => void;
+  /** 追加图层；v1 节点首次追加时自动物化基准层，返回新图层 id */
+  appendLayer: (nodeId: string, layer: CanvasLayerDraft) => string | null;
+  updateLayer: (
+    nodeId: string,
+    layerId: string,
+    patch: Partial<
+      Pick<CanvasLayer, "visible" | "opacity" | "locked" | "name">
+    >,
+  ) => void;
+  removeLayer: (nodeId: string, layerId: string) => void;
+  /** direction=-1 向下（更靠近底层），1 向上 */
+  moveLayer: (nodeId: string, layerId: string, direction: -1 | 1) => void;
+  /** 合并/拆分后整栈替换；historyId 变更时节点基准图随之更新 */
+  replaceNodeLayers: (
+    nodeId: string,
+    layers: CanvasLayer[],
+    historyId?: number,
+    clearRegions?: boolean,
+  ) => void;
+  addRegion: (
+    nodeId: string,
+    region: Omit<CanvasRegion, "id">,
+  ) => string | null;
+  updateRegion: (
+    nodeId: string,
+    regionId: string,
+    patch: Partial<Pick<CanvasRegion, "prompt" | "feather">>,
+  ) => void;
+  removeRegion: (nodeId: string, regionId: string) => void;
+  markRegionApplied: (
+    nodeId: string,
+    regionId: string,
+    appliedHistoryId: number,
+    appliedLayerId: string,
+  ) => void;
   setViewport: (viewport: CanvasViewport) => void;
   saveSoon: () => void;
   /** 立即落库；切换画布 / 离开页面前调用 */
@@ -207,7 +420,27 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
       dirty: false,
       saving: false,
       savedAt: null,
+      selectedNodeId: null,
+      layerPanelOpen: false,
     });
+
+  /** 首次加图层时物化基准层：锁定在最底层，指向节点基准图 */
+  const withBaseLayer = (node: CanvasNode): CanvasLayer[] =>
+    node.layers && node.layers.length > 0
+      ? node.layers
+      : [
+          {
+            id: `${node.id}-base`,
+            kind: "image",
+            historyId: node.historyId,
+            visible: true,
+            opacity: 1,
+            locked: true,
+          },
+        ];
+
+  const totalLayers = (nodes: CanvasNode[]) =>
+    nodes.reduce((sum, n) => sum + (n.layers?.length ?? 0), 0);
 
   return {
     boards: [],
@@ -217,6 +450,9 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
     edges: [],
     viewport: { ...DEFAULT_VIEWPORT },
     thumbs: {},
+    gifIds: {},
+    selectedNodeId: null,
+    layerPanelOpen: false,
     loaded: false,
     loading: false,
     dirty: false,
@@ -271,6 +507,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
           dirty: false,
           saving: false,
           savedAt: board.updatedAt,
+          selectedNodeId: null,
+          layerPanelOpen: false,
         }));
         return board.id;
       } catch (e) {
@@ -308,8 +546,10 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
           dirty: false,
           saving: false,
           savedAt: board.updatedAt,
+          selectedNodeId: null,
+          layerPanelOpen: false,
         });
-        void get().loadThumbs(data.nodes.map((n) => n.historyId));
+        void get().loadThumbs(collectThumbIds(data.nodes));
       } catch (e) {
         if (seq === boardSeq) {
           toast(
@@ -348,6 +588,8 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
         viewport: { ...DEFAULT_VIEWPORT },
         dirty: false,
         savedAt: null,
+        selectedNodeId: null,
+        layerPanelOpen: false,
       });
       savedKey = null;
       const next = rest[0];
@@ -360,7 +602,13 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
         const created = await get().createBoard("我的画布");
         if (created == null) return null;
       }
-      const existing = get().nodes.find((n) => n.historyId === historyId);
+      const existing = get().nodes.find(
+        (n) =>
+          n.historyId === historyId ||
+          n.layers?.some(
+            (l) => l.kind === "image" && l.historyId === historyId,
+          ),
+      );
       if (existing) return existing.id;
       const { nodes, viewport } = get();
       const col = nodes.length % 4;
@@ -407,8 +655,24 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
       set({
         nodes: s.nodes.filter((n) => n.id !== id),
         edges: s.edges.filter((e) => e.from !== id && e.to !== id),
+        ...(s.selectedNodeId === id
+          ? { selectedNodeId: null, layerPanelOpen: false }
+          : {}),
       });
       scheduleSave();
+    },
+
+    selectNode: (id) => {
+      if (get().selectedNodeId === id) return;
+      set({
+        selectedNodeId: id,
+        ...(id == null ? { layerPanelOpen: false } : {}),
+      });
+    },
+
+    setLayerPanelOpen: (open) => {
+      if (get().layerPanelOpen === open) return;
+      set({ layerPanelOpen: open });
     },
 
     addEdge: (from, to) => {
@@ -428,6 +692,216 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
     removeEdge: (id) => {
       if (!get().edges.some((e) => e.id === id)) return;
       set((s) => ({ edges: s.edges.filter((e) => e.id !== id) }));
+      scheduleSave();
+    },
+
+    appendLayer: (nodeId, layer) => {
+      const s = get();
+      const node = s.nodes.find((n) => n.id === nodeId);
+      if (!node) return null;
+      const layers = withBaseLayer(node);
+      if (layers.length >= MAX_LAYERS_PER_NODE) {
+        toast(
+          i18n.t("每个节点最多 {{max}} 层，可合并后继续", {
+            max: MAX_LAYERS_PER_NODE,
+          }),
+          "error",
+        );
+        return null;
+      }
+      if (totalLayers(s.nodes) >= MAX_LAYERS_PER_CANVAS) {
+        toast(
+          i18n.t("画布图层总数已达上限 {{max}}", {
+            max: MAX_LAYERS_PER_CANVAS,
+          }),
+          "error",
+        );
+        return null;
+      }
+      const id = newId("l");
+      const next = [...layers, { ...layer, id }];
+      set({
+        nodes: s.nodes.map((n) =>
+          n.id === nodeId ? { ...n, layers: next } : n,
+        ),
+      });
+      scheduleSave();
+      if (layer.kind === "image" && layer.historyId) {
+        void get().loadThumbs([layer.historyId]);
+      }
+      return id;
+    },
+
+    updateLayer: (nodeId, layerId, patch) => {
+      const s = get();
+      const node = s.nodes.find((n) => n.id === nodeId);
+      if (!node?.layers) return;
+      let changed = false;
+      const layers = node.layers.map((l) => {
+        if (l.id !== layerId) return l;
+        changed = true;
+        const next: CanvasLayer = { ...l };
+        if (patch.visible !== undefined) next.visible = patch.visible;
+        if (patch.locked !== undefined) next.locked = patch.locked;
+        if (patch.opacity !== undefined) {
+          next.opacity = clampOpacity(patch.opacity);
+        }
+        if (patch.name !== undefined) {
+          const name = patch.name.trim().slice(0, MAX_LAYER_NAME_CHARS);
+          if (name) next.name = name;
+          else delete next.name;
+        }
+        return next;
+      });
+      if (!changed) return;
+      set({
+        nodes: s.nodes.map((n) => (n.id === nodeId ? { ...n, layers } : n)),
+      });
+      scheduleSave();
+    },
+
+    removeLayer: (nodeId, layerId) => {
+      const s = get();
+      const node = s.nodes.find((n) => n.id === nodeId);
+      if (!node?.layers) return;
+      const target = node.layers.find((l) => l.id === layerId);
+      if (!target || target.locked) return;
+      const layers = node.layers.filter((l) => l.id !== layerId);
+      set({
+        nodes: s.nodes.map((n) => (n.id === nodeId ? { ...n, layers } : n)),
+      });
+      scheduleSave();
+    },
+
+    moveLayer: (nodeId, layerId, direction) => {
+      const s = get();
+      const node = s.nodes.find((n) => n.id === nodeId);
+      if (!node?.layers) return;
+      const index = node.layers.findIndex((l) => l.id === layerId);
+      const target = index + direction;
+      if (index < 0 || target < 0 || target >= node.layers.length) return;
+      if (node.layers[index].locked || node.layers[target].locked) return;
+      const layers = [...node.layers];
+      [layers[index], layers[target]] = [layers[target], layers[index]];
+      set({
+        nodes: s.nodes.map((n) => (n.id === nodeId ? { ...n, layers } : n)),
+      });
+      scheduleSave();
+    },
+
+    replaceNodeLayers: (nodeId, layers, historyId, clearRegions) => {
+      const s = get();
+      if (!s.nodes.some((n) => n.id === nodeId)) return;
+      const limited = layers.slice(0, MAX_LAYERS_PER_NODE);
+      const base =
+        historyId !== undefined && historyId > 0 ? historyId : undefined;
+      set({
+        nodes: s.nodes.map((n) => {
+          if (n.id !== nodeId) return n;
+          const next: CanvasNode = {
+            ...n,
+            layers: limited,
+            ...(base ? { historyId: base } : {}),
+          };
+          if (clearRegions) delete next.regions;
+          return next;
+        }),
+      });
+      scheduleSave();
+      const ids = limited.flatMap((l) =>
+        l.kind === "image" && l.historyId ? [l.historyId] : [],
+      );
+      if (base) ids.push(base);
+      if (ids.length > 0) void get().loadThumbs(ids);
+    },
+
+    addRegion: (nodeId, region) => {
+      const s = get();
+      const node = s.nodes.find((n) => n.id === nodeId);
+      if (!node) return null;
+      const regions = node.regions ?? [];
+      if (regions.length >= MAX_REGIONS_PER_NODE) {
+        toast(
+          i18n.t("每个节点最多 {{max}} 个区域", {
+            max: MAX_REGIONS_PER_NODE,
+          }),
+          "error",
+        );
+        return null;
+      }
+      const id = newId("r");
+      const next = [
+        ...regions,
+        {
+          ...region,
+          id,
+          prompt: region.prompt.slice(0, MAX_REGION_PROMPT_CHARS),
+          feather: Math.min(
+            MAX_REGION_FEATHER,
+            Math.max(0, Math.round(region.feather)),
+          ),
+        },
+      ];
+      set({
+        nodes: s.nodes.map((n) =>
+          n.id === nodeId ? { ...n, regions: next } : n,
+        ),
+      });
+      scheduleSave();
+      return id;
+    },
+
+    updateRegion: (nodeId, regionId, patch) => {
+      const s = get();
+      const node = s.nodes.find((n) => n.id === nodeId);
+      if (!node?.regions) return;
+      const regions = node.regions.map((r) => {
+        if (r.id !== regionId) return r;
+        const next = { ...r };
+        if (patch.prompt !== undefined) {
+          next.prompt = patch.prompt.slice(0, MAX_REGION_PROMPT_CHARS);
+        }
+        if (patch.feather !== undefined && Number.isFinite(patch.feather)) {
+          next.feather = Math.min(
+            MAX_REGION_FEATHER,
+            Math.max(0, Math.round(patch.feather)),
+          );
+        }
+        return next;
+      });
+      set({
+        nodes: s.nodes.map((n) => (n.id === nodeId ? { ...n, regions } : n)),
+      });
+      scheduleSave();
+    },
+
+    removeRegion: (nodeId, regionId) => {
+      const s = get();
+      const node = s.nodes.find((n) => n.id === nodeId);
+      if (!node?.regions) return;
+      const regions = node.regions.filter((r) => r.id !== regionId);
+      set({
+        nodes: s.nodes.map((n) => {
+          if (n.id !== nodeId) return n;
+          const next: CanvasNode = { ...n };
+          if (regions.length > 0) next.regions = regions;
+          else delete next.regions;
+          return next;
+        }),
+      });
+      scheduleSave();
+    },
+
+    markRegionApplied: (nodeId, regionId, appliedHistoryId, appliedLayerId) => {
+      const s = get();
+      const node = s.nodes.find((n) => n.id === nodeId);
+      if (!node?.regions) return;
+      const regions = node.regions.map((r) =>
+        r.id === regionId ? { ...r, appliedHistoryId, appliedLayerId } : r,
+      );
+      set({
+        nodes: s.nodes.map((n) => (n.id === nodeId ? { ...n, regions } : n)),
+      });
       scheduleSave();
     },
 
@@ -516,8 +990,12 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
           if (rows.length === 0) continue;
           set((s) => {
             const thumbs = { ...s.thumbs };
-            for (const row of rows) thumbs[row.historyId] = row.thumbUrl;
-            return { thumbs };
+            const gifIds = { ...s.gifIds };
+            for (const row of rows) {
+              thumbs[row.historyId] = row.thumbUrl;
+              if (row.gif) gifIds[row.historyId] = true;
+            }
+            return { thumbs, gifIds };
           });
         } catch {
           // 缩略图失败只影响节点显示，SafeImg 会给出占位；不打断画布操作。

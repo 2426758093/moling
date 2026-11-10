@@ -51,6 +51,49 @@ export interface ModelCaps {
   transform: boolean;
   maxSide: number;
   multiImage: boolean;
+  /** 是否支持 GIF 输出（GPT-Image-2.6 默认开启，其余需手动勾选） */
+  gif: boolean;
+  /** 该模型允许的最大 GIF 帧数（官方 16，网关可放宽） */
+  gifMaxFrames: number;
+}
+
+/** GIF 元数据：由 Rust 侧读取文件头得出，不落数据库 */
+export interface AnimationInfo {
+  width: number;
+  height: number;
+  frames: number;
+  /** 0 = 无限循环；playOnce 时为 1 */
+  loopCount: number;
+  /** 文件没有循环扩展，只播一遍 */
+  playOnce: boolean;
+  totalMs: number;
+  durationsMs: number[];
+  bytes: number;
+}
+
+export interface AnimationFramePreview {
+  index: number;
+  delayMs: number;
+  dataUrl: string;
+}
+
+export interface AnimationFrameImage extends AnimationFramePreview {
+  width: number;
+  height: number;
+}
+
+export interface AnimationSaveResult {
+  historyId: number;
+  dataUrl: string;
+  filePath: string;
+  animation: AnimationInfo;
+}
+
+export interface StickerResult extends AnimationSaveResult {
+  coverDataUrl: string;
+  preset: string;
+  maxBytes: number;
+  withinLimit: boolean;
 }
 
 export type AdapterError =
@@ -132,6 +175,8 @@ export interface HistoryItem {
   };
   /** 列表只带缩略图；下载/打包导出需按 id 取原图 */
   thumbUrl: string;
+  /** 动图元数据（列表接口按需填充；静态图为空） */
+  animation?: AnimationInfo | null;
 }
 
 export interface GeneratedImage {
@@ -281,6 +326,11 @@ export interface EnqueueJobInput {
   /** 已落盘（refs/）的参考图路径，按位置与 references 对齐 */
   referencePaths?: string[];
   references?: { role: ReferenceRole; strength: number }[];
+  /** GIF 动图参数；outputFormat 省略/png = 静态图 */
+  outputFormat?: "png" | "gif" | null;
+  frameCount?: number | null;
+  frameDurationMs?: number | null;
+  complexity?: "low" | "medium" | "high" | null;
 }
 
 /** 队列任务扩展参数（与后端 JobExtras 对应） */
@@ -288,6 +338,10 @@ export interface QueueJobExtras {
   referencePaths?: string[];
   references?: { role: ReferenceRole; strength: number }[];
   quality?: ImageQuality | null;
+  outputFormat?: "png" | "gif" | null;
+  frameCount?: number | null;
+  frameDurationMs?: number | null;
+  complexity?: "low" | "medium" | "high" | null;
 }
 
 export interface AvailableUpdate {
@@ -386,6 +440,8 @@ export interface CanvasBoard extends CanvasBoardMeta {
 export interface CanvasThumb {
   historyId: number;
   thumbUrl: string;
+  /** 源文件是 GIF（缩略图仍是首帧静态图） */
+  gif?: boolean;
 }
 
 export const api = {
@@ -445,18 +501,25 @@ export const api = {
     count: number;
     /** 图片质量；auto/省略 = 不发送 quality 字段 */
     quality?: ImageQuality | null;
+    /** "gif" = 动图；省略/png = 静态图 */
+    outputFormat?: "png" | "gif" | null;
+    frameCount?: number | null;
+    frameDurationMs?: number | null;
+    complexity?: "low" | "medium" | "high" | null;
     images?: string[];
     /// 与 images 按位置对应；只在专家模式下发（省略即不追加角色说明）
     references?: { role: ReferenceRole; strength: number }[];
     // 生成任务 id：stop() 用它调用 cancel_generation 中断在途生成
     jobId?: string;
   }) =>
-    invoke<{ images: GeneratedImage[]; cancelled?: boolean }>(
-      "generate_images",
-      {
-        input,
-      },
-    ),
+    invoke<{
+      images: GeneratedImage[];
+      cancelled?: boolean;
+      /** 服务商静默退回静图 / 少给帧数时的提示 */
+      warnings?: string[];
+    }>("generate_images", {
+      input,
+    }),
   // 请求后端中断指定生成任务：仅尽力而为，cmd 未落地/失败时前端忽略
   cancelGeneration: (jobId: string) =>
     invoke<void>("cancel_generation", { jobId }),
@@ -469,16 +532,20 @@ export const api = {
     maskB64?: string | null;
     width: number;
     height: number;
-    /** edit | erase | outpaint（血统用；缺省按后端推断） */
-    op?: "edit" | "erase" | "outpaint";
+    /** edit | erase | outpaint | anim-frame（血统用；缺省按后端推断） */
+    op?: "edit" | "erase" | "outpaint" | "anim-frame";
     /** 原图记录 id */
     parentId?: number | null;
+    /** "png" = 结果必须可被本地位图管线解码（单帧修复）；省略即常规编辑 */
+    outputFormat?: "png" | "gif" | null;
   }) =>
     invoke<{
       historyId: number;
       dataUrl: string;
       filePath: string;
       op: string;
+      /** 请求动图但服务商返回静图 / 帧数不符时的提示 */
+      warning?: string | null;
     }>("edit_image", { input }),
   /** 高清放大 / 风格转换：scale=1 且带 prompt 为风格转换 */
   transformImage: (input: {
@@ -609,6 +676,59 @@ export const api = {
     invoke<void>("write_text_file", { dest, content }),
   writeFileBase64: (dest: string, data: string) =>
     invoke<void>("write_file_base64", { dest, data }),
+  /** 动图元数据（帧数 / 逐帧时长 / 循环 / 体积），不解码像素 */
+  getAnimationInfo: (historyId: number) =>
+    invoke<AnimationInfo>("get_animation_info", { historyId }),
+  /** 时间轴缩略图（默认 maxEdge=160） */
+  getAnimationFrames: (historyId: number, maxEdge?: number) =>
+    invoke<AnimationFramePreview[]>("get_animation_frames", {
+      historyId,
+      maxEdge,
+    }),
+  /** 全尺寸单帧（单帧修复底图） */
+  getAnimationFrame: (historyId: number, index: number) =>
+    invoke<AnimationFrameImage>("get_animation_frame", { historyId, index }),
+  optimizeAnimation: (historyId: number, targetBytes: number) =>
+    invoke<AnimationSaveResult & { targetBytes: number; reached: boolean }>(
+      "optimize_animation",
+      { historyId, targetBytes },
+    ),
+  replaceAnimationFrame: (historyId: number, index: number, dataUrl: string) =>
+    invoke<AnimationSaveResult & { index: number }>("replace_animation_frame", {
+      historyId,
+      index,
+      dataUrl,
+    }),
+  exportAnimationZip: (
+    historyId: number,
+    mode: "gif" | "png-sequence",
+    dest: string,
+  ) =>
+    invoke<{ files: string[]; path: string; animation: AnimationInfo }>(
+      "export_animation_zip",
+      { historyId, mode, dest },
+    ),
+  exportSticker: (historyId: number, preset: string) =>
+    invoke<StickerResult>("export_sticker", { historyId, preset }),
+  /** 本地重编码：按 order 重排 / 删帧 / 复制帧，套用逐帧时长与循环开关 */
+  composeAnimation: (
+    historyId: number,
+    order: number[],
+    delaysMs: number[],
+    loopPlay: boolean,
+  ) =>
+    invoke<AnimationSaveResult>("compose_animation", {
+      historyId,
+      order,
+      delaysMs,
+      loopPlay,
+    }),
+  /** 转静图：首帧另存为 PNG 新记录（GIF 节点上被置灰的静图编辑走这里） */
+  convertAnimationToStatic: (historyId: number) =>
+    invoke<{ historyId: number; dataUrl: string; filePath: string }>(
+      "convert_animation_to_static",
+      { historyId },
+    ),
   /** 画廊记录元信息（画布节点复用参数 / 编辑浮层提示词） */
   getHistoryItem: (id: number) =>
     invoke<HistoryItem["history"] | null>("get_history_item", { id }),
@@ -787,7 +907,99 @@ export const api = {
   /** 画布节点缩略图：一次最多 200 个 id，缺失文件跳过 */
   batchHistoryThumbs: (ids: number[]) =>
     invoke<CanvasThumb[]>("batch_history_thumbs", { ids }),
+  /** 画布蒙版 / 图层资产落盘（媒体根 images/），返回绝对路径 */
+  saveCanvasLayerAsset: (dataUrl: string) =>
+    invoke<{ path: string }>("save_canvas_layer_asset", { dataUrl }),
+  /** 读取媒体根内的图片资产为 data URL（路径越界会被拒绝） */
+  readMediaImage: (path: string) =>
+    invoke<{ dataUrl: string }>("read_media_image", { path }),
+  /** 按图层栈合成节点预览（可选降采样） */
+  composeCanvasNode: (input: ComposeNodeInput) =>
+    invoke<{ dataUrl: string; width: number; height: number }>(
+      "compose_canvas_node",
+      { input },
+    ),
+  /** 合成并入库为新的派生图（op="flatten"），返回 history */
+  flattenCanvasNode: (input: ComposeNodeInput) =>
+    invoke<{
+      historyId: number;
+      dataUrl: string;
+      filePath: string;
+      width: number;
+      height: number;
+      op: string;
+      parentId: number | null;
+    }>("flatten_canvas_node", { input }),
+  /** 分区重绘：逐区调用服务商并本地合成，逐区计费、不自动重试 */
+  regionEditBatch: (input: RegionBatchInput) =>
+    invoke<RegionBatchResult>("region_edit_batch", { input }),
 };
+
+/** 单个重绘区域：蒙版为全尺寸 alpha-hole PNG（透明 = 要重绘） */
+export interface RegionBatchItemPayload {
+  id: string;
+  prompt: string;
+  maskB64: string;
+  feather?: number;
+}
+
+export interface RegionBatchInput {
+  providerId: number;
+  model: string;
+  negativePrompt?: string | null;
+  baseHistoryId: number;
+  /** 节点当前合成画面（全尺寸 data URL） */
+  baseB64: string;
+  jobId?: string | null;
+  regions: RegionBatchItemPayload[];
+}
+
+export interface RegionBatchResultItem {
+  id: string;
+  ok: boolean;
+  error?: string;
+  historyId?: number;
+  dataUrl?: string;
+  filePath?: string;
+}
+
+export interface RegionBatchResult {
+  groupId: string;
+  results: RegionBatchResultItem[];
+  cancelled: boolean;
+  anySucceeded: boolean;
+  historyId: number | null;
+  dataUrl: string | null;
+}
+
+/** `image:region-progress` 事件载荷 */
+export interface RegionProgressEvent {
+  groupId: string;
+  index: number;
+  done: number;
+  total: number;
+  regionId?: string;
+  ok?: boolean;
+  historyId?: number;
+}
+
+/** 合成图层入参（与 Rust `ComposeLayerInput` 对齐） */
+export interface ComposeLayerPayload {
+  historyId?: number;
+  path?: string;
+  visible: boolean;
+  opacity: number;
+  maskPath?: string;
+  feather?: number;
+  regionId?: string;
+}
+
+export interface ComposeNodeInput {
+  baseHistoryId: number;
+  layers: ComposeLayerPayload[];
+  /** 预览用最长边；缺省按原尺寸输出 */
+  maxEdge?: number;
+}
 
 export interface PromptTemplate {
   id: string;

@@ -8,17 +8,29 @@ import {
 import { motion, AnimatePresence } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import { useChatStore } from "../stores/chatStore";
-import { useAppStore, SIZE_MIN, SIZE_MAX } from "../stores/appStore";
+import {
+  useAppStore,
+  SIZE_MIN,
+  SIZE_MAX,
+  type GenPrefs,
+} from "../stores/appStore";
 import { useProviderStore } from "../stores/providerStore";
 import { useQueueStore } from "../stores/queueStore";
 import {
   RATIO_OPTIONS,
-  QUALITY_OPTIONS,
+  COMPLEXITY_OPTIONS,
+  GIF_FRAME_MIN,
+  GIF_FRAME_MAX,
+  GIF_FRAME_MS_MIN,
+  GIF_FRAME_MS_MAX,
   qualityLabel,
+  qualityOptionsFor,
   REFERENCE_ROLES,
   DEFAULT_REFERENCE_STRENGTH,
   ReferenceRole,
   ImageQuality,
+  OutputFormat,
+  GifComplexity,
 } from "../lib/types";
 import { api } from "../lib/api";
 import { validateImageFile } from "../lib/file";
@@ -129,6 +141,96 @@ function CustomSizeRow({
       <div className="mt-1.5 text-caption text-tertiary">
         {t("512–4096，自动对齐到 8 的倍数")}
       </div>
+    </div>
+  );
+}
+
+/// 动图参数：帧数 / 逐帧时长 / 复杂度，只在「动图」输出时展开
+function GifPanel({
+  prefs,
+  maxFrames,
+  onChange,
+}: {
+  prefs: GenPrefs;
+  maxFrames: number;
+  onChange: (patch: Partial<GenPrefs>) => void;
+}) {
+  const { t } = useTranslation();
+  const framesMax = Math.min(
+    GIF_FRAME_MAX,
+    Math.max(GIF_FRAME_MIN, maxFrames || GIF_FRAME_MAX),
+  );
+  return (
+    <div className="mt-3 space-y-2.5 border-t border-separator pt-2.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-subhead text-secondary">{t("帧数")}</span>
+        <Input
+          type="number"
+          inputMode="numeric"
+          min={GIF_FRAME_MIN}
+          max={framesMax}
+          step={1}
+          value={prefs.frameCount}
+          onChange={(e) => {
+            const n = Number(e.target.value);
+            if (!Number.isFinite(n)) return;
+            onChange({
+              frameCount: Math.min(
+                framesMax,
+                Math.max(GIF_FRAME_MIN, Math.round(n)),
+              ),
+            });
+          }}
+          aria-label={t("动图帧数")}
+          compact
+          widthClass="w-16"
+        />
+      </div>
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-subhead text-secondary">{t("每帧时长")}</span>
+        <div className="flex items-center gap-1">
+          <Input
+            type="number"
+            inputMode="numeric"
+            min={GIF_FRAME_MS_MIN}
+            max={GIF_FRAME_MS_MAX}
+            step={10}
+            value={prefs.frameDurationMs}
+            onChange={(e) => {
+              const n = Number(e.target.value);
+              if (!Number.isFinite(n)) return;
+              const clamped = Math.min(
+                GIF_FRAME_MS_MAX,
+                Math.max(GIF_FRAME_MS_MIN, n),
+              );
+              onChange({ frameDurationMs: Math.round(clamped / 10) * 10 });
+            }}
+            aria-label={t("每帧时长（毫秒）")}
+            compact
+            widthClass="w-16"
+          />
+          <span className="text-caption text-tertiary">ms</span>
+        </div>
+      </div>
+      <div>
+        <div className="mb-1.5 text-subhead text-secondary">{t("复杂度")}</div>
+        <SegmentedControl
+          value={prefs.complexity}
+          onValueChange={(v) => onChange({ complexity: v as GifComplexity })}
+          label={t("动图复杂度")}
+          size="sm"
+          block
+          options={COMPLEXITY_OPTIONS.map((c) => ({
+            value: c.id,
+            label: t(c.label, c.label),
+          }))}
+        />
+      </div>
+      <p className="text-caption text-tertiary">
+        {t(
+          "20–2000ms，按 10ms 取整；GIF 按 token 计费，需模型开通预览权限，且不支持蒙版编辑。",
+        )}
+      </p>
     </div>
   );
 }
@@ -290,6 +392,12 @@ export default function Composer() {
   const selectedProvider = providers.find(
     (p) => p.provider.id === defaultProviderId,
   );
+  const modelName = selectedProvider?.provider.defaultModel ?? "";
+  // 极高 / 最高只有 GPT-Image-2.6 认，其余模型保持四档
+  const qualityChoices = qualityOptionsFor(modelName);
+  const qualityValue = qualityChoices.some((q) => q.id === prefs.quality)
+    ? prefs.quality
+    : "auto";
   const samplingAvailable = selectedProvider?.provider.kind === "openai";
   const samplingActive = SAMPLING_KEYS.some(
     (k) =>
@@ -504,6 +612,10 @@ export default function Composer() {
       toast(t("请先在「设置」中配置绘图服务商与模型"), "error");
       return;
     }
+    if (prefs.outputFormat === "gif" && !caps.gif) {
+      toast(t("当前模型未开通 GIF 输出，请切换模型或改回静态图"), "error");
+      return;
+    }
     setEnqueuing(true);
     try {
       const referencePaths = await Promise.all(
@@ -519,6 +631,11 @@ export default function Composer() {
         height: prefs.height,
         count: prefs.count,
         quality: prefs.quality === "auto" ? null : prefs.quality,
+        outputFormat: prefs.outputFormat === "gif" ? "gif" : null,
+        frameCount: prefs.outputFormat === "gif" ? prefs.frameCount : null,
+        frameDurationMs:
+          prefs.outputFormat === "gif" ? prefs.frameDurationMs : null,
+        complexity: prefs.outputFormat === "gif" ? prefs.complexity : null,
         referencePaths,
         references:
           mode === "expert" && atts.length > 0
@@ -830,8 +947,62 @@ export default function Composer() {
                     label: t("{{n}} 张", { n }),
                   }))}
                 />
+                {prefs.outputFormat === "gif" && prefs.count > 1 && (
+                  <div className="mt-2 text-caption text-tertiary">
+                    {t("动图模式下每个数量都会单独调用一次，费用 ×{{n}}", {
+                      n: prefs.count,
+                    })}
+                  </div>
+                )}
               </div>
             </Popover>
+
+            {caps.gif && (
+              <Popover
+                side="top"
+                align="start"
+                trigger={
+                  <button className={CHIP} aria-label={t("输出格式")}>
+                    {prefs.outputFormat === "gif" ? t("动图") : t("静态图")}
+                    {prefs.outputFormat === "gif" && (
+                      <span className="text-quaternary">·</span>
+                    )}
+                    {prefs.outputFormat === "gif" && (
+                      <span className="tabular-nums">
+                        {prefs.frameCount}×{prefs.frameDurationMs}ms
+                      </span>
+                    )}
+                    <IconChevron size={10} direction="down" />
+                  </button>
+                }
+              >
+                <div className="w-64">
+                  <div className="mb-2 text-footnote font-medium text-tertiary">
+                    {t("输出格式")}
+                  </div>
+                  <SegmentedControl
+                    value={prefs.outputFormat}
+                    onValueChange={(v) =>
+                      setPrefs({ outputFormat: v as OutputFormat })
+                    }
+                    label={t("输出格式")}
+                    size="sm"
+                    block
+                    options={[
+                      { value: "png", label: t("静态图") },
+                      { value: "gif", label: t("动图") },
+                    ]}
+                  />
+                  {prefs.outputFormat === "gif" && (
+                    <GifPanel
+                      prefs={prefs}
+                      maxFrames={caps.gifMaxFrames}
+                      onChange={(patch) => setPrefs(patch)}
+                    />
+                  )}
+                </div>
+              </Popover>
+            )}
 
             <Popover
               side="top"
@@ -848,20 +1019,22 @@ export default function Composer() {
                   {t("图片质量")}
                 </div>
                 <SegmentedControl
-                  value={prefs.quality}
+                  value={qualityValue}
                   onValueChange={(v) =>
                     setPrefs({ quality: v as ImageQuality })
                   }
                   label={t("图片质量")}
                   size="sm"
                   block
-                  options={QUALITY_OPTIONS.map((q) => ({
+                  options={qualityChoices.map((q) => ({
                     value: q.id,
                     label: t(q.label, q.label),
                   }))}
                 />
                 <div className="mt-2 text-caption text-tertiary">
-                  {t("自动不发送质量参数；低 / 中 / 高需要服务商支持")}
+                  {t(
+                    "自动不发送质量参数；低 / 中 / 高 / 极高 / 最高需要服务商支持",
+                  )}
                 </div>
               </div>
             </Popover>

@@ -10,6 +10,10 @@ pub struct ModelCaps {
     pub transform: bool,
     pub max_side: u32,
     pub multi_image: bool,
+    /// 是否支持 GIF 输出（gpt-image-2.6 系列默认开，其余需手动勾选）
+    pub gif: bool,
+    /// GIF 帧数上限：直连 OpenAI 为 16，网关放宽时用户可自行上调
+    pub gif_max_frames: u32,
 }
 
 impl Default for ModelCaps {
@@ -20,6 +24,8 @@ impl Default for ModelCaps {
             transform: true,
             max_side: 1024,
             multi_image: true,
+            gif: false,
+            gif_max_frames: 16,
         }
     }
 }
@@ -31,6 +37,10 @@ pub fn heuristic_caps(model: &str) -> ModelCaps {
     // OpenAI 图像接口没有标准负向字段（ADR #3），界面不展示负向输入
     if m.contains("dall-e") || m.contains("gpt-image") {
         caps.negative = false;
+    }
+    // 只有 gpt-image-2.6 系列在服务端打开了 GIF 输出（flare / sunburst 两个型号）
+    if m.contains("gpt-image-2.6") {
+        caps.gif = true;
     }
     caps
 }
@@ -126,6 +136,19 @@ mod tests {
         assert_eq!(caps, ModelCaps::default());
         assert_eq!(caps.max_side, 1024);
         assert!(caps.multi_image, "缺省允许多参考图，与当前行为一致");
+        assert!(!caps.gif, "未知模型不默认打开动图");
+        assert_eq!(caps.gif_max_frames, 16);
+    }
+
+    /// gpt-image-2.6 两个型号默认开 GIF，其它 gpt-image 不开；上限固定 16
+    #[test]
+    fn heuristic_enables_gif_only_for_2_6() {
+        let flare = heuristic_caps("gpt-image-2.6-flare");
+        assert!(flare.gif);
+        assert_eq!(flare.gif_max_frames, 16);
+        assert!(heuristic_caps("gpt-image-2.6-sunburst").gif);
+        assert!(!heuristic_caps("gpt-image-1").gif);
+        assert!(!heuristic_caps("dall-e-3").gif);
     }
 
     /// 旧覆盖值缺字段时按默认补齐，不 panic、不收紧能力

@@ -163,10 +163,18 @@ pub struct WorkflowPreset {
     pub updated_at: String,
 }
 
-/// 画布上限：JSON 2MB / 500 节点，避免一次保存把 SQLite 与 IPC 拖垮。
+/// 画布上限：JSON 8MB / 500 节点，避免一次保存把 SQLite 与 IPC 拖垮。
+/// v2 文档带图层与分区，2MB 在多节点多图层时会不够（见 ADR 37）。
 pub const MAX_CANVAS_NODES: usize = 500;
-pub const MAX_CANVAS_JSON_BYTES: usize = 2 * 1024 * 1024;
+pub const MAX_CANVAS_JSON_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CANVAS_NAME_CHARS: usize = 80;
+pub const MAX_CANVAS_LAYERS_PER_NODE: usize = 24;
+pub const MAX_CANVAS_LAYERS: usize = 3000;
+pub const MAX_CANVAS_REGIONS_PER_NODE: usize = 8;
+pub const MAX_CANVAS_REGION_FEATHER: f64 = 128.0;
+pub const MAX_CANVAS_LAYER_PATH: usize = 1024;
+pub const MAX_CANVAS_REGION_PROMPT: usize = 2000;
+pub const MAX_CANVAS_LAYER_NAME: usize = 80;
 
 pub const CANVAS_DEFAULT_DATA: &str =
     r#"{"version":1,"nodes":[],"edges":[],"viewport":{"x":0,"y":0,"zoom":1}}"#;
@@ -430,6 +438,12 @@ const IMAGE_REQUESTS_SQL: &str = "
         ALTER TABLE messages ADD COLUMN error TEXT;
 ";
 
+/// 迁移 014：画布 v1→v2 快照。旧版打开 v2 文档只会保留节点而丢掉图层，
+/// 首次以 v2 覆盖保存前把上一版文档留在这里，必要时可手工回退。
+const CANVAS_PREV_SQL: &str = "
+        ALTER TABLE canvas_boards ADD COLUMN data_json_prev TEXT NOT NULL DEFAULT '';
+";
+
 const MIGRATIONS: &[(&str, &str)] = &[
     ("001_tables", SCHEMA_SQL),
     ("002_indexes", INDEXES_SQL),
@@ -444,6 +458,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("011_jobs_heartbeat", JOBS_HEARTBEAT_SQL),
     ("012_provider_timeout_default", PROVIDER_TIMEOUT_DEFAULT_SQL),
     ("013_image_requests", IMAGE_REQUESTS_SQL),
+    ("014_canvas_prev", CANVAS_PREV_SQL),
 ];
 
 /// 当前 schema 版本 = 迁移条数
@@ -2594,17 +2609,27 @@ fn validate_canvas_name(name: &str) -> AppResult<&str> {
     Ok(name)
 }
 
-/// 画布数据校验：节点 id 唯一、边只引用已存在的节点、视口数值有限。
-/// 只校验结构与引用关系，不约束节点业务字段（局部重绘等参数由编辑器自己校验）。
+/// 画布数据校验：节点 id 唯一、边只引用已存在的节点、视口数值有限；
+/// v2 额外约束图层/区域形状与上限。宽进严出：宁可拒绝一次保存，也不把
+/// 坏数据写成下次启动打不开的画布。
 fn validate_canvas_data(raw: &str) -> AppResult<()> {
     if raw.len() > MAX_CANVAS_JSON_BYTES {
-        return Err(AppError::Other("画布数据过大（上限 2MB）".into()));
+        return Err(AppError::Other("画布数据过大（上限 8MB）".into()));
     }
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|_| AppError::Other("画布数据不是合法 JSON".into()))?;
     let obj = value
         .as_object()
         .ok_or_else(|| AppError::Other("画布数据必须是 JSON 对象".into()))?;
+
+    if let Some(version) = obj.get("version") {
+        let version = version
+            .as_i64()
+            .ok_or_else(|| AppError::Other("画布版本号必须是整数".into()))?;
+        if version != 1 && version != 2 {
+            return Err(AppError::Other(format!("不支持的画布版本 {version}")));
+        }
+    }
 
     let nodes = obj
         .get("nodes")
@@ -2616,6 +2641,7 @@ fn validate_canvas_data(raw: &str) -> AppResult<()> {
         )));
     }
     let mut ids = HashSet::new();
+    let mut total_layers = 0usize;
     for node in nodes {
         let node = node
             .as_object()
@@ -2628,6 +2654,13 @@ fn validate_canvas_data(raw: &str) -> AppResult<()> {
         if !ids.insert(id) {
             return Err(AppError::Other("画布节点 id 不能重复".into()));
         }
+        total_layers += validate_canvas_layers(node)?;
+        if total_layers > MAX_CANVAS_LAYERS {
+            return Err(AppError::Other(format!(
+                "画布图层总数不能超过 {MAX_CANVAS_LAYERS}"
+            )));
+        }
+        validate_canvas_regions(node)?;
     }
 
     let edges = obj
@@ -2662,6 +2695,108 @@ fn validate_canvas_data(raw: &str) -> AppResult<()> {
             .ok_or_else(|| AppError::Other(format!("画布视口缺少数值 {key}")))?;
         if !value.is_finite() {
             return Err(AppError::Other(format!("画布视口 {key} 必须是有限数值")));
+        }
+    }
+    Ok(())
+}
+
+/// 校验节点图层，返回该节点层数（用于画布总数上限）
+fn validate_canvas_layers(node: &serde_json::Map<String, serde_json::Value>) -> AppResult<usize> {
+    let Some(layers) = node.get("layers") else {
+        return Ok(0);
+    };
+    let layers = layers
+        .as_array()
+        .ok_or_else(|| AppError::Other("图层必须是数组".into()))?;
+    if layers.len() > MAX_CANVAS_LAYERS_PER_NODE {
+        return Err(AppError::Other(format!(
+            "每个节点的图层不能超过 {MAX_CANVAS_LAYERS_PER_NODE} 层"
+        )));
+    }
+    for layer in layers {
+        let layer = layer
+            .as_object()
+            .ok_or_else(|| AppError::Other("图层必须是对象".into()))?;
+        let id = layer.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if id.trim().is_empty() {
+            return Err(AppError::Other("图层缺少有效 id".into()));
+        }
+        let kind = layer.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        if kind != "image" && kind != "mask" {
+            return Err(AppError::Other("图层 kind 必须是 image 或 mask".into()));
+        }
+        if kind == "mask" {
+            let path = layer.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let path = path.trim();
+            if path.is_empty() || path.chars().count() > MAX_CANVAS_LAYER_PATH {
+                return Err(AppError::Other("蒙版层缺少有效路径".into()));
+            }
+        } else {
+            match layer.get("historyId").and_then(|v| v.as_i64()) {
+                Some(id) if id > 0 => {}
+                _ => return Err(AppError::Other("图像层缺少有效 historyId".into())),
+            }
+        }
+        if let Some(opacity) = layer.get("opacity") {
+            let opacity = opacity
+                .as_f64()
+                .ok_or_else(|| AppError::Other("图层不透明度必须是数值".into()))?;
+            if !(0.0..=1.0).contains(&opacity) {
+                return Err(AppError::Other("图层不透明度必须在 0 到 1 之间".into()));
+            }
+        }
+        if let Some(name) = layer.get("name").and_then(|v| v.as_str()) {
+            if name.chars().count() > MAX_CANVAS_LAYER_NAME {
+                return Err(AppError::Other("图层名称过长".into()));
+            }
+        }
+    }
+    Ok(layers.len())
+}
+
+/// 校验节点的分区列表（提示词、蒙版路径、羽化范围）
+fn validate_canvas_regions(node: &serde_json::Map<String, serde_json::Value>) -> AppResult<()> {
+    let Some(regions) = node.get("regions") else {
+        return Ok(());
+    };
+    let regions = regions
+        .as_array()
+        .ok_or_else(|| AppError::Other("分区必须是数组".into()))?;
+    if regions.len() > MAX_CANVAS_REGIONS_PER_NODE {
+        return Err(AppError::Other(format!(
+            "每个节点最多 {MAX_CANVAS_REGIONS_PER_NODE} 个分区"
+        )));
+    }
+    for region in regions {
+        let region = region
+            .as_object()
+            .ok_or_else(|| AppError::Other("分区必须是对象".into()))?;
+        let id = region.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if id.trim().is_empty() {
+            return Err(AppError::Other("分区缺少有效 id".into()));
+        }
+        let mask_path = region
+            .get("maskPath")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let mask_path = mask_path.trim();
+        if mask_path.is_empty() || mask_path.chars().count() > MAX_CANVAS_LAYER_PATH {
+            return Err(AppError::Other("分区缺少有效蒙版路径".into()));
+        }
+        if let Some(prompt) = region.get("prompt").and_then(|v| v.as_str()) {
+            if prompt.chars().count() > MAX_CANVAS_REGION_PROMPT {
+                return Err(AppError::Other("分区提示词过长".into()));
+            }
+        }
+        if let Some(feather) = region.get("feather") {
+            let feather = feather
+                .as_f64()
+                .ok_or_else(|| AppError::Other("分区羽化必须是数值".into()))?;
+            if !(0.0..=MAX_CANVAS_REGION_FEATHER).contains(&feather) {
+                return Err(AppError::Other(format!(
+                    "分区羽化必须在 0 到 {MAX_CANVAS_REGION_FEATHER} 之间"
+                )));
+            }
         }
     }
     Ok(())
@@ -2726,8 +2861,20 @@ pub(crate) fn save_canvas_board_in(
 ) -> AppResult<CanvasBoard> {
     let name = validate_canvas_name(name)?;
     validate_canvas_data(data_json)?;
+    // 首次用 v2 覆盖 v1 文档前留一份快照（只留一次，后续保存不覆盖）
     let changed = c.execute(
-        "UPDATE canvas_boards SET name = ?2, data_json = ?3, updated_at = ?4 WHERE id = ?1",
+        "UPDATE canvas_boards
+            SET name = ?2, data_json = ?3, updated_at = ?4,
+                data_json_prev = CASE
+                    WHEN data_json_prev = ''
+                     AND NOT (
+                        json_valid(data_json)
+                        AND json_extract(data_json, '$.version') = 2
+                     )
+                    THEN data_json
+                    ELSE data_json_prev
+                END
+          WHERE id = ?1",
         params![id, name, data_json, timestamp_millis()],
     )?;
     if changed == 0 {
@@ -2793,7 +2940,8 @@ pub(crate) fn normalize_path_key(p: &str) -> String {
 
 /// 引用集合 = `history.file_path` ∪ `messages.images_json[].path`
 /// ∪ `jobs.images_json[].path` ∪ `jobs.input_json.referencePaths`
-/// ∪ `workflow_presets.refs_json[].path`。
+/// ∪ `workflow_presets.refs_json[].path`
+/// ∪ 画布 JSON 的 `nodes[].layers[].path` 与 `nodes[].regions[].maskPath`。
 ///
 /// 用 JSON 结构化解析而不是 LIKE：JSON 里的 Windows 路径是转义双反斜杠，
 /// LIKE 匹配不上；子串匹配还会让 `a.png` 命中 `xa.png`。
@@ -2826,6 +2974,22 @@ pub(crate) fn collect_referenced_paths_in(c: &Connection) -> AppResult<HashSet<S
         JOIN json_each(CASE WHEN json_valid(p.refs_json)
                             THEN p.refs_json ELSE '[]' END) AS r
         WHERE r.type = 'object' AND json_type(r.value, '$.path') = 'text'
+        UNION
+        SELECT json_extract(l.value, '$.path')
+        FROM canvas_boards b
+        JOIN json_each(CASE WHEN json_valid(b.data_json)
+                            THEN b.data_json ELSE '{}' END, '$.nodes') AS n
+        JOIN json_each(CASE WHEN json_type(n.value, '$.layers') = 'array'
+                            THEN json_extract(n.value, '$.layers') ELSE '[]' END) AS l
+        WHERE l.type = 'object' AND json_type(l.value, '$.path') = 'text'
+        UNION
+        SELECT json_extract(g.value, '$.maskPath')
+        FROM canvas_boards b
+        JOIN json_each(CASE WHEN json_valid(b.data_json)
+                            THEN b.data_json ELSE '{}' END, '$.nodes') AS n
+        JOIN json_each(CASE WHEN json_type(n.value, '$.regions') = 'array'
+                            THEN json_extract(n.value, '$.regions') ELSE '[]' END) AS g
+        WHERE g.type = 'object' AND json_type(g.value, '$.maskPath') = 'text'
     ";
     let mut stmt = c.prepare(SQL)?;
     let rows = stmt.query_map([], |r| r.get::<_, Option<String>>(0))?;
@@ -2959,7 +3123,54 @@ fn rewrite_job_inputs(tx: &Connection, old_key: &str, new_root: &str) -> AppResu
     Ok(changed)
 }
 
-/// 媒体根搬家后的路径改写：覆盖库中全部 5 处引用，单事务提交。
+/// 改写 `canvas_boards.data_json` 里图层蒙版与分区蒙版路径（第 6 处引用）
+fn rewrite_canvas_media_paths(tx: &Connection, old_key: &str, new_root: &str) -> AppResult<usize> {
+    let rows: Vec<(i64, String)> = {
+        let mut stmt =
+            tx.prepare("SELECT id, data_json FROM canvas_boards WHERE data_json <> ''")?;
+        let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        mapped.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    let mut changed = 0usize;
+    for (id, raw) in rows {
+        let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let Some(nodes) = value.get_mut("nodes").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+        let mut touched = 0usize;
+        for node in nodes.iter_mut() {
+            for (field, key) in [("layers", "path"), ("regions", "maskPath")] {
+                let Some(items) = node.get_mut(field).and_then(|v| v.as_array_mut()) else {
+                    continue;
+                };
+                for item in items.iter_mut() {
+                    let Some(path) = item.get(key).and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    if let Some(next) = rewrite_path(path, old_key, new_root) {
+                        if let Some(obj) = item.as_object_mut() {
+                            obj.insert(key.into(), next.into());
+                            touched += 1;
+                        }
+                    }
+                }
+            }
+        }
+        if touched == 0 {
+            continue;
+        }
+        tx.execute(
+            "UPDATE canvas_boards SET data_json = ?1 WHERE id = ?2",
+            params![json_string(&value)?, id],
+        )?;
+        changed += touched;
+    }
+    Ok(changed)
+}
+
+/// 媒体根搬家后的路径改写：覆盖库中全部 6 处引用，单事务提交。
 ///
 /// 只改写落在旧根下的路径（前缀按目录边界比较，`images2` 不会被 `images` 命中）；
 /// 对已经是新根的库再次调用不会产生任何变更，可安全重试。
@@ -3003,6 +3214,9 @@ pub(crate) fn rewrite_media_root_in(c: &Connection, old: &Path, new: &Path) -> A
 
     // 4) jobs.input_json.referencePaths
     changed += rewrite_job_inputs(&tx, &old_key, &new_root)?;
+
+    // 6) canvas_boards.data_json 图层与分区蒙版
+    changed += rewrite_canvas_media_paths(&tx, &old_key, &new_root)?;
 
     tx.commit()?;
     Ok(changed)
@@ -4863,6 +5077,186 @@ mod tests {
 
         // 幂等：再跑一次不应有任何变更
         assert_eq!(rewrite_media_root_in(&c, old, new).unwrap(), 0);
+    }
+
+    /// 迁移 014：从 v13 升级后画布表多出 data_json_prev，且默认空串
+    #[test]
+    fn migration_014_adds_canvas_prev_column() {
+        let mut c = Connection::open_in_memory().unwrap();
+        apply_migrations_with(&mut c, &MIGRATIONS[..13]).unwrap();
+        assert_eq!(user_version_of(&c), 13);
+        let before: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('canvas_boards') WHERE name = 'data_json_prev'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 0);
+
+        apply_migrations(&mut c).unwrap();
+        assert_eq!(user_version_of(&c), MIGRATIONS.len() as i64);
+        let after: i64 = c
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('canvas_boards') WHERE name = 'data_json_prev'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after, 1);
+
+        let board = create_canvas_board_in(&c, "升级后").unwrap();
+        let prev: String = c
+            .query_row(
+                "SELECT data_json_prev FROM canvas_boards WHERE id = ?1",
+                params![board.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(prev.is_empty(), "新画布不应有旧版快照");
+    }
+
+    /// v1→v2 首次覆盖前只留一次 data_json_prev，后续保存不再覆盖
+    #[test]
+    fn canvas_prev_snapshot_is_written_once() {
+        let c = mem_conn();
+        let board = create_canvas_board_in(&c, "快照").unwrap();
+        let prev_of = |c: &Connection| -> String {
+            c.query_row(
+                "SELECT data_json_prev FROM canvas_boards WHERE id = ?1",
+                params![board.id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(prev_of(&c).is_empty());
+
+        let v1 = r#"{"version":1,"nodes":[{"id":"n1","historyId":3,"x":0,"y":0,"width":220}],"edges":[],"viewport":{"x":0,"y":0,"zoom":1}}"#;
+        save_canvas_board_in(&c, board.id, "v1", v1).unwrap();
+        assert_eq!(prev_of(&c), CANVAS_DEFAULT_DATA, "首次保存留下旧文档");
+
+        let v2 = r#"{"version":2,"nodes":[{"id":"n1","historyId":3,"x":0,"y":0,"width":220,"layers":[{"id":"l1","kind":"image","historyId":4,"visible":true,"opacity":1,"locked":false}]}],"edges":[],"viewport":{"x":0,"y":0,"zoom":1}}"#;
+        save_canvas_board_in(&c, board.id, "v2", v2).unwrap();
+        assert_eq!(prev_of(&c), CANVAS_DEFAULT_DATA, "v2 保存不覆盖快照");
+
+        save_canvas_board_in(&c, board.id, "again", v1).unwrap();
+        assert_eq!(prev_of(&c), CANVAS_DEFAULT_DATA, "快照只留一次");
+    }
+
+    /// v2 图层/分区的边界校验：版本、层数、蒙版路径、不透明度、羽化、分区数
+    #[test]
+    fn canvas_v2_validation_boundaries() {
+        let c = mem_conn();
+        let board = create_canvas_board_in(&c, "v2 校验").unwrap();
+        let wrap = |nodes: &str| {
+            format!(
+                r#"{{"version":2,"nodes":[{nodes}],"edges":[],"viewport":{{"x":0,"y":0,"zoom":1}}}}"#
+            )
+        };
+        let save = |doc: &str| save_canvas_board_in(&c, board.id, "x", doc);
+
+        assert!(save(&wrap(
+            r#"{"id":"n1","historyId":1,"x":0,"y":0,"width":220,"layers":[{"id":"l1","kind":"image","historyId":2}]}"#
+        ))
+        .is_ok());
+
+        let bad_version =
+            r#"{"version":3,"nodes":[],"edges":[],"viewport":{"x":0,"y":0,"zoom":1}}"#;
+        assert!(save(bad_version).is_err());
+
+        let bad_kind = wrap(
+            r#"{"id":"n1","historyId":1,"x":0,"y":0,"width":220,"layers":[{"id":"l1","kind":"text"}]}"#,
+        );
+        assert!(save(&bad_kind).is_err());
+
+        let no_history = wrap(
+            r#"{"id":"n1","historyId":1,"x":0,"y":0,"width":220,"layers":[{"id":"l1","kind":"image"}]}"#,
+        );
+        assert!(save(&no_history).is_err());
+
+        let no_mask_path = wrap(
+            r#"{"id":"n1","historyId":1,"x":0,"y":0,"width":220,"layers":[{"id":"m1","kind":"mask"}]}"#,
+        );
+        assert!(save(&no_mask_path).is_err());
+
+        let bad_opacity = wrap(
+            r#"{"id":"n1","historyId":1,"x":0,"y":0,"width":220,"layers":[{"id":"l1","kind":"image","historyId":2,"opacity":1.5}]}"#,
+        );
+        assert!(save(&bad_opacity).is_err());
+
+        let too_many_layers: Vec<String> = (0..=MAX_CANVAS_LAYERS_PER_NODE)
+            .map(|i| format!(r#"{{"id":"l{i}","kind":"image","historyId":{}}}"#, i + 2))
+            .collect();
+        let too_many_layers = wrap(&format!(
+            r#"{{"id":"n1","historyId":1,"x":0,"y":0,"width":220,"layers":[{}]}}"#,
+            too_many_layers.join(",")
+        ));
+        assert!(save(&too_many_layers).is_err());
+
+        let too_many_regions: Vec<String> = (0..=MAX_CANVAS_REGIONS_PER_NODE)
+            .map(|i| {
+                format!(r#"{{"id":"r{i}","prompt":"p","maskPath":"C:/m/{i}.png","feather":24}}"#)
+            })
+            .collect();
+        let too_many_regions = wrap(&format!(
+            r#"{{"id":"n1","historyId":1,"x":0,"y":0,"width":220,"regions":[{}]}}"#,
+            too_many_regions.join(",")
+        ));
+        assert!(save(&too_many_regions).is_err());
+
+        let bad_feather = wrap(
+            r#"{"id":"n1","historyId":1,"x":0,"y":0,"width":220,"regions":[{"id":"r1","prompt":"p","maskPath":"C:/m/1.png","feather":200}]}"#,
+        );
+        assert!(save(&bad_feather).is_err());
+    }
+
+    /// 画布蒙版路径必须进入引用集合，否则清理缓存会把仍在使用的蒙版移走
+    #[test]
+    fn referenced_paths_include_canvas_masks() {
+        let c = mem_conn();
+        let board = create_canvas_board_in(&c, "蒙版").unwrap();
+        let doc = r#"{"version":2,"nodes":[{"id":"n1","historyId":1,"x":0,"y":0,"width":220,"layers":[{"id":"m1","kind":"mask","path":"C:\\media\\images\\mask.png","visible":true,"opacity":1,"locked":false}],"regions":[{"id":"r1","prompt":"p","maskPath":"C:\\media\\images\\region.png","feather":24}]}],"edges":[],"viewport":{"x":0,"y":0,"zoom":1}}"#;
+        save_canvas_board_in(&c, board.id, "蒙版", doc).unwrap();
+
+        let set = collect_referenced_paths_in(&c).expect("collect");
+        assert!(set.contains(&normalize_path_key(r"C:\media\images\mask.png")));
+        assert!(set.contains(&normalize_path_key(r"C:\media\images\region.png")));
+        assert_eq!(set.len(), 2);
+
+        // 坏画布 JSON 不能让整条引用查询失败
+        c.execute(
+            "UPDATE canvas_boards SET data_json = 'not-json' WHERE id = ?1",
+            params![board.id],
+        )
+        .unwrap();
+        collect_referenced_paths_in(&c).expect("坏 JSON 不应导致查询失败");
+    }
+
+    /// 媒体根改写覆盖画布图层/分区蒙版（第 6 处），且幂等
+    #[test]
+    fn rewrite_media_root_updates_canvas_masks() {
+        let c = mem_conn();
+        let old = Path::new(r"E:\old root");
+        let new = Path::new(r"D:\new\media");
+        let board = create_canvas_board_in(&c, "搬家").unwrap();
+        let doc = r#"{"version":2,"nodes":[{"id":"n1","historyId":1,"x":0,"y":0,"width":220,"layers":[{"id":"m1","kind":"mask","path":"E:\\old root\\images\\mask.png"}],"regions":[{"id":"r1","prompt":"p","maskPath":"E:\\old root\\images\\region.png","feather":24},{"id":"r2","prompt":"q","maskPath":"E:\\other\\keep.png","feather":24}]}],"edges":[],"viewport":{"x":0,"y":0,"zoom":1}}"#;
+        save_canvas_board_in(&c, board.id, "搬家", doc).unwrap();
+
+        let changed = rewrite_media_root_in(&c, old, new).expect("rewrite");
+        assert_eq!(changed, 2, "图层与分区蒙版各一处");
+
+        let data_json: String = c
+            .query_row(
+                "SELECT data_json FROM canvas_boards WHERE id = ?1",
+                params![board.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(data_json.contains(r"D:\\new\\media\\images\\mask.png"));
+        assert!(data_json.contains(r"D:\\new\\media\\images\\region.png"));
+        assert!(data_json.contains(r"E:\\other\\keep.png"), "旧根外路径不动");
+
+        assert_eq!(rewrite_media_root_in(&c, old, new).unwrap(), 0, "幂等");
     }
 
     /// 缓存保留天数：缺省 30，合法值生效，脏值/越界回退默认

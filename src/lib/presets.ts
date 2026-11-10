@@ -22,7 +22,7 @@ export function sizeLabel(width: number, height: number): string {
   return isAutoSize(width, height) ? i18n.t("自动") : `${width} × ${height}`;
 }
 
-export type ImageQuality = "auto" | "low" | "medium" | "high";
+export type ImageQuality = "auto" | "low" | "medium" | "high" | "xhigh" | "max";
 
 /// label 即词典 key：写成字面量类型，漏补英文时编译期即报错
 export const QUALITY_OPTIONS = [
@@ -30,11 +30,57 @@ export const QUALITY_OPTIONS = [
   { id: "low", label: "低" },
   { id: "medium", label: "中" },
   { id: "high", label: "高" },
+  { id: "xhigh", label: "极高" },
+  { id: "max", label: "最高" },
 ] as const satisfies readonly { id: ImageQuality; label: string }[];
 
 export function qualityLabel(quality: string): string {
   const label = QUALITY_OPTIONS.find((q) => q.id === quality)?.label ?? "自动";
   return i18n.t(label);
+}
+
+/// xhigh / max 只有 GPT-Image-2.6 系列认；其余模型照旧只展示四档
+export function qualityOptionsFor(model: string) {
+  const supportsTop = model.toLowerCase().includes("gpt-image-2.6");
+  return supportsTop
+    ? QUALITY_OPTIONS
+    : QUALITY_OPTIONS.filter((q) => q.id !== "xhigh" && q.id !== "max");
+}
+
+/// GIF 输出容器的选择：png = 静态图（默认），gif = 动图
+export type OutputFormat = "png" | "gif";
+
+export type GifComplexity = "low" | "medium" | "high";
+
+export const GIF_FRAME_MIN = 2;
+export const GIF_FRAME_MAX = 16;
+export const GIF_FRAME_DEFAULT = 9;
+export const GIF_FRAME_MS_MIN = 20;
+export const GIF_FRAME_MS_MAX = 2000;
+export const GIF_FRAME_MS_DEFAULT = 200;
+
+/// label 同 QUALITY_OPTIONS：字面量即词典 key
+export const COMPLEXITY_OPTIONS = [
+  { id: "low", label: "低" },
+  { id: "medium", label: "中" },
+  { id: "high", label: "高" },
+] as const satisfies readonly { id: GifComplexity; label: string }[];
+
+export function complexityLabel(complexity: string): string {
+  const label =
+    COMPLEXITY_OPTIONS.find((c) => c.id === complexity)?.label ?? "高";
+  return i18n.t(label);
+}
+
+/** 动图体积、帧率展示（0 时回退为占位，避免除零） */
+export function animationSummary(info: {
+  frames: number;
+  totalMs: number;
+  bytes: number;
+}): string {
+  const fps = info.totalMs > 0 ? info.frames / (info.totalMs / 1000) : 0;
+  const kb = Math.max(1, Math.round(info.bytes / 1024));
+  return `${info.frames} 帧 · ${fps > 0 ? fps.toFixed(1) : "—"} fps · ${kb} KB`;
 }
 
 export interface StylePreset {

@@ -227,6 +227,25 @@ impl TemplateAdapter {
             ("image_count", req.images.len().to_string()),
             // 角色 / 强度：提示词级近似，模板可按需自行降权或忽略
             ("ref_roles", crate::reference::roles_json(&req.references)),
+            // GIF：非动图时为空串，模板可据此走静态分支
+            (
+                "output_format",
+                req.output_format
+                    .clone()
+                    .filter(|f| super::wants_gif(Some(f)))
+                    .unwrap_or_default(),
+            ),
+            (
+                "frame_count",
+                req.frame_count.map(|n| n.to_string()).unwrap_or_default(),
+            ),
+            (
+                "frame_duration_ms",
+                req.frame_duration_ms
+                    .map(|n| n.to_string())
+                    .unwrap_or_default(),
+            ),
+            ("complexity", req.complexity.clone().unwrap_or_default()),
         ]
     }
 
@@ -253,6 +272,24 @@ impl TemplateAdapter {
                 "mask_count",
                 if req.mask_b64.is_some() { "1" } else { "0" }.to_string(),
             ),
+            (
+                "output_format",
+                req.output_format
+                    .clone()
+                    .filter(|f| super::wants_gif(Some(f)))
+                    .unwrap_or_default(),
+            ),
+            (
+                "frame_count",
+                req.frame_count.map(|n| n.to_string()).unwrap_or_default(),
+            ),
+            (
+                "frame_duration_ms",
+                req.frame_duration_ms
+                    .map(|n| n.to_string())
+                    .unwrap_or_default(),
+            ),
+            ("complexity", req.complexity.clone().unwrap_or_default()),
         ]
     }
 
@@ -323,9 +360,12 @@ impl TemplateAdapter {
         for s in values {
             let b64 = if s.starts_with("http://") || s.starts_with("https://") {
                 // F-011：URL 结果统一走带状态码 / 体积上限 / 魔数校验的下载函数
-                let bytes =
-                    download_image_bytes(&s, std::time::Duration::from_secs(config.timeout_secs))
-                        .await?;
+                let bytes = download_image_bytes(
+                    &s,
+                    std::time::Duration::from_secs(config.timeout_secs),
+                    super::MAX_REMOTE_IMAGE_BYTES,
+                )
+                .await?;
                 base64::engine::general_purpose::STANDARD.encode(&bytes)
             } else {
                 s
@@ -692,6 +732,7 @@ mod tests {
                     strength: None,
                 },
             ],
+            ..Default::default()
         };
         let pairs = TemplateAdapter::vars(&config, &req);
         let pairs = vars_as_strs(&pairs);
@@ -759,6 +800,7 @@ mod tests {
             mask_b64: Some("MASK".into()),
             width: 800,
             height: 600,
+            ..Default::default()
         };
         let pairs = TemplateAdapter::edit_vars(&config, &req);
         let pairs = vars_as_strs(&pairs);

@@ -22,8 +22,27 @@ const chatComposer = {
   低: "Low",
   中: "Medium",
   高: "High",
-  "自动不发送质量参数；低 / 中 / 高需要服务商支持":
-    "Auto sends no quality parameter; low / medium / high require provider support",
+  极高: "Very high",
+  最高: "Highest",
+  "自动不发送质量参数；低 / 中 / 高 / 极高 / 最高需要服务商支持":
+    "Auto sends no quality parameter; low / medium / high / very high / highest require provider support",
+
+  // 动图输出
+  输出格式: "Output format",
+  静态图: "Still image",
+  动图: "Animated",
+  帧数: "Frames",
+  动图帧数: "Animated frame count",
+  每帧时长: "Frame duration",
+  "每帧时长（毫秒）": "Frame duration (ms)",
+  复杂度: "Complexity",
+  动图复杂度: "Animated complexity",
+  "20–2000ms，按 10ms 取整；GIF 按 token 计费，需模型开通预览权限，且不支持蒙版编辑。":
+    "20–2000ms, rounded to 10ms. GIF is billed by token, requires preview access on the model, and doesn't support mask editing.",
+  "动图模式下每个数量都会单独调用一次，费用 ×{{n}}":
+    "Animated mode calls once per image, so the cost is ×{{n}}",
+  "当前模型未开通 GIF 输出，请切换模型或改回静态图":
+    "This model doesn't have GIF output enabled; switch models or go back to still images",
 
   // 采样参数
   高级采样参数: "Advanced sampling",

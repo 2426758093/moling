@@ -105,7 +105,14 @@ async fn resolve(candidate: Candidate) -> Option<String> {
         }
         Candidate::Url(url) => {
             let timeout = std::time::Duration::from_secs(60);
-            match crate::adapters::download_image_bytes(&url, timeout).await {
+            // 产物可能是 GIF 动图，恢复下载按动图上限放行
+            match crate::adapters::download_image_bytes(
+                &url,
+                timeout,
+                crate::adapters::MAX_REMOTE_GIF_BYTES,
+            )
+            .await
+            {
                 Ok(bytes) => Some(base64::engine::general_purpose::STANDARD.encode(&bytes)),
                 Err(e) => {
                     tracing::warn!("恢复下载失败（不重新生成）: {} -> {}", url, e.message());

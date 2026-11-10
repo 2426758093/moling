@@ -17,7 +17,7 @@ pub struct ZipEntryInput {
 }
 
 /// 目标路径的最后一道校验：空路径 / 纯空白直接拒绝，父目录不存在则创建。
-fn prepare_dest(dest: &str) -> Result<PathBuf, String> {
+pub(crate) fn prepare_dest(dest: &str) -> Result<PathBuf, String> {
     let trimmed = dest.trim();
     if trimmed.is_empty() {
         return Err("保存路径为空".into());

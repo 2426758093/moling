@@ -27,6 +27,7 @@ const CAP_FIELDS = [
   { key: "edit", label: "编辑能力" },
   { key: "transform", label: "变换能力" },
   { key: "multiImage", label: "多参考图" },
+  { key: "gif", label: "GIF 输出" },
 ] as const;
 
 type SpecPrefix = "editTemplate" | "transformTemplate";
@@ -704,6 +705,37 @@ export default function ProviderDialog({
                           widthClass="w-24"
                         />
                       </label>
+                      {caps.gif && (
+                        <label className="mt-2 flex items-center justify-between gap-2 text-footnote text-tertiary">
+                          {t("GIF 帧数上限")}
+                          <Input
+                            type="number"
+                            min={2}
+                            max={64}
+                            step={1}
+                            value={caps.gifMaxFrames}
+                            onChange={(e) =>
+                              patchCaps(m, {
+                                gifMaxFrames:
+                                  Number(e.target.value) || caps.gifMaxFrames,
+                              })
+                            }
+                            onBlur={() =>
+                              patchCaps(m, {
+                                gifMaxFrames: Math.min(
+                                  64,
+                                  Math.max(2, caps.gifMaxFrames),
+                                ),
+                              })
+                            }
+                            aria-label={t("{{model}} GIF 帧数上限", {
+                              model: m,
+                            })}
+                            compact
+                            widthClass="w-24"
+                          />
+                        </label>
+                      )}
                     </div>
                   );
                 })}

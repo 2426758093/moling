@@ -19,7 +19,7 @@ pub const KIND_OPENAI: &str = "openai";
 /// 错误响应体保留的最大字符数（避免超长错误消息撑爆 UI/日志）
 pub const ERROR_BODY_TRUNCATE_LEN: usize = 500;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GenerateRequest {
     pub prompt: String,
     pub negative_prompt: Option<String>,
@@ -38,9 +38,21 @@ pub struct GenerateRequest {
     /// 与 `images` 按位置对应的角色 / 强度；只用于提示词级说明与模板变量
     #[serde(default)]
     pub references: Vec<crate::reference::ReferenceSpec>,
+    /// 输出容器：None / "png" = 静态图，"gif" = 动图
+    #[serde(default)]
+    pub output_format: Option<String>,
+    /// GIF 帧数（2–16，按服务商上限钳制）
+    #[serde(default)]
+    pub frame_count: Option<u32>,
+    /// GIF 单帧时长（毫秒，20–2000）
+    #[serde(default)]
+    pub frame_duration_ms: Option<u32>,
+    /// 生成复杂度（low / medium / high）
+    #[serde(default)]
+    pub complexity: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EditRequest {
     pub prompt: String,
     pub negative_prompt: Option<String>,
@@ -49,6 +61,14 @@ pub struct EditRequest {
     pub mask_b64: Option<String>,
     pub width: u32,
     pub height: u32,
+    #[serde(default)]
+    pub output_format: Option<String>,
+    #[serde(default)]
+    pub frame_count: Option<u32>,
+    #[serde(default)]
+    pub frame_duration_ms: Option<u32>,
+    #[serde(default)]
+    pub complexity: Option<String>,
 }
 
 /// 高清放大 / 风格转换（M4 起由 `transform_image` 命令使用）。
@@ -62,6 +82,42 @@ pub struct TransformRequest {
     pub scale: u32,
     /// detail（细节增强）| faithful（忠实还原）
     pub mode: String,
+}
+
+/// GIF 参数只在 output_format=gif 时成立，统一在这里收口，避免各适配器各写一套判定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GifParams {
+    pub output_format: String,
+    pub frame_count: u32,
+    pub frame_duration_ms: u32,
+    pub complexity: Option<String>,
+}
+
+impl GifParams {
+    pub(crate) fn from_request(
+        output_format: Option<&str>,
+        frame_count: Option<u32>,
+        frame_duration_ms: Option<u32>,
+        complexity: Option<&str>,
+    ) -> Option<Self> {
+        if !wants_gif(output_format) {
+            return None;
+        }
+        Some(Self {
+            output_format: "gif".into(),
+            frame_count: frame_count.unwrap_or(9).clamp(2, 16),
+            frame_duration_ms: frame_duration_ms.unwrap_or(200).clamp(20, 2000),
+            complexity: complexity
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(str::to_string),
+        })
+    }
+}
+
+/// 是否请求 GIF 输出：唯一判定口径，避免各层对大小写 / 空串理解不一致
+pub(crate) fn wants_gif(output_format: Option<&str>) -> bool {
+    output_format.is_some_and(|f| f.trim().eq_ignore_ascii_case("gif"))
 }
 
 /// 负向提示词的统一落法：OpenAI 兼容接口没有标准负向字段，按 ADR #3 不新增字段，
@@ -254,6 +310,8 @@ pub(crate) fn http_client() -> Result<Arc<reqwest::Client>, AdapterError> {
 
 /// 单张远程图片体积上限（20MB）：防止错误页 / 超大响应把内存与落盘打满。
 pub(crate) const MAX_REMOTE_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+/// GIF 动图单独放宽到 64MB：16 帧动图体积天然比静图大一个量级
+pub(crate) const MAX_REMOTE_GIF_BYTES: usize = 64 * 1024 * 1024;
 
 /// 支持的图片魔数（与 `image` crate 启用的格式一致：PNG / JPEG / GIF / WebP）
 fn looks_like_image(bytes: &[u8]) -> bool {
@@ -399,6 +457,7 @@ const DOWNLOAD_HEADER_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) async fn download_image_bytes(
     url: &str,
     timeout: Duration,
+    max_bytes: usize,
 ) -> Result<Vec<u8>, AdapterError> {
     let parsed = validate_remote_url(url)?;
     let request = http::image_client()
@@ -425,13 +484,10 @@ pub(crate) async fn download_image_bytes(
     }
     if resp
         .content_length()
-        .is_some_and(|len| len > MAX_REMOTE_IMAGE_BYTES as u64)
+        .is_some_and(|len| len > max_bytes as u64)
     {
         return Err(AdapterError::Other {
-            message: format!(
-                "图片体积超过上限 {} MB",
-                MAX_REMOTE_IMAGE_BYTES / 1024 / 1024
-            ),
+            message: format!("图片体积超过上限 {} MB", max_bytes / 1024 / 1024),
         });
     }
     let bytes = read_body_with_idle(
@@ -439,10 +495,10 @@ pub(crate) async fn download_image_bytes(
         "下载图片",
         body_idle_timeout(),
         body_total_timeout(),
-        MAX_REMOTE_IMAGE_BYTES,
+        max_bytes,
     )
     .await?;
-    validate_downloaded_image(&bytes, MAX_REMOTE_IMAGE_BYTES)?;
+    validate_downloaded_image(&bytes, max_bytes)?;
     Ok(bytes)
 }
 

@@ -81,6 +81,9 @@ const settingsSections = {
   编辑能力: "Editing",
   变换能力: "Transform",
   多参考图: "Multiple references",
+  "GIF 输出": "GIF output",
+  "GIF 帧数上限": "GIF frame cap",
+  "{{model}} GIF 帧数上限": "{{model}} GIF frame cap",
   最大边长: "Max side length",
   "{{model}} 最大边长": "{{model}} max side length",
   "共获取 {{n}} 个模型，保存后可在生成页直接使用。":

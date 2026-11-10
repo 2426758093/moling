@@ -1,6 +1,6 @@
 [package]
 name = "moling"
-version = "1.7.0"
+version = "2.0.0"
 description = "MoLing - AI drawing client for any API"
 authors = ["MoLing Contributors"]
 edition = "2021"
@@ -52,6 +52,8 @@ image = { version = "0.25", default-features = false, features = [
   "webp",
   "gif",
 ] }
+# GIF 动图：读循环次数、逐帧时长与 NeuQuant 编码需要直接控制编码器
+gif = "0.14"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"

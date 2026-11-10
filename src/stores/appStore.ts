@@ -4,7 +4,15 @@ import {
   ThemeMode,
   UiMode,
   ImageQuality,
+  OutputFormat,
+  GifComplexity,
   RATIO_OPTIONS,
+  GIF_FRAME_MIN,
+  GIF_FRAME_MAX,
+  GIF_FRAME_DEFAULT,
+  GIF_FRAME_MS_MIN,
+  GIF_FRAME_MS_MAX,
+  GIF_FRAME_MS_DEFAULT,
 } from "../lib/types";
 import { api } from "../lib/api";
 import i18n, { applyLocale, Locale, readLocaleMirror } from "../i18n";
@@ -28,6 +36,14 @@ export interface GenPrefs {
   /** 图片质量；auto = 不发送 quality 字段 */
   quality: ImageQuality;
   negativePrompt: string;
+  /** png = 静态图（默认），gif = 动图 */
+  outputFormat: OutputFormat;
+  /** 动图帧数 2–16 */
+  frameCount: number;
+  /** 每帧时长（毫秒），20–2000 且 10ms 取整 */
+  frameDurationMs: number;
+  /** 动图复杂度；仅 GIF 时下发 */
+  complexity: GifComplexity;
 }
 
 /** 编辑入口来源；canvas = 从画布节点打开，结果回写画布 */
@@ -39,6 +55,9 @@ export interface EditTarget {
   prompt: string;
   mode: "inpaint" | "erase";
   host?: EditHost;
+  /** 源图像素尺寸：画布回写据此判断“同尺寸成层 / 异尺寸成节点” */
+  width?: number;
+  height?: number;
 }
 
 export interface OutpaintTarget {
@@ -46,6 +65,8 @@ export interface OutpaintTarget {
   dataUrl: string;
   prompt: string;
   host?: EditHost;
+  width?: number;
+  height?: number;
 }
 
 /** upscale = 高清放大；style = 风格转换 */
@@ -57,6 +78,8 @@ export interface BasicEditTarget {
   dataUrl: string;
   prompt: string;
   host?: EditHost;
+  width?: number;
+  height?: number;
 }
 
 /** 换背景：蒙版 + 纯色 / 渐变 / AI 描述 */
@@ -65,6 +88,8 @@ export interface BackgroundTarget {
   dataUrl: string;
   prompt: string;
   host?: EditHost;
+  width?: number;
+  height?: number;
 }
 
 export interface TransformTarget {
@@ -72,6 +97,22 @@ export interface TransformTarget {
   historyId: number;
   dataUrl: string;
   prompt: string;
+  host?: EditHost;
+  width?: number;
+  height?: number;
+}
+
+/** 动图编辑器：只持有历史 id，帧与元数据由 Rust 侧按需读取 */
+export interface AnimationTarget {
+  historyId: number;
+  host?: EditHost;
+}
+
+/** 分区重绘：底图是节点当前合成画面，区域蒙版由编辑器另存为资产 */
+export interface RegionTarget {
+  nodeId: string;
+  baseHistoryId: number;
+  dataUrl: string;
   host?: EditHost;
 }
 
@@ -93,6 +134,8 @@ interface AppState {
   transformTarget: TransformTarget | null;
   basicEditTarget: BasicEditTarget | null;
   backgroundTarget: BackgroundTarget | null;
+  animationTarget: AnimationTarget | null;
+  regionTarget: RegionTarget | null;
   setView: (view: AppView) => void;
   setTheme: (theme: ThemeMode) => void;
   setGlass: (glass: GlassAppearance) => void;
@@ -116,6 +159,10 @@ interface AppState {
   closeBasicEdit: () => void;
   openBackground: (target: BackgroundTarget) => void;
   closeBackground: () => void;
+  openAnimation: (target: AnimationTarget) => void;
+  closeAnimation: () => void;
+  openRegionEdit: (target: RegionTarget) => void;
+  closeRegionEdit: () => void;
 }
 
 const BASE = 1024;
@@ -143,6 +190,10 @@ export const DEFAULT_PREFS: GenPrefs = {
   count: 1,
   quality: "auto",
   negativePrompt: "",
+  outputFormat: "png",
+  frameCount: GIF_FRAME_DEFAULT,
+  frameDurationMs: GIF_FRAME_MS_DEFAULT,
+  complexity: "high",
 };
 
 /// 从磁盘/导入的 JSON 恢复生成参数：逐字段校验，非法值直接丢弃，
@@ -173,12 +224,41 @@ export function sanitizePrefs(raw: unknown): Partial<GenPrefs> {
     quality === "auto" ||
     quality === "low" ||
     quality === "medium" ||
-    quality === "high"
+    quality === "high" ||
+    quality === "xhigh" ||
+    quality === "max"
   ) {
     out.quality = quality;
   }
   if (typeof src.negativePrompt === "string") {
     out.negativePrompt = src.negativePrompt;
+  }
+  if (src.outputFormat === "png" || src.outputFormat === "gif") {
+    out.outputFormat = src.outputFormat;
+  }
+  if (typeof src.frameCount === "number" && Number.isFinite(src.frameCount)) {
+    out.frameCount = Math.min(
+      GIF_FRAME_MAX,
+      Math.max(GIF_FRAME_MIN, Math.round(src.frameCount)),
+    );
+  }
+  if (
+    typeof src.frameDurationMs === "number" &&
+    Number.isFinite(src.frameDurationMs)
+  ) {
+    // 与后端 normalize_gif 同一口径：先夹区间，再取整到 10ms
+    const clamped = Math.min(
+      GIF_FRAME_MS_MAX,
+      Math.max(GIF_FRAME_MS_MIN, src.frameDurationMs),
+    );
+    out.frameDurationMs = Math.round(clamped / 10) * 10;
+  }
+  if (
+    src.complexity === "low" ||
+    src.complexity === "medium" ||
+    src.complexity === "high"
+  ) {
+    out.complexity = src.complexity;
   }
   return out;
 }
@@ -211,6 +291,8 @@ export const useAppStore = create<AppState>((set) => ({
   transformTarget: null,
   basicEditTarget: null,
   backgroundTarget: null,
+  animationTarget: null,
+  regionTarget: null,
   setView: (view) => set({ view }),
   setTheme: (theme) => {
     set({ theme });
@@ -301,7 +383,7 @@ export const useAppStore = create<AppState>((set) => ({
     set((s) => ({
       prefs: { ...s.prefs, ratio: "custom", ...snapSize(width, height) },
     })),
-  // 同一时刻只允许一个编辑实例：打开任一入口都先关掉其余四个
+  // 同一时刻只允许一个编辑实例：打开任一入口都先关掉其余六个
   openEditor: (editTarget) =>
     set({
       editTarget,
@@ -309,6 +391,8 @@ export const useAppStore = create<AppState>((set) => ({
       transformTarget: null,
       basicEditTarget: null,
       backgroundTarget: null,
+      animationTarget: null,
+      regionTarget: null,
     }),
   closeEditor: () => set({ editTarget: null }),
   openOutpaint: (outpaintTarget) =>
@@ -318,6 +402,8 @@ export const useAppStore = create<AppState>((set) => ({
       transformTarget: null,
       basicEditTarget: null,
       backgroundTarget: null,
+      animationTarget: null,
+      regionTarget: null,
     }),
   closeOutpaint: () => set({ outpaintTarget: null }),
   openTransform: (transformTarget) =>
@@ -327,6 +413,8 @@ export const useAppStore = create<AppState>((set) => ({
       outpaintTarget: null,
       basicEditTarget: null,
       backgroundTarget: null,
+      animationTarget: null,
+      regionTarget: null,
     }),
   closeTransform: () => set({ transformTarget: null }),
   openBasicEdit: (basicEditTarget) =>
@@ -336,6 +424,8 @@ export const useAppStore = create<AppState>((set) => ({
       outpaintTarget: null,
       transformTarget: null,
       backgroundTarget: null,
+      animationTarget: null,
+      regionTarget: null,
     }),
   closeBasicEdit: () => set({ basicEditTarget: null }),
   openBackground: (backgroundTarget) =>
@@ -345,6 +435,30 @@ export const useAppStore = create<AppState>((set) => ({
       outpaintTarget: null,
       transformTarget: null,
       basicEditTarget: null,
+      animationTarget: null,
+      regionTarget: null,
     }),
   closeBackground: () => set({ backgroundTarget: null }),
+  openAnimation: (animationTarget) =>
+    set({
+      animationTarget,
+      editTarget: null,
+      outpaintTarget: null,
+      transformTarget: null,
+      basicEditTarget: null,
+      backgroundTarget: null,
+      regionTarget: null,
+    }),
+  closeAnimation: () => set({ animationTarget: null }),
+  openRegionEdit: (regionTarget) =>
+    set({
+      regionTarget,
+      editTarget: null,
+      outpaintTarget: null,
+      transformTarget: null,
+      basicEditTarget: null,
+      backgroundTarget: null,
+      animationTarget: null,
+    }),
+  closeRegionEdit: () => set({ regionTarget: null }),
 }));

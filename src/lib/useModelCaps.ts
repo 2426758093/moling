@@ -11,14 +11,18 @@ export const DEFAULT_MODEL_CAPS: ModelCaps = {
   transform: true,
   maxSide: 1024,
   multiImage: true,
+  gif: false,
+  gifMaxFrames: 16,
 };
 
 /// 与后端 model_caps::heuristic_caps 保持一致，仅用于新增服务商保存前的展示
 export function heuristicCaps(model: string): ModelCaps {
   const m = model.toLowerCase();
-  return m.includes("dall-e") || m.includes("gpt-image")
-    ? { ...DEFAULT_MODEL_CAPS, negative: false }
-    : { ...DEFAULT_MODEL_CAPS };
+  const caps =
+    m.includes("dall-e") || m.includes("gpt-image")
+      ? { ...DEFAULT_MODEL_CAPS, negative: false }
+      : { ...DEFAULT_MODEL_CAPS };
+  return m.includes("gpt-image-2.6") ? { ...caps, gif: true } : caps;
 }
 
 interface ModelCapsState {

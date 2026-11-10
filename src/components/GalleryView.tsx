@@ -3,8 +3,9 @@ import { useTranslation } from "react-i18next";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { api, HistoryItem } from "../lib/api";
 import { exportHistoryZip, saveHistoryImage } from "../lib/save";
-import { extOf } from "../lib/image";
+import { extOf, isGifPath } from "../lib/image";
 import { dayKey, dayLabel } from "../lib/date";
+import { HISTORY_CHANGED_EVENT } from "../lib/historyEvents";
 import { toast } from "../lib/notify";
 import SafeImg from "./SafeImg";
 import PageHeader from "./PageHeader";
@@ -29,6 +30,7 @@ import {
   IconTrash,
   IconRotate,
   IconClose,
+  IconImage,
 } from "./Icons";
 
 const PAGE_SIZE = 90;
@@ -147,6 +149,7 @@ function justifyRows(
 
 export default function GalleryView() {
   const { t } = useTranslation();
+  const openAnimation = useAppStore((s) => s.openAnimation);
   const [items, setItems] = useState<HistoryItem[]>([]);
   const [hasMore, setHasMore] = useState(true);
   const [modelFilter, setModelFilter] = useState("");
@@ -222,6 +225,12 @@ export default function GalleryView() {
     void load(null, modelFilter, styleFilter, favOnly);
     setSelected(new Set());
   }, [modelFilter, styleFilter, favOnly, load]);
+
+  // 编辑器 / 动图导出等常驻在画廊之上：新记录落库后重载列表
+  useEffect(() => {
+    window.addEventListener(HISTORY_CHANGED_EVENT, reload);
+    return () => window.removeEventListener(HISTORY_CHANGED_EVENT, reload);
+  }, [reload]);
 
   // 列数与行高都由容器宽度决定：最大化后列数不变时，行高会随宽度一起长
   useEffect(() => {
@@ -649,10 +658,26 @@ export default function GalleryView() {
                         >
                           {item.history.favorite ? "★" : "☆"}
                         </button>
-                        {item.history.parentId != null && (
-                          <span className="glass-media pointer-events-none absolute bottom-2 left-2 rounded-pill px-2 py-0.5 text-caption text-on-accent">
-                            {t("派生 #{{id}}", { id: item.history.parentId })}
-                          </span>
+                        {(isGifPath(item.history.filePath) ||
+                          item.history.parentId != null) && (
+                          <div className="pointer-events-none absolute bottom-2 left-2 flex flex-col items-start gap-1">
+                            {isGifPath(item.history.filePath) && (
+                              <span className="glass-media rounded-pill px-2 py-0.5 text-caption text-on-accent">
+                                {item.animation
+                                  ? t("动图 · {{n}} 帧", {
+                                      n: item.animation.frames,
+                                    })
+                                  : t("动图")}
+                              </span>
+                            )}
+                            {item.history.parentId != null && (
+                              <span className="glass-media rounded-pill px-2 py-0.5 text-caption text-on-accent">
+                                {t("派生 #{{id}}", {
+                                  id: item.history.parentId,
+                                })}
+                              </span>
+                            )}
+                          </div>
                         )}
                         <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center p-2 opacity-0 transition-opacity duration-200 group-focus-within:opacity-100 group-hover:opacity-100">
                           <div className="glass-media pointer-events-auto flex items-center gap-0.5 rounded-pill p-0.5">
@@ -686,6 +711,22 @@ export default function GalleryView() {
                                 <IconStar size={13} />
                               </button>
                             </Tooltip>
+                            {isGifPath(item.history.filePath) && (
+                              <Tooltip label={t("打开动图编辑器")} side="top">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    openAnimation({
+                                      historyId: item.history.id,
+                                    })
+                                  }
+                                  aria-label={t("打开动图编辑器")}
+                                  className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent hover:bg-on-accent/15"
+                                >
+                                  <IconImage size={13} />
+                                </button>
+                              </Tooltip>
+                            )}
                             <Tooltip label={t("下载原图与参数")} side="top">
                               <button
                                 type="button"

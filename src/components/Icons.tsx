@@ -121,11 +121,12 @@ export const IconTrash = (p: IconProps) => (
 export const IconChevron = ({
   direction = "right",
   ...p
-}: IconProps & { direction?: "right" | "down" | "left" }) => (
+}: IconProps & { direction?: "right" | "down" | "left" | "up" }) => (
   <svg {...base(p)}>
     {direction === "right" && <path d="m9 18 6-6-6-6" />}
     {direction === "down" && <path d="m6 9 6 6 6-6" />}
     {direction === "left" && <path d="m15 18-6-6 6-6" />}
+    {direction === "up" && <path d="m6 15 6-6 6 6" />}
   </svg>
 );
 
@@ -312,5 +313,36 @@ export const IconWindowRestore = (p: IconProps) => (
   <svg {...base(p)}>
     <rect x="4" y="8" width="11" height="11" rx="2" />
     <path d="M8 8V6a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2" />
+  </svg>
+);
+
+/// 图层浮层：眼睛 / 锁定 / 层栈（14px 为主，描边由调用处压到 1.8）
+export const IconEye = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12Z" />
+    <circle cx="12" cy="12" r="3" />
+  </svg>
+);
+
+export const IconEyeOff = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="M3 3l18 18" />
+    <path d="M10.6 6.1A9.8 9.8 0 0 1 12 6c6 0 9.5 6 9.5 6a17 17 0 0 1-3.3 3.9" />
+    <path d="M6.6 7.6A16.6 16.6 0 0 0 2.5 12S6 18 12 18c1.4 0 2.7-.3 3.9-.8" />
+    <path d="M9.9 9.9a3 3 0 0 0 4.2 4.2" />
+  </svg>
+);
+
+export const IconLock = (p: IconProps) => (
+  <svg {...base(p)}>
+    <rect x="5" y="10.5" width="14" height="9.5" rx="2" />
+    <path d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3" />
+  </svg>
+);
+
+export const IconLayers = (p: IconProps) => (
+  <svg {...base(p)}>
+    <path d="m12 3 9 5-9 5-9-5 9-5Z" />
+    <path d="m3 13 9 5 9-5" />
   </svg>
 );

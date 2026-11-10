@@ -2426,11 +2426,12 @@ dependencies = [
 
 [[package]]
 name = "moling"
-version = "1.7.0"
+version = "2.0.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
  "flate2",
+ "gif",
  "image",
  "keyring",
  "ort",

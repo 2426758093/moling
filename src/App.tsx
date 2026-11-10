@@ -19,6 +19,7 @@ import OutpaintView from "./components/OutpaintView";
 import TransformDialog from "./components/TransformDialog";
 import BasicEditView from "./components/BasicEditView";
 import BackgroundView from "./components/BackgroundView";
+import AnimationView from "./components/AnimationView";
 import { TooltipProvider } from "./components/ui/Tooltip";
 import { CommandPalette } from "./components/ui/CommandPalette";
 import TitleBar from "./components/shell/TitleBar";
@@ -66,6 +67,7 @@ function AppShell() {
   const outpaintTarget = useAppStore((s) => s.outpaintTarget);
   const basicEditTarget = useAppStore((s) => s.basicEditTarget);
   const backgroundTarget = useAppStore((s) => s.backgroundTarget);
+  const animationTarget = useAppStore((s) => s.animationTarget);
   const canvasInline = useAppStore((s) => s.canvasInline);
   const addFileAttachment = useChatStore((s) => s.addFileAttachment);
   const setView = useAppStore((s) => s.setView);
@@ -170,6 +172,7 @@ function AppShell() {
     if (app.transformTarget?.host === "canvas") app.closeTransform();
     if (app.basicEditTarget?.host === "canvas") app.closeBasicEdit();
     if (app.backgroundTarget?.host === "canvas") app.closeBackground();
+    if (app.animationTarget?.host === "canvas") app.closeAnimation();
   }, [view]);
 
   return (
@@ -274,6 +277,9 @@ function AppShell() {
       </AnimatePresence>
       <AnimatePresence>
         {overlayVisible(backgroundTarget) && <BackgroundView />}
+      </AnimatePresence>
+      <AnimatePresence>
+        {overlayVisible(animationTarget) && <AnimationView />}
       </AnimatePresence>
       <TransformDialog />
     </div>

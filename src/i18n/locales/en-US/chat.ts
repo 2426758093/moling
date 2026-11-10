@@ -65,8 +65,18 @@ const chat = {
   已复制: "Copied",
   更多操作: "More actions",
 
+  // 动图（ImageCard）
+  动图: "Animated",
+  动图请用动图编辑器或单帧修复:
+    "Use the animation editor or single-frame repair for animated images",
+  "转静图（取首帧）": "Convert to still (first frame)",
+  已转静图: "Converted to a still image",
+  "转静图失败：{{error}}": "Failed to convert to a still image: {{error}}",
+
   // ImageViewer
   图片查看器: "Image viewer",
+  "动图 {{frames}} 帧 · {{fps}} fps · {{kb}} KB":
+    "Animated · {{frames}} frames · {{fps}} fps · {{kb}} KB",
   下载图片: "Download image",
   退出全屏: "Exit fullscreen",
   全屏查看: "View fullscreen",
