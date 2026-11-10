@@ -346,6 +346,11 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
     done: number;
     total: number;
   } | null>(null);
+  /**
+   * 这批多区域自己追加的合成整图步骤 key：只有换到这一步时不清草稿。
+   * 合成图与区域蒙版同尺寸，没成功的区域接着提交仍然对得齐；其余换步一律清空。
+   */
+  const [regionKeepStep, setRegionKeepStep] = useState<string | null>(null);
   const maskRef = useRef<MaskCanvasHandle | null>(null);
   /** 正在跑的那批多区域 job：取消按钮认的是它（后端 cancelGeneration 认 jobId） */
   const regionJobRef = useRef<string | null>(null);
@@ -568,8 +573,15 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
   const [regionKey, setRegionKey] = useState(cur.key);
   if (regionKey !== cur.key) {
     setRegionKey(cur.key);
-    if (regionDrafts.length > 0) setRegionDrafts([]);
-    if (Object.keys(regionStatus).length > 0) setRegionStatus({});
+    // 合成整图那一步是这批区域自己追加的：蒙版与它同尺寸，仍然对得齐，
+    // 没成功的草稿要继续留着（否则刚按 id 保住的那批又被换步抹掉）。
+    // 用状态而不是 ref：渲染期读写 ref 会被 react-hooks/refs 判为错误。
+    const keep = regionKeepStep === cur.key;
+    setRegionKeepStep(null);
+    if (!keep) {
+      if (regionDrafts.length > 0) setRegionDrafts([]);
+      if (Object.keys(regionStatus).length > 0) setRegionStatus({});
+    }
     if (regionProgress) setRegionProgress(null);
   }
 
@@ -1196,32 +1208,41 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
     const modelId = model;
     const regions = regionDrafts.map((item) => ({ ...item }));
     const job = newRegionJobId();
-    regionJobRef.current = job;
-    setRegionProgress({ done: 0, total: regions.length });
-    setRegionStatus(
-      Object.fromEntries(regions.map((item) => [item.id, "running" as const])),
-    );
+    /** 本次真正跑成功的区域：只有它们能从草稿列表里移除 */
+    const succeeded = new Set<string>();
 
     void commit("region", "多区域", async (src) => {
       // 底图必须已入库：后端的 baseHistoryId 是这次合成的父节点
       const baseHistoryId = src.historyId;
       if (baseHistoryId == null) throw new Error(t("图片读取失败，请重试"));
-      // 同一时刻只允许一批（busy 已保证）：事件按 jobId 认不出来，也不需要过滤
-      const unlisten = await listen<RegionProgressEvent>(
-        "image:region-progress",
-        (event) => {
-          const p = event.payload;
-          setRegionProgress({ done: p.done, total: p.total });
-          if (p.regionId) {
-            const id = p.regionId;
-            setRegionStatus((state) => ({
-              ...state,
-              [id]: p.ok ? "ok" : "error",
-            }));
-          }
-        },
+      // 进度与取消句柄必须在 run 里初始化：commit 若被未确认计费拦下，
+      // run 根本不会执行，列表不能一直停在「重绘中…」。
+      regionJobRef.current = job;
+      setRegionProgress({ done: 0, total: regions.length });
+      setRegionStatus(
+        Object.fromEntries(
+          regions.map((item) => [item.id, "running" as const]),
+        ),
       );
+      let unlisten: (() => void) | undefined;
+      /** 是否已拿到本批结果：没拿到就失败时，running 角标必须退回「待提交」 */
+      let settled = false;
       try {
+        // 同一时刻只允许一批（busy 已保证）：事件按 jobId 认不出来，也不需要过滤
+        unlisten = await listen<RegionProgressEvent>(
+          "image:region-progress",
+          (event) => {
+            const p = event.payload;
+            setRegionProgress({ done: p.done, total: p.total });
+            if (p.regionId) {
+              const id = p.regionId;
+              setRegionStatus((state) => ({
+                ...state,
+                [id]: p.ok ? "ok" : "error",
+              }));
+            }
+          },
+        );
         const out = await api.regionEditBatch({
           providerId,
           model: modelId,
@@ -1237,11 +1258,17 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
           })),
         });
         // 事件可能丢：以返回结果为准收口每个区域的状态
+        settled = true;
         setRegionStatus(
           Object.fromEntries(
             out.results.map((item) => [item.id, item.ok ? "ok" : "error"]),
           ) as Record<string, "running" | "ok" | "error">,
         );
+        // 取消但已有区域成功、或部分区域失败但合成图存在时，run 仍会正常返回：
+        // 草稿只能按「这次真跑成功的 id」剔除，失败 / 未执行的必须留着。
+        for (const item of out.results) {
+          if (item.ok === true) succeeded.add(item.id);
+        }
         const failures = out.results
           .filter((item) => !item.ok)
           .map((item) => item.error)
@@ -1249,7 +1276,7 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
         if (out.cancelled) {
           toast(
             t("已取消，已保留 {{done}} 个区域的结果", {
-              done: out.results.filter((item) => item.ok).length,
+              done: succeeded.size,
             }),
             "info",
           );
@@ -1264,19 +1291,32 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
               : t("分区重绘失败"),
           );
         }
+        // 还有区域没成：commit 接下来追加的是这批的合成整图，换步清空要放它一马
+        if (succeeded.size < regions.length) {
+          setRegionKeepStep(`s${out.historyId}`);
+        }
         return { historyId: out.historyId, dataUrl: out.dataUrl };
       } finally {
-        // 进度与取消句柄在 run 返回前收掉：之后的量尺寸 / 追加步骤 / 回写仍归 commit
-        unlisten();
+        // 进度与取消句柄在 run 返回前收掉：之后的量尺寸 / 追加步骤 / 回写仍归 commit。
+        // listen 失败时也要走这里收掉进度行；unlisten 可能是 undefined。
+        unlisten?.();
         regionJobRef.current = null;
         setRegionProgress(null);
+        // 请求本身就没跑成（例如事件订阅失败）：running 角标退回「待提交」，
+        // 否则列表会一直显示「重绘中…」而草稿其实一个都没发出去。
+        if (!settled) setRegionStatus({});
       }
     }).then((ok) => {
-      // 成功才清草稿：失败 / 取消要留着让用户补齐重试
-      if (ok) {
-        setRegionDrafts([]);
-        setRegionStatus({});
-      }
+      // 失败 / 取消要留草稿；成功也只清「这次真跑成功的」——蒙版在添加时就固化了，
+      // 失败的草稿被清掉就再也画不回来，用户得从零点一次。
+      if (!ok) return;
+      setRegionDrafts((prev) => prev.filter((item) => !succeeded.has(item.id)));
+      setRegionStatus(
+        (prev) =>
+          Object.fromEntries(
+            Object.entries(prev).filter(([id]) => !succeeded.has(id)),
+          ) as typeof prev,
+      );
     });
   };
 
@@ -1409,7 +1449,9 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
         onConfirm={applyUpscale}
       />
     ) : panel === "region" ? (
+      // key 绑步骤：换步后重挂载，面板里的提示词输入框不会留着上一张底图的描述
       <RegionPanel
+        key={`region-${cur.key}`}
         reason={reasons.region}
         busy={busy}
         drafts={regionDrafts}

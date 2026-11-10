@@ -22,14 +22,14 @@ interface FakeMask {
   applyMask: () => Promise<void>;
 }
 
-const { maskHandles, deliverSpy, historySpy, cropPreviewSpy } = vi.hoisted(
-  () => ({
+const { maskHandles, deliverSpy, historySpy, cropPreviewSpy, unlistenSpy } =
+  vi.hoisted(() => ({
     maskHandles: [] as FakeMask[],
     deliverSpy: vi.fn(),
     historySpy: vi.fn(),
     cropPreviewSpy: vi.fn(),
-  }),
-);
+    unlistenSpy: vi.fn(),
+  }));
 
 // 回写单独测：这里只关心「提交成功后有没有带着 nodeId 调回写」，画布规则在
 // deliverEditResult.test.ts 里覆盖。
@@ -49,9 +49,10 @@ vi.mock("../../lib/historyEvents", () => ({
   emitHistoryChanged: historySpy,
 }));
 
-// 多区域提交要订阅后端进度事件：jsdom 里没有 Tauri 事件总线，返回一个空 unlisten
+// 多区域提交要订阅后端进度事件：jsdom 里没有 Tauri 事件总线，
+// 返回一个可断言的 unlisten（提交结束必须就地释放，不能攒监听器）
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn().mockResolvedValue(() => undefined),
+  listen: vi.fn().mockResolvedValue(unlistenSpy),
 }));
 
 // 真实画布依赖 canvas 像素 API（jsdom 没有）：用按实例记录笔画的替身，
@@ -125,6 +126,7 @@ class FakeImage {
 }
 
 import RetouchView from "./RetouchView";
+import { listen } from "@tauri-apps/api/event";
 import { GUARD_SUFFIX } from "../../lib/retouchPrompts";
 
 const ANALYSIS = {
@@ -293,6 +295,9 @@ beforeEach(() => {
   });
   vi.mocked(api.cancelGeneration).mockReset();
   vi.mocked(api.cancelGeneration).mockResolvedValue(undefined);
+  // 事件订阅的调用次数与 unlisten 都是「每次提交一条」的契约：用例间清零
+  vi.mocked(listen).mockClear();
+  unlistenSpy.mockClear();
 });
 
 function renderStudio() {
@@ -1197,6 +1202,9 @@ describe("RetouchStudio 多区域面板", () => {
     ]);
     // 成功后草稿清空，列表回到空提示
     await screen.findByText("请先涂抹区域并填写提示词");
+    // 进度监听只挂一次，且提交结束就地释放（不攒监听器、不前一批事件串后一批）
+    expect(listen).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(unlistenSpy).toHaveBeenCalledTimes(1));
   });
 
   it("一批最多 4 个区域：第 5 次时添加按钮禁用", async () => {
