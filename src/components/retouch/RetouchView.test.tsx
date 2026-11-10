@@ -778,12 +778,12 @@ describe("RetouchStudio 换背景", () => {
 
 describe("RetouchStudio 未确认计费保护", () => {
   /** 一次未确认失败：gateway 超时但可能已在服务商侧出图 */
-  function unconfirmed() {
+  function unconfirmed(requestId: string | null = "req_1") {
     return new Error(
       JSON.stringify({
         type: "unconfirmed",
         message: "gateway timeout",
-        request_id: "req_1",
+        request_id: requestId ?? undefined,
       }),
     );
   }
@@ -895,6 +895,83 @@ describe("RetouchStudio 未确认计费保护", () => {
     await waitFor(() =>
       expect(screen.queryByText("请求 ID：req_1")).toBeNull(),
     );
+  });
+
+  it("恢复成功即解除拦截：再次云端提交不再确认，直接发请求", async () => {
+    vi.mocked(api.editImage)
+      .mockRejectedValueOnce(unconfirmed())
+      .mockResolvedValueOnce({
+        historyId: 12,
+        dataUrl: "data:image/png;base64,FIX",
+        filePath: "C:/media/fix.png",
+        op: "erase",
+      });
+    renderStudio();
+
+    fireEvent.click(screen.getByRole("button", { name: "AI 消除" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认消除" }));
+    await screen.findByText("请求 ID：req_1");
+
+    // 对账完成：这次客户端请求的计费风险已结清（哪怕有的图没恢复）
+    fireEvent.click(screen.getByRole("button", { name: "尝试恢复" }));
+    await waitFor(() =>
+      expect(api.recoverImageRequestByClient).toHaveBeenCalledWith("req_1"),
+    );
+
+    // 挂起标记必须已清：再提交直接发请求，不弹「确认重新生成？」
+    fireEvent.click(screen.getByRole("button", { name: "确认消除" }));
+    await waitFor(() => expect(api.editImage).toHaveBeenCalledTimes(2));
+    expect(screen.queryByText("确认重新生成？")).toBeNull();
+  });
+
+  it("第二次失败带 ID 时采用最新请求 ID 对账", async () => {
+    vi.mocked(api.editImage)
+      // 第一次失败没带 request_id：标记里只有 null
+      .mockRejectedValueOnce(unconfirmed(null))
+      .mockRejectedValueOnce(unconfirmed("req_2"));
+    renderStudio();
+
+    fireEvent.click(screen.getByRole("button", { name: "AI 消除" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认消除" }));
+    await screen.findByText("可能已计费，重试会再次扣费");
+    // 没有 ID 的提示条给不出恢复入口
+    expect(screen.queryByRole("button", { name: "尝试恢复" })).toBeNull();
+
+    // 确认后重试，第二次失败带上了 ID
+    fireEvent.click(screen.getByRole("button", { name: "确认消除" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "仍然重新生成" }),
+    );
+    await screen.findByText("请求 ID：req_2");
+
+    // 对账必须用提示条上显示的那次请求
+    fireEvent.click(screen.getByRole("button", { name: "尝试恢复" }));
+    await waitFor(() =>
+      expect(api.recoverImageRequestByClient).toHaveBeenCalledWith("req_2"),
+    );
+  });
+
+  it("两次都带 ID 时用最新那次对账，不被最早那次钉住", async () => {
+    vi.mocked(api.editImage)
+      .mockRejectedValueOnce(unconfirmed("req_1"))
+      .mockRejectedValueOnce(unconfirmed("req_2"));
+    renderStudio();
+
+    fireEvent.click(screen.getByRole("button", { name: "AI 消除" }));
+    fireEvent.click(await screen.findByRole("button", { name: "确认消除" }));
+    await screen.findByText("请求 ID：req_1");
+
+    fireEvent.click(screen.getByRole("button", { name: "确认消除" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "仍然重新生成" }),
+    );
+    await screen.findByText("请求 ID：req_2");
+
+    fireEvent.click(screen.getByRole("button", { name: "尝试恢复" }));
+    await waitFor(() =>
+      expect(api.recoverImageRequestByClient).toHaveBeenCalledWith("req_2"),
+    );
+    expect(api.recoverImageRequestByClient).not.toHaveBeenCalledWith("req_1");
   });
 });
 

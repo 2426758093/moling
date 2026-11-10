@@ -662,21 +662,17 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
       const parsed = parseAdapterError(
         error instanceof Error ? error.message : String(error),
       );
-      // 可能已计费：记下挂起标记（保留最早那次「带 ID」的未确认请求，便于对账）。
-      // 上一次记的没有 ID、这次带 ID 时要用新 ID 覆盖：提示条显示的是新请求的
-      // ID，恢复按钮若还拿旧 null 就永远发不出对账请求。
+      // 可能已计费：挂起标记跟踪的是「最新一次」未确认请求 —— 提示条显示的
+      // 是它，恢复按钮对账的也是它。新错误带 ID 就用新 ID 覆盖（旧 ID 对应的
+      // 那次已被新的失败顶到后面）；新错误没带 ID 时保留已有的非空 ID，免得
+      // 把还能对账的请求顶成 null。
       // 其他错误不改它 —— 一次网络抖动不该顶掉还没对账的计费风险。
       if (isUnconfirmedError(parsed)) {
-        setUnconfirmed((prev) =>
-          prev?.requestId
-            ? prev
-            : {
-                requestId:
-                  parsed.type === "unconfirmed"
-                    ? (parsed.request_id ?? null)
-                    : null,
-              },
-        );
+        const nextId =
+          parsed.type === "unconfirmed" ? (parsed.request_id ?? null) : null;
+        setUnconfirmed((prev) => ({
+          requestId: nextId ?? prev?.requestId ?? null,
+        }));
       }
       setLastError(parsed);
       toast(describeError(error), "error");
@@ -836,9 +832,10 @@ function RetouchStudio({ target, embedded, stacked }: StudioProps) {
         t("已恢复 {{n}} 张到画廊", { n: outcome.recovered }) + suffix,
         outcome.failed > 0 ? "error" : "info",
       );
-      // 对账通过：提示条与挂起标记一起解除，下一次提交重新回到正常流程
+      // 对账完成：这家客户端请求的计费风险已经交代清楚（不论是否全部恢复），
+      // 提示条与挂起标记一起解除，下一次提交重新回到正常流程
       setLastError(null);
-      if (mayBillRetouchAction(action)) setUnconfirmed(null);
+      setUnconfirmed(null);
     } catch (e) {
       toast(t("恢复失败：{{error}}", { error: String(e) }), "error");
     } finally {
