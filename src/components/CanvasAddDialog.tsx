@@ -26,7 +26,7 @@ export default function CanvasAddDialog({
     if (!open) return;
     let alive = true;
     api
-      .listHistory(RECENT_LIMIT, null)
+      .listHistory({ limit: RECENT_LIMIT })
       .then(({ items: page }) => {
         if (!alive) return;
         setItems(page);

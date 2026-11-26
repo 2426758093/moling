@@ -231,6 +231,15 @@ const CANVAS_PREV_SQL: &str = "
         ALTER TABLE canvas_boards ADD COLUMN data_json_prev TEXT NOT NULL DEFAULT '';
 ";
 
+/// 迁移 015：作品页全局排序。`file_size` 让「按大小」排序与展示不读盘，
+/// 存量行由启动后台回填（`backfill_file_sizes`）；prompt / file_size 索引
+/// 支撑 keyset 翻页，避免大表排序时全表扫。
+const HISTORY_SIZE_SQL: &str = "
+        ALTER TABLE history ADD COLUMN file_size INTEGER NOT NULL DEFAULT 0;
+        CREATE INDEX IF NOT EXISTS idx_history_file_size ON history(file_size, id);
+        CREATE INDEX IF NOT EXISTS idx_history_prompt ON history(prompt, id);
+";
+
 const MIGRATIONS: &[(&str, &str)] = &[
     ("001_tables", SCHEMA_SQL),
     ("002_indexes", INDEXES_SQL),
@@ -246,6 +255,7 @@ const MIGRATIONS: &[(&str, &str)] = &[
     ("012_provider_timeout_default", PROVIDER_TIMEOUT_DEFAULT_SQL),
     ("013_image_requests", IMAGE_REQUESTS_SQL),
     ("014_canvas_prev", CANVAS_PREV_SQL),
+    ("015_history_size", HISTORY_SIZE_SQL),
 ];
 
 /// 当前 schema 版本 = 迁移条数
@@ -507,6 +517,47 @@ mod tests {
             )
             .unwrap();
         assert!(prev.is_empty(), "新画布不应有旧版快照");
+    }
+
+    /// 迁移 015：历史表新增 file_size（默认 0）与 prompt / file_size 索引；
+    /// v14 旧库升级后既有行原样保留、可重复执行
+    #[test]
+    fn migration_015_adds_history_file_size() {
+        let mut c = Connection::open_in_memory().unwrap();
+        apply_migrations_with(&mut c, &MIGRATIONS[..14]).unwrap();
+        assert_eq!(user_version_of(&c), 14);
+        let has_size = |c: &Connection| -> i64 {
+            c.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('history') WHERE name = 'file_size'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(has_size(&c), 0);
+        c.execute(
+            "INSERT INTO history (prompt, file_path, created_at) VALUES ('旧图', '/tmp/old.png', '0')",
+            [],
+        )
+        .unwrap();
+
+        apply_migrations(&mut c).unwrap();
+        assert_eq!(user_version_of(&c), MIGRATIONS.len() as i64);
+        assert_eq!(has_size(&c), 1);
+        assert!(index_exists(&c, "idx_history_file_size"));
+        assert!(index_exists(&c, "idx_history_prompt"));
+        let size: i64 = c
+            .query_row(
+                "SELECT file_size FROM history WHERE prompt = '旧图'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(size, 0, "旧行应默认 0，等后台回填");
+
+        // 幂等：已是最新版本时再跑不报错
+        apply_migrations(&mut c).unwrap();
+        assert_eq!(user_version_of(&c), MIGRATIONS.len() as i64);
     }
 
     /// M9：008 老库升级到 009 成功且可重复执行

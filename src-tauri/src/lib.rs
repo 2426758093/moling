@@ -124,6 +124,14 @@ pub fn run() {
             std::mem::drop(tauri::async_runtime::spawn_blocking(move || {
                 image_gc::run(&gc_root)
             }));
+            // 历史文件大小回填：作品页「按大小」排序/详情列依赖它；后台分批，失败只落日志
+            std::mem::drop(tauri::async_runtime::spawn_blocking(|| {
+                match storage::backfill_file_sizes() {
+                    Ok(0) => {}
+                    Ok(n) => tracing::info!("已回填 {n} 条历史记录的文件大小"),
+                    Err(e) => tracing::warn!("回填历史文件大小失败: {e}"),
+                }
+            }));
             // 更新下载残留：超过 24h 的 .tmp/.pkg 清理掉，避免中断后占满缓存目录
             commands::cleanup_stale_downloads(app.handle());
             // 日志保留：只清理超过 7 天的滚动文件，跳过当天；失败仅落日志

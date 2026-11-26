@@ -1,7 +1,9 @@
 use super::*;
 
 use crate::error::{AppError, AppResult};
-use rusqlite::{params, Connection};
+use base64::Engine;
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,12 +35,25 @@ pub struct HistoryRow {
 fn default_op() -> String {
     "generate".to_string()
 }
+
+/// 原图字节数；文件缺失 / 不可读时填 0，列表按「—」展示。
+/// 只在写库时 stat 一次，读路径（列表）不再逐个读盘。
+fn file_size_of(path: &str) -> i64 {
+    std::fs::metadata(path).map(|m| m.len() as i64).unwrap_or(0)
+}
+
 pub fn add_history(h: &HistoryRow) -> AppResult<i64> {
     let c = conn()?;
+    add_history_in(&c, h)
+}
+
+pub(crate) fn add_history_in(c: &Connection, h: &HistoryRow) -> AppResult<i64> {
+    // 落库即记录文件大小：派生图（放大 / 风格 / 编辑 / 画布）也走这里，统一覆盖
+    let file_size = file_size_of(&h.file_path);
     c.execute(
         "INSERT INTO history (prompt, negative_prompt, model, provider_name, seed, width,
-         height, guidance, steps, style, file_path, favorite, created_at, parent_id, op)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+         height, guidance, steps, style, file_path, favorite, created_at, parent_id, op, file_size)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
         params![
             h.prompt,
             h.negative_prompt,
@@ -54,12 +69,15 @@ pub fn add_history(h: &HistoryRow) -> AppResult<i64> {
             h.favorite as i64,
             h.created_at,
             h.parent_id,
-            h.op
+            h.op,
+            file_size
         ],
     )?;
     Ok(c.last_insert_rowid())
 }
 
+/// 旧版分页接口：保留给设置导入测试与 before_id 兼容调用；作品页走 list_history_page。
+#[allow(dead_code)]
 pub fn list_history(
     limit: i64,
     offset: i64,
@@ -80,6 +98,7 @@ pub fn list_history(
     )
 }
 
+#[allow(dead_code)]
 pub(crate) fn list_history_in(
     c: &Connection,
     limit: i64,
@@ -132,6 +151,282 @@ pub(crate) fn list_history_in(
     values.push(&offset);
     let rows = stmt.query_map(values.as_slice(), history_from_row)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+/// 作品页查询：游标分页 + 筛选 + 全局排序 + 模糊查询。
+/// 字段由命令层从 IPC 参数填充，存储层只认这个结构。
+#[derive(Debug, Clone, Default)]
+pub struct HistoryQuery {
+    pub limit: i64,
+    pub offset: i64,
+    pub before_id: Option<i64>,
+    pub cursor: Option<String>,
+    pub model: String,
+    pub style: String,
+    pub favorite_only: bool,
+    pub query: String,
+    pub sort: String,
+    pub order: String,
+}
+
+/// 列表项：HistoryRow + 文件大小。`flatten` 让前端继续拿到 `history.fileSize`。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryListItem {
+    #[serde(flatten)]
+    pub row: HistoryRow,
+    pub file_size: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryPage {
+    pub items: Vec<HistoryListItem>,
+    pub has_more: bool,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CursorPayload {
+    sort: String,
+    order: String,
+    key: String,
+    id: i64,
+}
+
+fn canonical_sort(sort: &str) -> &'static str {
+    match sort {
+        "name" => "name",
+        "type" => "type",
+        "model" => "model",
+        "style" => "style",
+        "size" => "size",
+        "dimensions" => "dimensions",
+        "favorite" => "favorite",
+        _ => "date",
+    }
+}
+
+fn sort_expr(sort: &str) -> &'static str {
+    match sort {
+        "name" => "prompt",
+        "type" => {
+            "CASE WHEN lower(file_path) LIKE '%.gif' THEN 'gif' \
+             WHEN lower(file_path) LIKE '%.jpg' OR lower(file_path) LIKE '%.jpeg' THEN 'jpeg' \
+             WHEN lower(file_path) LIKE '%.webp' THEN 'webp' ELSE 'png' END"
+        }
+        "model" => "model",
+        "style" => "style",
+        "size" => "file_size",
+        "dimensions" => "(width * height)",
+        "favorite" => "favorite",
+        _ => "created_at",
+    }
+}
+
+/// 与 sort_expr 的类型 CASE 保持同口径，避免游标边界与排序键不一致
+fn type_key(path: &str) -> String {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".gif") {
+        "gif".into()
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        "jpeg".into()
+    } else if lower.ends_with(".webp") {
+        "webp".into()
+    } else {
+        "png".into()
+    }
+}
+
+fn is_numeric_sort(sort: &str) -> bool {
+    matches!(sort, "size" | "dimensions" | "favorite")
+}
+
+fn cursor_key(item: &HistoryListItem, sort: &str) -> String {
+    match sort {
+        "name" => item.row.prompt.clone(),
+        "type" => type_key(&item.row.file_path),
+        "model" => item.row.model.clone(),
+        "style" => item.row.style.clone(),
+        "size" => item.file_size.to_string(),
+        "dimensions" => (item.row.width * item.row.height).to_string(),
+        "favorite" => (item.row.favorite as i64).to_string(),
+        _ => item.row.created_at.clone(),
+    }
+}
+
+fn encode_cursor(sort: &str, order: &str, key: String, id: i64) -> String {
+    let payload = CursorPayload {
+        sort: sort.to_string(),
+        order: order.to_string(),
+        key,
+        id,
+    };
+    let bytes = serde_json::to_vec(&payload).unwrap_or_default();
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+fn decode_cursor(raw: &str, sort: &str, order: &str) -> Option<(Value, i64)> {
+    let bytes = base64::engine::general_purpose::STANDARD.decode(raw).ok()?;
+    let payload: CursorPayload = serde_json::from_slice(&bytes).ok()?;
+    if payload.sort != sort || payload.order != order {
+        return None;
+    }
+    let key = if is_numeric_sort(sort) {
+        Value::Integer(payload.key.parse::<i64>().ok()?)
+    } else {
+        Value::Text(payload.key)
+    };
+    Some((key, payload.id))
+}
+
+fn escape_like(raw: &str) -> String {
+    raw.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn history_item_from_row(row: &rusqlite::Row) -> rusqlite::Result<HistoryListItem> {
+    Ok(HistoryListItem {
+        row: history_from_row(row)?,
+        file_size: row.get(16)?,
+    })
+}
+
+/// 作品页查询：服务端完成筛选/查询/全局排序，游标保证翻页不重不漏。
+pub fn list_history_page(q: &HistoryQuery) -> AppResult<HistoryPage> {
+    let c = conn()?;
+    list_history_page_in(&c, q)
+}
+
+pub(crate) fn list_history_page_in(c: &Connection, q: &HistoryQuery) -> AppResult<HistoryPage> {
+    let limit = q.limit.clamp(1, 200);
+    let offset = q.offset.max(0);
+    let sort = canonical_sort(&q.sort);
+    let order = if q.order == "asc" { "ASC" } else { "DESC" };
+    let order_l = order.to_ascii_lowercase();
+    let key_expr = sort_expr(sort);
+    // 旧 before_id 调用必须保持 id DESC；新作品页一律走游标。
+    let legacy = q.cursor.as_deref().filter(|s| !s.is_empty()).is_none() && q.before_id.is_some();
+
+    let mut conditions: Vec<String> = Vec::new();
+    let mut values: Vec<Value> = Vec::new();
+
+    // 游标优先；给了游标但解析失败时按首页处理，不回退 before_id（避免跳到错误位置）。
+    if let Some(raw) = q.cursor.as_deref().filter(|s| !s.is_empty()) {
+        if let Some((key, id)) = decode_cursor(raw, sort, &order_l) {
+            let op = if order == "ASC" { ">" } else { "<" };
+            conditions.push(format!(
+                "({key_expr} {op} ? OR ({key_expr} = ? AND id {op} ?))"
+            ));
+            values.push(key.clone());
+            values.push(key);
+            values.push(Value::Integer(id));
+        }
+    } else if let Some(before_id) = q.before_id.filter(|id| *id > 0) {
+        conditions.push("id < ?".into());
+        values.push(Value::Integer(before_id));
+    }
+
+    if !q.model.is_empty() {
+        conditions.push("model = ?".into());
+        values.push(Value::Text(q.model.clone()));
+    }
+    if !q.style.is_empty() {
+        conditions.push("style = ?".into());
+        values.push(Value::Text(q.style.clone()));
+    }
+    if q.favorite_only {
+        conditions.push("favorite = 1".into());
+    }
+    let query = q.query.trim();
+    if !query.is_empty() {
+        let pattern = format!("%{}%", escape_like(query));
+        conditions.push("(prompt LIKE ? ESCAPE '\\' OR model LIKE ? ESCAPE '\\')".into());
+        values.push(Value::Text(pattern.clone()));
+        values.push(Value::Text(pattern));
+    }
+
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+    let order_clause = if legacy {
+        "id DESC".to_string()
+    } else {
+        format!("{key_expr} {order}, id {order}")
+    };
+    let sql = format!(
+        "SELECT id, prompt, negative_prompt, model, provider_name, seed, width, height,
+         guidance, steps, style, file_path, favorite, created_at, parent_id, op, file_size
+         FROM history{where_clause} ORDER BY {order_clause} LIMIT ? OFFSET ?"
+    );
+
+    values.push(Value::Integer(limit + 1));
+    values.push(Value::Integer(offset));
+
+    let mut stmt = c.prepare(&sql)?;
+    let mut rows = stmt.query(params_from_iter(values))?;
+    let mut items: Vec<HistoryListItem> = Vec::new();
+    while let Some(row) = rows.next()? {
+        items.push(history_item_from_row(row)?);
+    }
+    let has_more = items.len() as i64 > limit;
+    if has_more {
+        items.truncate(limit as usize);
+    }
+    let next_cursor = if has_more && !legacy {
+        items
+            .last()
+            .map(|item| encode_cursor(sort, &order_l, cursor_key(item, sort), item.row.id))
+    } else {
+        None
+    };
+    Ok(HistoryPage {
+        items,
+        has_more,
+        next_cursor,
+    })
+}
+
+/// 启动后台回填文件大小：只处理 file_size = 0 的行；文件缺失写 -1 作为「已检查」。
+pub fn backfill_file_sizes() -> AppResult<usize> {
+    let c = conn()?;
+    backfill_file_sizes_in(&c)
+}
+
+pub(crate) fn backfill_file_sizes_in(c: &Connection) -> AppResult<usize> {
+    let mut total = 0usize;
+    for _ in 0..100 {
+        let rows: Vec<(i64, String)> = {
+            let mut stmt =
+                c.prepare("SELECT id, file_path FROM history WHERE file_size = 0 LIMIT 200")?;
+            let mapped = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let mut out = Vec::new();
+            for row in mapped {
+                out.push(row?);
+            }
+            out
+        };
+        if rows.is_empty() {
+            break;
+        }
+        for (id, path) in &rows {
+            let size = file_size_of(path);
+            let value = if size > 0 { size } else { -1 };
+            c.execute(
+                "UPDATE history SET file_size = ?1 WHERE id = ?2 AND file_size = 0",
+                params![value, id],
+            )?;
+        }
+        total += rows.len();
+        if rows.len() < 200 {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 /// 画廊记录的原图路径（get_history_image 用）；记录不存在返回 None
@@ -468,5 +763,202 @@ mod tests {
         )
         .unwrap();
         assert_eq!(history_lineage_in(&c, cc).unwrap().len(), 32);
+    }
+
+    /// 作品页：名称升序游标翻页、大小降序、模糊查询与 before_id 兼容
+    #[test]
+    fn list_history_page_sorts_paginates_and_queries() {
+        let c = mem_conn();
+        let insert = |prompt: &str, size: i64, created: &str| {
+            c.execute(
+                "INSERT INTO history (prompt, model, provider_name, style, file_path,
+                 favorite, created_at, op, file_size)
+                 VALUES (?1, 'm', 'P', 's', ?2, 0, ?3, 'generate', ?4)",
+                params![prompt, format!("/tmp/{prompt}.png"), created, size],
+            )
+            .unwrap();
+        };
+        insert("d", 40, "1");
+        insert("b", 10, "2");
+        insert("a", 30, "3");
+        insert("c", 20, "4");
+
+        let page = list_history_page_in(
+            &c,
+            &HistoryQuery {
+                limit: 2,
+                sort: "name".into(),
+                order: "asc".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|i| i.row.prompt.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert!(page.has_more);
+
+        let page2 = list_history_page_in(
+            &c,
+            &HistoryQuery {
+                limit: 2,
+                cursor: page.next_cursor,
+                sort: "name".into(),
+                order: "asc".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            page2
+                .items
+                .iter()
+                .map(|i| i.row.prompt.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c", "d"]
+        );
+        assert!(!page2.has_more);
+        assert!(page2.next_cursor.is_none());
+
+        let by_size = list_history_page_in(
+            &c,
+            &HistoryQuery {
+                limit: 4,
+                sort: "size".into(),
+                order: "desc".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            by_size
+                .items
+                .iter()
+                .map(|i| i.row.prompt.as_str())
+                .collect::<Vec<_>>(),
+            vec!["d", "a", "c", "b"]
+        );
+
+        let filtered = list_history_page_in(
+            &c,
+            &HistoryQuery {
+                limit: 10,
+                query: "a".into(),
+                sort: "name".into(),
+                order: "asc".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            filtered
+                .items
+                .iter()
+                .map(|i| i.row.prompt.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a"]
+        );
+
+        let legacy = list_history_page_in(
+            &c,
+            &HistoryQuery {
+                limit: 2,
+                before_id: Some(3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.items.iter().map(|i| i.row.id).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+    }
+
+    /// 类型排序 + 前端契约：HistoryListItem 必须序列化出 fileSize（camelCase）
+    #[test]
+    fn list_history_page_sorts_by_type_and_serializes_file_size() {
+        let c = mem_conn();
+        for (prompt, path, style) in [
+            ("a", "/tmp/a.png", "oil"),
+            ("b", "/tmp/b.gif", "anime"),
+            ("c", "/tmp/c.jpg", "oil"),
+        ] {
+            c.execute(
+                "INSERT INTO history (prompt, model, provider_name, style, file_path,
+                 favorite, created_at, op, file_size, width, height)
+                 VALUES (?1, 'm', 'P', ?2, ?3, 0, '1', 'generate', 10, 100, 100)",
+                params![prompt, style, path],
+            )
+            .unwrap();
+        }
+        let page = list_history_page_in(
+            &c,
+            &HistoryQuery {
+                limit: 10,
+                sort: "type".into(),
+                order: "asc".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|i| i.row.prompt.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "c", "a"]
+        );
+        let value = serde_json::to_value(&page.items[0]).unwrap();
+        assert!(value.get("fileSize").is_some(), "前端需要 fileSize");
+        assert!(value.get("file_path").is_none(), "必须序列化为 camelCase");
+    }
+
+    /// 启动回填：真实文件写实际大小，缺失文件写 -1 防止无限重试
+    #[test]
+    fn backfill_file_sizes_sets_size_and_marks_missing() {
+        let c = mem_conn();
+        let file = std::env::temp_dir().join(format!(
+            "moling-history-size-{}-{}.png",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&file, b"12345").unwrap();
+        c.execute(
+            "INSERT INTO history (prompt, file_path, op) VALUES ('with-file', ?1, 'generate')",
+            params![file.to_string_lossy().to_string()],
+        )
+        .unwrap();
+        c.execute(
+            "INSERT INTO history (prompt, file_path, op) VALUES ('missing', 'Z:/definitely/missing.png', 'generate')",
+            [],
+        )
+        .unwrap();
+
+        let n = backfill_file_sizes_in(&c).unwrap();
+        assert_eq!(n, 2);
+        let with_file: i64 = c
+            .query_row(
+                "SELECT file_size FROM history WHERE prompt = 'with-file'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(with_file, 5);
+        let missing: i64 = c
+            .query_row(
+                "SELECT file_size FROM history WHERE prompt = 'missing'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(missing, -1);
+        let _ = std::fs::remove_file(file);
     }
 }

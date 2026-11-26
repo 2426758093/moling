@@ -1613,40 +1613,61 @@ pub async fn save_chat_image(
 /// 画廊列表：只返回缩略图 data URL（缺失时为空串，前端显示占位）。
 /// 不回退原图：原图是几 MB 的 base64，回退会把列表响应撑爆。
 /// 读盘 + base64 编码是 CPU/IO 操作，整段放阻塞线程。
+// IPC 参数多是有意为之：保持前端平铺传参，避免再包一层结构体。
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn list_history(
     limit: Option<i64>,
     offset: Option<i64>,
     before_id: Option<i64>,
+    cursor: Option<String>,
     model: Option<String>,
     style: Option<String>,
     favorite_only: Option<bool>,
+    query: Option<String>,
+    sort: Option<String>,
+    order: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let limit = limit.unwrap_or(200);
-    let offset = offset.unwrap_or(0);
-    let model = model.unwrap_or_default();
-    let style = style.unwrap_or_default();
-    let favorite_only = favorite_only.unwrap_or(false);
+    let q = storage::HistoryQuery {
+        limit: limit.unwrap_or(200),
+        offset: offset.unwrap_or(0),
+        before_id,
+        cursor,
+        model: model.unwrap_or_default(),
+        style: style.unwrap_or_default(),
+        favorite_only: favorite_only.unwrap_or(false),
+        query: query.unwrap_or_default(),
+        sort: sort.unwrap_or_else(|| "date".into()),
+        order: order.unwrap_or_else(|| "desc".into()),
+    };
     tauri::async_runtime::spawn_blocking(move || {
-        let rows = storage::list_history(limit, offset, before_id, &model, &style, favorite_only)
-            .map_err(|e| e.to_string())?;
-        let items: Vec<serde_json::Value> = rows
+        let page = storage::list_history_page(&q).map_err(|e| e.to_string())?;
+        let items: Vec<serde_json::Value> = page
+            .items
             .into_iter()
-            .map(|r| {
-                let path = std::path::Path::new(&r.file_path);
+            .map(|item| {
+                let path = std::path::Path::new(&item.row.file_path);
                 let thumb = image_store::thumb_path_for(path);
                 let thumb_url =
                     image_store::path_to_data_url(&thumb.to_string_lossy()).unwrap_or_default();
                 // 动图元数据按需探测文件头（不落库、不解码像素）；探测失败不影响列表
-                let animation = if r.file_path.to_ascii_lowercase().ends_with(".gif") {
+                let animation = if item.row.file_path.to_ascii_lowercase().ends_with(".gif") {
                     crate::animation::probe_path(path).ok()
                 } else {
                     None
                 };
-                serde_json::json!({ "history": r, "thumbUrl": thumb_url, "animation": animation })
+                serde_json::json!({
+                    "history": item,
+                    "thumbUrl": thumb_url,
+                    "animation": animation
+                })
             })
             .collect();
-        Ok(serde_json::json!({ "items": items }))
+        Ok(serde_json::json!({
+            "items": items,
+            "hasMore": page.has_more,
+            "nextCursor": page.next_cursor
+        }))
     })
     .await
     .map_err(|e| format!("读取画廊失败: {e}"))?

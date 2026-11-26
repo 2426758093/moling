@@ -171,6 +171,8 @@ export interface HistoryItem {
     filePath: string;
     favorite: boolean;
     createdAt: string;
+    /** 原图字节数；旧数据未回填时为 0，界面显示「—」 */
+    fileSize: number;
     /** 派生图血统：父记录 id 与来源操作（generate / edit / upscale / style…） */
     parentId: number | null;
     op: string;
@@ -181,6 +183,48 @@ export interface HistoryItem {
   animation?: AnimationInfo | null;
 }
 
+/** 作品页全局排序键；与服务端 list_history 的 sort 参数一一对应 */
+export type HistorySort =
+  | "date"
+  | "name"
+  | "type"
+  | "size"
+  | "dimensions"
+  | "model"
+  | "style"
+  | "favorite";
+
+export type SortOrder = "asc" | "desc";
+
+/** 作品页查询参数：游标分页 + 筛选 + 全局排序 */
+export interface HistoryQueryArgs {
+  limit?: number;
+  /** 不透明游标；首页传 null/省略。旧版 beforeId 仍可由后端兼容。 */
+  cursor?: string | null;
+  model?: string;
+  style?: string;
+  favoriteOnly?: boolean;
+  /** 提示词 / 模型模糊查询 */
+  query?: string;
+  sort?: HistorySort;
+  order?: SortOrder;
+}
+
+export interface HistoryPage {
+  items: HistoryItem[];
+  hasMore: boolean;
+  nextCursor: string | null;
+}
+
+/** 服务商连接测试结果；error 兼容旧后端的 JSON 字符串 */
+export interface ConnectionTestResult {
+  ok: boolean;
+  latencyMs?: number;
+  modelCount?: number;
+  status?: number;
+  error?: AdapterError | string;
+}
+
 /** history_lineage 返回的裸历史行（不是 HistoryItem 包装） */
 export interface HistoryRowView {
   id: number;
@@ -189,6 +233,8 @@ export interface HistoryRowView {
   width: number;
   height: number;
   filePath: string;
+  /** 旧版后端/测试夹具可能省略；界面按 0 处理并显示「—」 */
+  fileSize?: number;
   parentId: number | null;
   op: string;
   createdAt: string;
@@ -528,13 +574,7 @@ export const api = {
     entries: Record<string, ModelCaps>,
   ) => invoke<void>("save_model_caps_batch", { providerId, entries }),
   testConnection: (id: number) =>
-    invoke<{
-      ok: boolean;
-      latencyMs?: number;
-      modelCount?: number;
-      // 后端返回 AdapterError 的 JSON 字符串（或裸字符串），由 parseAdapterError 兼容
-      error?: string;
-    }>("test_connection", { id }),
+    invoke<ConnectionTestResult>("test_connection", { id }),
   getProxyConfig: () => invoke<ProxyConfigView>("get_proxy_config"),
   saveProxyConfig: (input: ProxyInputPayload) =>
     invoke<ProxyConfigView>("save_proxy_config", { input }),
@@ -733,20 +773,20 @@ export const api = {
     invoke<{ items: HistoryItem["history"][] }>("list_derived", {
       historyId,
     }),
-  /** 画廊分页：beforeId 为上一页最后一条的 id（游标），首页传 null */
-  listHistory: (
-    limit?: number,
-    beforeId?: number | null,
-    model?: string,
-    style?: string,
-    favoriteOnly?: boolean,
-  ) =>
-    invoke<{ items: HistoryItem[] }>("list_history", {
-      limit,
-      beforeId,
-      model,
-      style,
-      favoriteOnly,
+  /**
+   * 作品页分页：游标为不透明字符串，首页传 null/省略。
+   * 服务端负责筛选、查询与全局排序；beforeId 旧参数由 Rust 侧继续兼容。
+   */
+  listHistory: (args: HistoryQueryArgs = {}) =>
+    invoke<HistoryPage>("list_history", {
+      limit: args.limit,
+      cursor: args.cursor ?? null,
+      model: args.model,
+      style: args.style,
+      favoriteOnly: args.favoriteOnly,
+      query: args.query,
+      sort: args.sort,
+      order: args.order,
     }),
   getHistoryImage: (id: number) =>
     invoke<{ historyId: number; dataUrl: string; filePath: string }>(
