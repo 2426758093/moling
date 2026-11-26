@@ -7,16 +7,6 @@ use base64::Engine;
 
 pub struct OpenAiAdapter;
 
-#[derive(serde::Deserialize)]
-struct ModelListResponse {
-    data: Vec<ModelEntry>,
-}
-
-#[derive(serde::Deserialize)]
-struct ModelEntry {
-    id: String,
-}
-
 #[derive(serde::Serialize)]
 struct GenerationBody {
     model: String,
@@ -116,6 +106,71 @@ pub(crate) fn truncate_preview(body: &str, max_chars: usize) -> String {
         Some((idx, _)) => format!("{}…", &body[..idx]),
         None => body.to_string(),
     }
+}
+
+/// `/models` 的去噪上限：部分中转会把全部内部模型一次性返回，列表页只需要可选项
+pub(crate) const MAX_LIST_MODELS: usize = 2000;
+
+/// 模型条目的名字：字符串直接取用，对象取 `id`（其次 `name`），其余形状忽略。
+fn model_name(item: &serde_json::Value) -> Option<&str> {
+    match item {
+        serde_json::Value::String(name) => Some(name.as_str()),
+        serde_json::Value::Object(map) => map
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| map.get("name").and_then(serde_json::Value::as_str)),
+        _ => None,
+    }
+}
+
+/// 兼容常见 `/models` 响应形状：`{data:[...]}`、`{models:[...]}`、`{result:[...]}` 与顶层数组；
+/// 元素可以是字符串或带 `id`/`name` 的对象。去空、trim、去重、字典序、上限 2000。
+/// 完全没有可识别的数组时返回 None，由调用方补充响应预览。
+pub(crate) fn parse_models_payload(payload: &serde_json::Value) -> Option<Vec<String>> {
+    let items = match payload {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(map) => ["data", "models", "result"]
+            .iter()
+            .find_map(|key| map.get(*key).and_then(serde_json::Value::as_array))?,
+        _ => return None,
+    };
+    let names: std::collections::BTreeSet<String> = items
+        .iter()
+        .filter_map(model_name)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+    Some(names.into_iter().take(MAX_LIST_MODELS).collect())
+}
+
+/// 解析 2xx 的 `/models` 响应体：非法 JSON / 无模型数组都归为 Other，保留响应预览。
+fn parse_models_body(body: &str) -> Result<Vec<String>, AdapterError> {
+    let payload: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| AdapterError::Other {
+            message: format!(
+                "/models 返回非法 JSON: {e}；预览: {}",
+                truncate_preview(body, 300)
+            ),
+        })?;
+    parse_models_payload(&payload).ok_or_else(|| AdapterError::Other {
+        message: format!(
+            "/models 返回格式无法解析（缺少 data/models/result 数组）: {}",
+            truncate_preview(body, 300)
+        ),
+    })
+}
+
+/// `/models` 的统一响应处理：非 2xx 走既有错误分类（保留状态码与响应预览），
+/// 2xx 再按多种形状解析，保证拉取列表与连接测试共用同一错误路径。
+pub(crate) fn parse_models_response(
+    status: reqwest::StatusCode,
+    body: &str,
+) -> Result<Vec<String>, AdapterError> {
+    if !status.is_success() {
+        return Err(classify_http(status, body));
+    }
+    parse_models_body(body)
 }
 
 /// `/images/edits` 的表单文本字段：嵌套值无法作为表单发送直接跳过。
@@ -593,18 +648,14 @@ impl ImageAdapter for OpenAiAdapter {
                 .send()
                 .await
                 .map_err(|e| classify_reqwest(&e))?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let body = resp.text().await.unwrap_or_default();
-                return Err(classify_http(status, &body));
-            }
-            let body = resp.text().await.map_err(|e| classify_reqwest(&e))?;
-            if let Ok(list) = serde_json::from_str::<ModelListResponse>(&body) {
-                return Ok(list.data.into_iter().map(|m| m.id).collect());
-            }
-            Err(AdapterError::Other {
-                message: format!("/models 返回格式无法解析: {}", truncate_preview(&body, 300)),
-            })
+            let status = resp.status();
+            // 错误体很小且必须保留预览；成功体走请求级超时，避免长列表卡住设置页
+            let body = if status.is_success() {
+                resp.text().await.map_err(|e| classify_reqwest(&e))?
+            } else {
+                super::read_error_text(resp).await
+            };
+            parse_models_response(status, &body)
         })
     }
 
@@ -1150,6 +1201,99 @@ mod tests {
             "unknown parameter: image[] is deprecated"
         ));
         assert!(!suggests_singular_image_field("content policy violation"));
+    }
+
+    /// 五种常见 `/models` 响应形状都能解析：data 对象 / data 字符串 / models 混合 / result / 顶层数组
+    #[test]
+    fn parse_models_payload_accepts_common_shapes() {
+        let cases: [(&str, Vec<&str>); 5] = [
+            (r#"{"data":[{"id":"b"},{"id":"a"}]}"#, vec!["a", "b"]),
+            (
+                r#"{"data":["gpt-image-1","dall-e-3"]}"#,
+                vec!["dall-e-3", "gpt-image-1"],
+            ),
+            (
+                r#"{"models":["sdxl",{"id":"z-image"},{"name":"flux-pro"}]}"#,
+                vec!["flux-pro", "sdxl", "z-image"],
+            ),
+            (r#"{"result":[{"name":"kandinsky"}]}"#, vec!["kandinsky"]),
+            (
+                r#"["midjourney",{"id":"imagen"}]"#,
+                vec!["imagen", "midjourney"],
+            ),
+        ];
+        for (raw, expected) in cases {
+            let payload: serde_json::Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(
+                parse_models_payload(&payload).unwrap(),
+                expected,
+                "形状解析不符: {raw}"
+            );
+        }
+        // 没有可识别数组 / 非对象非数组时返回 None，交由调用方带预览报错
+        assert!(parse_models_payload(&serde_json::json!({ "unexpected": 1 })).is_none());
+        assert!(parse_models_payload(&serde_json::json!("text")).is_none());
+        assert!(parse_models_payload(&serde_json::json!({ "data": "oops" })).is_none());
+    }
+
+    /// trim / 去空 / 去重 / 字典序：不能让空串或重复项污染服务商模型列表
+    #[test]
+    fn parse_models_payload_trims_and_dedupes() {
+        let payload = serde_json::json!({
+            "data": [" b ", "a", "b", "", "   ", { "id": "" }, { "name": " a " }, 7, null]
+        });
+        assert_eq!(
+            parse_models_payload(&payload).unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        // 空数组是合法响应，返回空列表而不是错误
+        assert_eq!(
+            parse_models_payload(&serde_json::json!({ "data": [] })),
+            Some(Vec::new())
+        );
+    }
+
+    /// 超过上限时截断到 2000：保留字典序靠前的部分，且先去重再截断
+    #[test]
+    fn parse_models_payload_caps_at_limit() {
+        let items: Vec<String> = (0..MAX_LIST_MODELS + 500)
+            .map(|i| format!("m{i:05}"))
+            .collect();
+        let out = parse_models_payload(&serde_json::json!({ "data": items })).unwrap();
+        assert_eq!(out.len(), MAX_LIST_MODELS);
+        assert_eq!(out.first().map(String::as_str), Some("m00000"));
+        assert_eq!(out.last().map(String::as_str), Some("m01999"));
+    }
+
+    /// 非法 JSON 与非 2xx：错误分类沿用 AdapterError，并保留状态码/响应预览
+    #[test]
+    fn parse_models_response_reports_bad_body_and_status() {
+        let err =
+            parse_models_response(reqwest::StatusCode::OK, "<html>not json</html>").unwrap_err();
+        assert!(err.message().contains("非法 JSON"), "{}", err.message());
+        assert!(err.message().contains("not json"), "{}", err.message());
+
+        let err =
+            parse_models_response(reqwest::StatusCode::OK, r#"{"unexpected":1}"#).unwrap_err();
+        assert!(err.message().contains("无法解析"), "{}", err.message());
+
+        let err =
+            parse_models_response(reqwest::StatusCode::UNAUTHORIZED, r#"{"error":"bad key"}"#)
+                .unwrap_err();
+        match err {
+            AdapterError::AuthInvalid { message, status } => {
+                assert_eq!(status, 401);
+                assert!(message.contains("bad key"), "{message}");
+            }
+            other => panic!("401 应归类为 AuthInvalid: {other:?}"),
+        }
+
+        let err =
+            parse_models_response(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "boom").unwrap_err();
+        assert!(
+            matches!(err, AdapterError::Upstream { status: 500, .. }),
+            "{err:?}"
+        );
     }
 
     /// F-012：空结果必须报错，非空结果可取到首张

@@ -1,9 +1,14 @@
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { api, parseAdapterError, ProviderItem } from "../../lib/api";
+import { api, ProviderItem } from "../../lib/api";
 import { useProviderStore } from "../../stores/providerStore";
 import { KIND_OPTIONS } from "./ui";
 import { Button } from "../ui/Button";
+import {
+  ConnectionErrorBanner,
+  describeConnectionError,
+  type ConnectionErrorInfo,
+} from "./ProviderDialog/connectionError";
 
 export default function ProviderCard({
   item,
@@ -16,29 +21,31 @@ export default function ProviderCard({
   const remove = useProviderStore((s) => s.remove);
   const defaultProviderId = useProviderStore((s) => s.defaultProviderId);
   const setDefaultProvider = useProviderStore((s) => s.setDefaultProvider);
-  const [status, setStatus] = useState("");
+  const [testing, setTesting] = useState(false);
+  const [success, setSuccess] = useState<{ ms: number; n: number } | null>(
+    null,
+  );
+  const [testError, setTestError] = useState<ConnectionErrorInfo | null>(null);
   const p = item.provider;
   const isDefault = defaultProviderId === p.id;
   const kindLabel = KIND_OPTIONS.find((k) => k.id === p.kind)?.label;
 
   const doTest = async () => {
-    setStatus(t("测试中…"));
+    if (!p.id || testing) return;
+    setTesting(true);
+    setSuccess(null);
+    setTestError(null);
     try {
-      const r = await api.testConnection(p.id!);
-      setStatus(
-        r.ok
-          ? t("连接正常 · {{ms}}ms · {{n}} 个模型", {
-              ms: r.latencyMs ?? 0,
-              n: r.modelCount ?? 0,
-            })
-          : t("连接失败：{{error}}", {
-              error: r.error
-                ? parseAdapterError(r.error).message
-                : t("未知错误"),
-            }),
-      );
+      const r = await api.testConnection(p.id);
+      if (r.ok) {
+        setSuccess({ ms: r.latencyMs ?? 0, n: r.modelCount ?? 0 });
+      } else {
+        setTestError(describeConnectionError(r.error, r.status));
+      }
     } catch (e) {
-      setStatus(t("连接失败：{{error}}", { error: String(e) }));
+      setTestError(describeConnectionError(String(e)));
+    } finally {
+      setTesting(false);
     }
   };
 
@@ -76,8 +83,23 @@ export default function ProviderCard({
               {t("Key 失效：请重新填写")}
             </div>
           )}
-          {status && (
-            <div className="mt-0.5 text-footnote text-secondary">{status}</div>
+          {testing && (
+            <div className="mt-0.5 text-footnote text-secondary">
+              {t("测试中…")}
+            </div>
+          )}
+          {success && (
+            <div role="status" className="mt-0.5 text-footnote text-success">
+              {t("连接正常 · {{ms}}ms · {{n}} 个模型", {
+                ms: success.ms,
+                n: success.n,
+              })}
+            </div>
+          )}
+          {testError && (
+            <div className="mt-1">
+              <ConnectionErrorBanner error={testError} />
+            </div>
           )}
         </div>
         <div className="flex shrink-0 items-center gap-1.5">
@@ -101,6 +123,8 @@ export default function ProviderCard({
           </Button>
           <Button
             size="sm"
+            loading={testing}
+            disabled={testing}
             onClick={() => void doTest()}
             aria-label={t("测试服务商 {{name}}", { name: p.name })}
           >

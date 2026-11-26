@@ -154,6 +154,64 @@ const settings = {
 
   // 快捷键
   在任何页面都可用: "Works on any page",
+
+  // 服务商向导：快速预设与连接测试
+  快速预设: "Quick presets",
+  "推荐模型：{{models}}": "Recommended models: {{models}}",
+  "自定义（OpenAI 兼容）": "Custom (OpenAI-compatible)",
+  自定义模板: "Custom template",
+  "Mock 调试": "Mock debug",
+  "官方接口，需要 API Key；推荐 gpt-image-1 / gpt-image-1-mini / dall-e-3。":
+    "Official API; requires an API key. gpt-image-1, gpt-image-1-mini and dall-e-3 are recommended.",
+  "OpenAI 兼容接口，需先在控制台创建 API Key。":
+    "OpenAI-compatible API; create an API key in the console first.",
+  "本地推理，无需 Key；请先启动 Ollama 并拉取图像模型。":
+    "Local inference without a key; start Ollama and pull an image model first.",
+  "本地服务，无需 Key；请先在 LM Studio 中启动本地服务器。":
+    "Local service without a key; start the local server in LM Studio first.",
+  "第三方中转或私有网关请选此项，并填写确认可用的 /v1 地址。":
+    "Use this for third-party gateways or private endpoints, and enter a verified /v1 URL.",
+  "占位符模板接口，模型列表需手动填写。":
+    "Placeholder template API; enter the model list manually.",
+  "离线调试适配器，不发出真实网络请求。":
+    "Offline debug adapter; no real network requests are sent.",
+  本地服务可留空: "Optional for local services",
+  "本地服务可以不填 Key": "Local services don't need an API key",
+  "修改地址或接口类型后，请重新填写 API Key 再测试或拉取":
+    "Re-enter the API key after changing the base URL or provider type",
+  连接失败: "Connection failed",
+  "Key 无效，请检查 API Key": "Invalid key — check your API key",
+  "Key 无权限访问该接口": "Key can't access this endpoint",
+  "Base URL 可能缺少 /v1": "Base URL may be missing /v1",
+  服务商响应超时: "Provider timed out",
+  "网络错误，请检查地址或代理": "Network error — check the URL or proxy",
+
+  // 服务商向导：模型拉取与保存摘要
+  模型列表: "Models",
+  "共 {{n}} 个模型": "{{n}} models",
+  重新拉取: "Reload",
+  "还没有模型，请检查地址与 Key 后重试。":
+    "No models yet. Check the URL and key, then try again.",
+  搜索模型: "Search models",
+  模型筛选: "Model filter",
+  图像: "Image",
+  推荐: "Recommended",
+  排序: "Sort",
+  默认排序: "Default order",
+  "名称 A–Z": "Name A–Z",
+  推荐优先: "Recommended first",
+  "把 {{model}} 设为默认模型": "Set {{model}} as default",
+  没有匹配的模型: "No matching models",
+  "{{n}} 项修改": "{{n}} edits",
+  保存前确认: "Review before saving",
+  确认保存: "Review",
+  未命名: "Unnamed",
+  地址: "URL",
+  模型数: "Models",
+  能力修改: "Capability edits",
+  "{{n}} 项": "{{n}} items",
+  "还没有可用模型，请返回上一步拉取或检查地址与 Key。":
+    "No models available. Go back and reload, or check the URL and key.",
 } as const;
 
 export default settings;

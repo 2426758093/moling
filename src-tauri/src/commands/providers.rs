@@ -309,17 +309,49 @@ pub async fn test_models(input: ProviderInput) -> Result<Vec<String>, String> {
         .map_err(adapters::adapter_error_json)
 }
 
+/// AdapterError → 前端可直接读取的错误对象（不再套一层 JSON 字符串）
+fn error_value(e: &adapters::AdapterError) -> serde_json::Value {
+    serde_json::to_value(e).unwrap_or_else(|_| {
+        serde_json::json!({
+            "type": "other",
+            "message": e.message(),
+        })
+    })
+}
+
+/// 连接测试失败结果：`{ ok:false, error:{ type, message, status? }, status? }`。
+/// 顶层 status 只在已知 HTTP 状态码（401/403/5xx 等）时给出，Key 池据此提示。
+fn connection_failure(e: &adapters::AdapterError) -> serde_json::Value {
+    let status = match e {
+        adapters::AdapterError::AuthInvalid { status, .. }
+        | adapters::AdapterError::Upstream { status, .. } => Some(*status).filter(|s| *s != 0),
+        _ => None,
+    };
+    let mut value = serde_json::json!({
+        "ok": false,
+        "error": error_value(e),
+    });
+    if let (Some(status), Some(obj)) = (status, value.as_object_mut()) {
+        obj.insert("status".to_string(), serde_json::json!(status));
+    }
+    value
+}
+
 #[tauri::command]
 pub async fn test_connection(id: i64) -> Result<serde_json::Value, String> {
     let start = std::time::Instant::now();
-    let candidates = key_pool::candidates(id)?;
+    let candidates = match key_pool::candidates(id) {
+        Ok(candidates) => candidates,
+        Err(e) => {
+            return Ok(connection_failure(&adapters::AdapterError::Other {
+                message: e,
+            }))
+        }
+    };
     if candidates.is_empty() {
-        return Ok(serde_json::json!({
-            "ok": false,
-            "error": adapters::adapter_error_json(adapters::AdapterError::AuthInvalid {
-                message: "该服务商还没有配置 API Key".to_string(),
-                status: 0,
-            }),
+        return Ok(connection_failure(&adapters::AdapterError::AuthInvalid {
+            message: "该服务商还没有配置 API Key".to_string(),
+            status: 0,
         }));
     }
     let mut last_err: Option<adapters::AdapterError> = None;
@@ -341,18 +373,12 @@ pub async fn test_connection(id: i64) -> Result<serde_json::Value, String> {
                 key_pool::note_auth_failure(id, candidate.index, &e);
                 last_err = Some(e);
             }
-            Err(e) => {
-                return Ok(serde_json::json!({
-                    "ok": false,
-                    "error": e,
-                }))
-            }
+            Err(e) => return Ok(connection_failure(&e)),
         }
     }
-    Ok(serde_json::json!({
-        "ok": false,
-        "error": last_err.expect("候选列表非空时必有结果或错误"),
-    }))
+    Ok(connection_failure(
+        &last_err.expect("候选列表非空时必有结果或错误"),
+    ))
 }
 
 /// 导出配置（备份 v4）：`include_keys` 默认 false，不把明文 API Key 写进文件；
@@ -523,4 +549,41 @@ pub async fn import_config(app: tauri::AppHandle, data: serde_json::Value) -> Re
     adapters::init_body_timeouts();
     tracing::warn!("配置导入完成（替换语义）：{count} 个服务商");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 契约：失败时 error 是结构化对象（type/message/status），不是二层 JSON 字符串
+    #[test]
+    fn connection_failure_returns_structured_error() {
+        let err = adapters::AdapterError::AuthInvalid {
+            message: "bad key".into(),
+            status: 401,
+        };
+        let value = connection_failure(&err);
+        assert_eq!(value["ok"], false);
+        assert!(value["error"].is_object(), "error 必须是对象: {value}");
+        assert_eq!(value["error"]["type"], "auth_invalid");
+        assert_eq!(value["error"]["message"], "bad key");
+        assert_eq!(value["status"], 401);
+    }
+
+    /// 非 HTTP 类错误不带顶层 status；status=0（无 Key）也不输出假状态码
+    #[test]
+    fn connection_failure_omits_unknown_status() {
+        let network = connection_failure(&adapters::AdapterError::Network {
+            message: "connection reset".into(),
+        });
+        assert_eq!(network["error"]["type"], "network");
+        assert!(network.get("status").is_none(), "{network}");
+
+        let no_key = connection_failure(&adapters::AdapterError::AuthInvalid {
+            message: "no key".into(),
+            status: 0,
+        });
+        assert_eq!(no_key["error"]["type"], "auth_invalid");
+        assert!(no_key.get("status").is_none(), "{no_key}");
+    }
 }

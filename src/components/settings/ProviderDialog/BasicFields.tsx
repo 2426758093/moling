@@ -1,8 +1,19 @@
 import { useTranslation } from "react-i18next";
 import { ProviderInput, ProviderItem, ProviderKeyView } from "../../../lib/api";
+import {
+  keyOptionalFor,
+  PROVIDER_PRESETS,
+  type ProviderPreset,
+} from "../../../lib/providerPresets";
 import { KIND_OPTIONS } from "../ui";
+import { Button } from "../../ui/Button";
 import { Input, Textarea } from "../../ui/Field";
 import { Select } from "../../ui/Select";
+import { cn } from "../../ui/cn";
+import {
+  ConnectionErrorBanner,
+  type ConnectionTestOutcome,
+} from "./connectionError";
 import { KeyManager } from "./KeyManager";
 import { TemplateSection } from "./TemplateSection";
 
@@ -20,6 +31,12 @@ export function BasicFields({
   onResetKey,
   advancedOpen,
   onToggleAdvanced,
+  activePresetId,
+  onApplyPreset,
+  testing,
+  testResult,
+  onTestConnection,
+  canTest,
 }: {
   form: ProviderInput;
   patch: (p: Partial<ProviderInput>) => void;
@@ -34,10 +51,55 @@ export function BasicFields({
   onResetKey: (index: number) => void;
   advancedOpen: boolean;
   onToggleAdvanced: () => void;
+  activePresetId: string | null;
+  onApplyPreset: (preset: ProviderPreset) => void;
+  testing: boolean;
+  testResult: ConnectionTestOutcome | null;
+  onTestConnection: () => void;
+  canTest: boolean;
 }) {
   const { t } = useTranslation();
+  const activePreset =
+    PROVIDER_PRESETS.find((preset) => preset.id === activePresetId) ?? null;
+  const keyOptional = keyOptionalFor(form.baseUrl, form.kind);
+
   return (
     <div className="space-y-3">
+      <div className="flex flex-col gap-1.5">
+        <span className="text-subhead text-secondary">{t("快速预设")}</span>
+        <div className="flex flex-wrap gap-1.5">
+          {PROVIDER_PRESETS.map((preset) => {
+            const active = preset.id === activePresetId;
+            const label = preset.nameKey ? t(preset.nameKey) : preset.name;
+            return (
+              <button
+                key={preset.id}
+                type="button"
+                aria-pressed={active}
+                onClick={() => onApplyPreset(preset)}
+                className={cn(
+                  "pressable rounded-chip border px-2 py-1 text-footnote transition-colors",
+                  active
+                    ? "border-accent bg-accent-soft font-medium text-accent-text"
+                    : "border-line bg-fill text-secondary hover:bg-hover hover:text-primary",
+                )}
+              >
+                {label}
+              </button>
+            );
+          })}
+        </div>
+        {activePreset && (
+          <p className="text-footnote text-tertiary">
+            {t(activePreset.hint)}
+            {activePreset.recommendedModels.length > 0 &&
+              ` ${t("推荐模型：{{models}}", {
+                models: activePreset.recommendedModels.join(" / "),
+              })}`}
+          </p>
+        )}
+      </div>
+
       <Input
         label={t("名称")}
         value={form.name}
@@ -70,7 +132,11 @@ export function BasicFields({
             value={form.apiKey ?? ""}
             onChange={(e) => patch({ apiKey: e.target.value })}
             placeholder={
-              initial?.hasKey ? t("留空则继续使用已保存的 Key") : "sk-..."
+              initial?.hasKey
+                ? t("留空则继续使用已保存的 Key")
+                : keyOptional
+                  ? t("本地服务可留空")
+                  : "sk-..."
             }
             hint={
               initial?.hasKey
@@ -83,7 +149,9 @@ export function BasicFields({
                       "已保存 {{key}}。出于安全考虑不回填明文 Key；留空保存即保持不变。",
                       { key: initial.apiKeyMasked },
                     )
-                : t("仅保存在本机，不会随备份导出（除非显式勾选）")
+                : keyOptional
+                  ? t("本地服务可以不填 Key")
+                  : t("仅保存在本机，不会随备份导出（除非显式勾选）")
             }
           />
           {providerId && (
@@ -107,6 +175,31 @@ export function BasicFields({
           onToggleAdvanced={onToggleAdvanced}
         />
       )}
+
+      {form.kind !== "template" && (
+        <div className="flex flex-wrap items-center gap-2">
+          <Button
+            size="sm"
+            loading={testing}
+            disabled={!canTest}
+            onClick={() => void onTestConnection()}
+          >
+            {testing ? t("测试中…") : t("测试连接")}
+          </Button>
+          {testResult?.ok && (
+            <span role="status" className="text-footnote text-success">
+              {t("连接正常 · {{ms}}ms · {{n}} 个模型", {
+                ms: testResult.latencyMs ?? 0,
+                n: testResult.modelCount ?? 0,
+              })}
+            </span>
+          )}
+        </div>
+      )}
+      {testResult && !testResult.ok && testResult.error && (
+        <ConnectionErrorBanner error={testResult.error} />
+      )}
+
       <Input
         label={t("超时（秒）")}
         type="number"
