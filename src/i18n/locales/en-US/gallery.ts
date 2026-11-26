@@ -65,6 +65,59 @@ const gallery = {
   该作品已在画布中: "Already on canvas",
   已加入画布: "Added to canvas",
   "下载失败：原图不可用": "Download failed: original unavailable",
+
+  // GalleryView · 工具栏（Windows 11 资源管理器式）
+  搜索作品: "Search works",
+  搜索提示词或模型: "Search prompts or models",
+  视图: "View",
+  排序: "Sort",
+  分组: "Group",
+  "排序：{{name}}": "Sort: {{name}}",
+  "分组：{{name}}": "Group: {{name}}",
+  升序: "Ascending",
+  降序: "Descending",
+  显示详情窗格: "Show details pane",
+  隐藏详情窗格: "Hide details pane",
+  详细信息: "Details",
+  选择一张作品查看详情: "Select a work to see details",
+  缩略图大小: "Thumbnail size",
+
+  // GalleryView · 视图模式
+  超大图标: "Extra large icons",
+  大图标: "Large icons",
+  中图标: "Medium icons",
+  小图标: "Small icons",
+  平铺: "Tiles",
+  内容: "Content",
+
+  // GalleryView · 分组
+  无分组: "None",
+  按日期: "Date",
+  按模型: "Model",
+  按风格: "Style",
+  按收藏: "Favorite",
+  按大小: "Size",
+  已收藏: "Favorited",
+  未收藏: "Not favorited",
+  未知大小: "Unknown size",
+  "小于 1 MB": "Less than 1 MB",
+  "1–5 MB": "1–5 MB",
+  "5–20 MB": "5–20 MB",
+  "大于 20 MB": "More than 20 MB",
+
+  // GalleryView · 状态栏与详情
+  "共 {{n}} 张": "{{n}} items",
+  "已选 {{n}} 张": "{{n}} selected",
+  打开: "Open",
+  修改日期: "Date modified",
+  类型: "Type",
+  大小: "Size",
+  尺寸: "Dimensions",
+  未知风格: "Unknown style",
+
+  // GalleryView · 空态（搜索 / 筛选）
+  没有匹配的作品: "No matching works",
+  试试其他关键词或清除筛选: "Try another keyword or clear the filters",
 } as const;
 
 export default gallery;

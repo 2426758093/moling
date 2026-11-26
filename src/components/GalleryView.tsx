@@ -1,40 +1,67 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { api, HistoryItem } from "../lib/api";
+import { api } from "../lib/api";
+import type { HistoryItem } from "../lib/api";
 import { exportHistoryZip, saveHistoryImage } from "../lib/save";
-import { extOf, isGifPath } from "../lib/image";
-import { dayKey, dayLabel } from "../lib/date";
+import { extOf } from "../lib/image";
 import { HISTORY_CHANGED_EVENT } from "../lib/historyEvents";
 import { toast } from "../lib/notify";
-import SafeImg from "./SafeImg";
+import {
+  DEFAULT_ICON_SIZE,
+  DEFAULT_PREFS,
+  GALLERY_PAGE_SIZE,
+  GALLERY_PREFS_KEY,
+  GROUP_HEADER_HEIGHT,
+  SEARCH_DEBOUNCE_MS,
+  appendHistoryItems,
+  buildGalleryRows,
+  buildHistoryQuery,
+  defaultIconSizeForMode,
+  groupHistoryItems,
+  iconModeForSize,
+  isIconMode,
+  layoutForMode,
+  nextSortState,
+  parseGalleryPrefs,
+  rowHeightForMode,
+  rowThumbSize,
+  serializeGalleryPrefs,
+  snapIconSize,
+  zoomIconSize,
+  type GalleryRow,
+  type GallerySort,
+  type GalleryPrefs,
+  type GroupBy,
+  type ViewMode,
+} from "../lib/galleryView";
+import type { SortOrder } from "../lib/api";
 import PageHeader from "./PageHeader";
 import CompareDialog from "./CompareDialog";
+import ImageViewer, { ViewerImage } from "./ImageViewer";
 import { useScrollEdge } from "../hooks/useScrollEdge";
 import { Button } from "./ui/Button";
 import { IconButton } from "./ui/IconButton";
 import { EmptyState } from "./ui/EmptyState";
-import { Tooltip } from "./ui/Tooltip";
-import { Select } from "./ui/Select";
-import { SegmentedControl } from "./ui/SegmentedControl";
 import { useAppStore } from "../stores/appStore";
 import { useChatStore } from "../stores/chatStore";
 import { useStylePresets } from "../stores/stylePresetStore";
 import { usePromptAssetsStore } from "../stores/promptAssetsStore";
 import { useCanvasStore } from "../stores/canvasStore";
+import { IconClose } from "./Icons";
+import { GalleryToolbar } from "./gallery/GalleryToolbar";
+import { GalleryStatusBar } from "./gallery/GalleryStatusBar";
+import { GalleryDetailsPane } from "./gallery/GalleryDetailsPane";
+import { GalleryGrid } from "./gallery/GalleryGrid";
+import { GalleryTiles } from "./gallery/GalleryTiles";
+import { GalleryList } from "./gallery/GalleryList";
 import {
-  IconQuote,
-  IconCanvas,
-  IconStar,
-  IconDownload,
-  IconTrash,
-  IconRotate,
-  IconClose,
-  IconImage,
-  IconSparkle,
-} from "./Icons";
-
-const PAGE_SIZE = 90;
+  GalleryDetailsHeader,
+  GalleryDetailsRow,
+} from "./gallery/GalleryDetailsTable";
+import { GalleryContent } from "./gallery/GalleryContent";
+import type { GalleryActions } from "./gallery/types";
 
 function paramsOf(item: HistoryItem) {
   const h = item.history;
@@ -84,148 +111,132 @@ async function downloadOne(
   if (saved) toast(savedToast);
 }
 
-/// 画廊栅格：按容器宽度在 2 / 3 / 4 列之间切换。每行按图片宽高比做
-/// justified 布局 —— 行高由「可用宽度 ÷ 宽高比之和」推导，图片完整显示、不裁切。
-const GRID_GAP = 12;
-const GRID_PAD = 32; // px-4 两侧
-const ROW_MAX_HEIGHT = 420; // 行高上限：避免单张竖图撑满整屏
-const DAY_HEADER_HEIGHT = 44; // h-11，固定单行，避免 measureElement 破坏滚动稳定性
-
-type RowItem = { item: HistoryItem; ratio: number };
-
-type Block =
-  | { type: "header"; key: string; label: string; count: number }
-  | {
-      type: "row";
-      key: string;
-      items: RowItem[];
-      height: number;
-      totalWidth: number;
-    };
-
-/** 宽高比兜底：尺寸缺失或非法时按 1:1 处理，避免除零与 NaN 布局 */
-function aspectRatio(item: HistoryItem): number {
-  const w = Number(item.history.width);
-  const h = Number(item.history.height);
-  if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return 1;
-  return w / h;
+function readPrefs(): GalleryPrefs {
+  try {
+    return parseGalleryPrefs(localStorage.getItem(GALLERY_PREFS_KEY));
+  } catch {
+    return { ...DEFAULT_PREFS };
+  }
 }
 
-/** 把一组作品切成列数固定的行，并按宽高比求每行高度（含底部间距）。 */
-function justifyRows(
-  items: HistoryItem[],
-  cols: number,
-  containerWidth: number,
-): Block[] {
-  const out: Block[] = [];
-  const available = Math.max(
-    120,
-    containerWidth - GRID_PAD - GRID_GAP * (cols - 1),
+function isTypingTarget(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el) return false;
+  return (
+    el.tagName === "INPUT" ||
+    el.tagName === "TEXTAREA" ||
+    el.tagName === "SELECT" ||
+    el.isContentEditable
   );
-  for (let start = 0; start < items.length; start += cols) {
-    const slice = items.slice(start, start + cols);
-    const row: RowItem[] = slice.map((item) => ({
-      item,
-      ratio: aspectRatio(item),
-    }));
-    const ratioSum = row.reduce((sum, r) => sum + r.ratio, 0) || row.length;
-    const perRow = Math.max(0, row.length - 1);
-    // 末行不满时不拉伸到整行宽度，保持与满行一致的图片尺寸
-    const target =
-      row.length === cols ? available : (available * row.length) / cols;
-    const height = Math.min(
-      ROW_MAX_HEIGHT,
-      (target - GRID_GAP * perRow) / ratioSum,
-    );
-    out.push({
-      type: "row",
-      key: `r-${row[0]?.item.history.id ?? start}`,
-      items: row,
-      height,
-      totalWidth: height * ratioSum + GRID_GAP * perRow,
-    });
-  }
-  return out;
 }
 
 export default function GalleryView() {
   const { t } = useTranslation();
   const openAnimation = useAppStore((s) => s.openAnimation);
+  const stylePresets = useStylePresets();
+
+  const [prefs, setPrefs] = useState<GalleryPrefs>(readPrefs);
+  const { mode, iconSize, sort, order, group, detailsPane } = prefs;
+
   const [items, setItems] = useState<HistoryItem[]>([]);
-  const [hasMore, setHasMore] = useState(true);
+  const [hasMore, setHasMore] = useState(false);
   const [modelFilter, setModelFilter] = useState("");
   const [styleFilter, setStyleFilter] = useState("");
-  const stylePresets = useStylePresets();
   const [favOnly, setFavOnly] = useState(false);
+  const [searchText, setSearchText] = useState("");
+  const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [activeId, setActiveId] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState(false);
   const [exporting, setExporting] = useState(false);
   const [compareOpen, setCompareOpen] = useState(false);
-  const [cols, setCols] = useState(3);
   const [containerWidth, setContainerWidth] = useState(960);
+  const [wide, setWide] = useState(true);
+  const [viewer, setViewer] = useState<ViewerImage | null>(null);
+
+  const rootRef = useRef<HTMLDivElement>(null);
   const parentRef = useRef<HTMLDivElement>(null);
   const sentinelRef = useRef<HTMLDivElement>(null);
   // Shift 连选的锚点：上一次单独点选的 id
   const anchorRef = useRef<number | null>(null);
   const loadSeq = useRef(0);
-  // 下一页游标 = 已加载的最后一条 id；用游标而不是 offset，删除记录后不跳项
-  const cursorRef = useRef<number | null>(null);
+  // 下一页游标由后端返回；首页为 null
+  const cursorRef = useRef<string | null>(null);
   const fetchingRef = useRef(false);
   useScrollEdge(parentRef);
 
+  useEffect(() => {
+    try {
+      localStorage.setItem(GALLERY_PREFS_KEY, serializeGalleryPrefs(prefs));
+    } catch {
+      // 隐私模式写不进去不影响当前会话
+    }
+  }, [prefs]);
+
+  // 搜索 250ms 防抖：输入过程中不打断列表
+  useEffect(() => {
+    const timer = window.setTimeout(
+      () => setQuery(searchText.trim()),
+      SEARCH_DEBOUNCE_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [searchText]);
+
   const load = useCallback(
-    async (
-      beforeId: number | null,
-      model: string,
-      style: string,
-      fav: boolean,
-    ) => {
-      // 触底回调可能密集触发：同一时刻只允许一个列表请求
-      if (fetchingRef.current) return;
+    async (cursor: string | null) => {
+      // 翻页请求同一时刻只允许一个；筛选/搜索触发的首页请求可以抢占旧请求
+      if (cursor !== null && fetchingRef.current) return;
       fetchingRef.current = true;
       const seq = ++loadSeq.current;
       setLoading(true);
       setLoadError(false);
       try {
-        const { items: page } = await api.listHistory(
-          PAGE_SIZE,
-          beforeId,
-          model,
-          style,
-          fav,
+        const page = await api.listHistory(
+          buildHistoryQuery({
+            limit: GALLERY_PAGE_SIZE,
+            cursor,
+            query,
+            model: modelFilter,
+            style: styleFilter,
+            favoriteOnly: favOnly,
+            sort,
+            order,
+          }),
         );
         if (seq !== loadSeq.current) return;
-        setHasMore(page.length === PAGE_SIZE);
-        setItems((prev) => {
-          if (beforeId === null) return page;
-          // 翻页期间新增/删除会让相邻页出现重复 id，按 id 去重
-          const seen = new Set(prev.map((i) => i.history.id));
-          return [...prev, ...page.filter((i) => !seen.has(i.history.id))];
-        });
-        const last = page[page.length - 1];
-        if (last) cursorRef.current = last.history.id;
+        const pageItems = page?.items ?? [];
+        setHasMore(page?.hasMore ?? false);
+        cursorRef.current = page?.nextCursor ?? null;
+        setItems((prev) =>
+          cursor === null ? pageItems : appendHistoryItems(prev, pageItems),
+        );
       } catch {
         // 失败后停止自动触底，由用户点「重试」；避免无限重试刷屏
         if (seq === loadSeq.current) setLoadError(true);
       } finally {
-        if (seq === loadSeq.current) setLoading(false);
-        fetchingRef.current = false;
+        if (seq === loadSeq.current) {
+          setLoading(false);
+          fetchingRef.current = false;
+        }
       }
     },
-    [],
+    [query, modelFilter, styleFilter, favOnly, sort, order],
   );
 
   const reload = useCallback(() => {
     cursorRef.current = null;
-    void load(null, modelFilter, styleFilter, favOnly);
-  }, [load, modelFilter, styleFilter, favOnly]);
+    void load(null);
+  }, [load]);
 
+  // 筛选 / 搜索 / 排序变化：清空列表与选择，从首页重新拉
   useEffect(() => {
     cursorRef.current = null;
-    void load(null, modelFilter, styleFilter, favOnly);
+    setItems([]);
     setSelected(new Set());
-  }, [modelFilter, styleFilter, favOnly, load]);
+    setActiveId(null);
+    void load(null);
+  }, [load]);
 
   // 编辑器 / 动图导出等常驻在画廊之上：新记录落库后重载列表
   useEffect(() => {
@@ -233,18 +244,19 @@ export default function GalleryView() {
     return () => window.removeEventListener(HISTORY_CHANGED_EVENT, reload);
   }, [reload]);
 
-  // 列数与行高都由容器宽度决定：最大化后列数不变时，行高会随宽度一起长
+  // 容器宽度决定列数；根宽度决定详情窗格是否可用
   useEffect(() => {
     const el = parentRef.current;
-    if (!el) return;
+    const root = rootRef.current;
+    if (!el || !root) return;
     const update = () => {
-      const width = el.clientWidth;
-      setContainerWidth(width);
-      setCols(width >= 1500 ? 4 : width >= 1100 ? 3 : 2);
+      setContainerWidth(el.clientWidth);
+      setWide(root.clientWidth >= 980);
     };
     update();
     const observer = new ResizeObserver(update);
     observer.observe(el);
+    observer.observe(root);
     return () => observer.disconnect();
   }, []);
 
@@ -257,65 +269,180 @@ export default function GalleryView() {
   // 风格选项：预设 + 当前已加载数据里出现的未知风格（筛选由后端执行）
   const styles = useMemo(() => {
     const map = new Map<string, string>();
-    for (const s of stylePresets) {
-      if (s.prompt) map.set(s.prompt, s.label);
+    for (const preset of stylePresets) {
+      if (preset.prompt) map.set(preset.prompt, preset.label);
     }
     for (const item of items) {
-      const s = item.history.style;
-      if (s && !map.has(s)) map.set(s, s);
+      const style = item.history.style;
+      if (style && !map.has(style)) map.set(style, style);
     }
     return Array.from(map, ([id, label]) => ({ id, label }));
   }, [items, stylePresets]);
 
-  // 时间线：同一天归为一组，组头固定 44px 单行，组内按宽高比 justified 排布
-  const groups = useMemo(() => {
-    const out: { key: string; label: string; items: HistoryItem[] }[] = [];
-    for (const item of items) {
-      const createdAt = Number(item.history.createdAt);
-      const key = Number.isFinite(createdAt) ? dayKey(createdAt) : "unknown";
-      const last = out[out.length - 1];
-      if (last && last.key === key) last.items.push(item);
-      else
-        out.push({
-          key,
-          label: Number.isFinite(createdAt) ? dayLabel(createdAt) : t("更早"),
-          items: [item],
-        });
-    }
-    return out;
-  }, [items, t]);
+  // 服务端排序 + 前端补齐类型/风格；分组按排序流切片
+  // 服务端已按 sort/order 全局排序；这里不再二次排序，避免中文 collation 与 SQL 不一致
+  const displayItems = items;
 
-  const blocks = useMemo(() => {
-    const out: Block[] = [];
-    for (const g of groups) {
-      out.push({
-        type: "header",
-        key: `h-${g.key}`,
-        label: g.label,
-        count: g.items.length,
-      });
-      out.push(...justifyRows(g.items, cols, containerWidth));
-    }
-    return out;
-  }, [groups, cols, containerWidth]);
+  const availableWidth = Math.max(120, containerWidth - 32);
+  const layout = useMemo(
+    () => layoutForMode(mode, availableWidth, iconSize),
+    [mode, availableWidth, iconSize],
+  );
+
+  const sections = useMemo(
+    () => groupHistoryItems(displayItems, group),
+    [displayItems, group],
+  );
+
+  const rows = useMemo(
+    () => buildGalleryRows(sections, layout.columns),
+    [sections, layout.columns],
+  );
+
+  const itemRowHeight = rowHeightForMode(mode, iconSize);
+  const thumbSize = rowThumbSize(iconSize);
 
   const virtualizer = useVirtualizer({
-    count: blocks.length,
+    count: rows.length,
     getScrollElement: () => parentRef.current,
-    estimateSize: (index) => {
-      const block = blocks[index];
-      if (!block) return 0;
-      return block.type === "header"
-        ? DAY_HEADER_HEIGHT
-        : block.height + GRID_GAP;
-    },
-    overscan: 4,
+    estimateSize: (index) =>
+      rows[index]?.type === "header" ? GROUP_HEADER_HEIGHT : itemRowHeight,
+    overscan: 6,
   });
 
-  // 列数 / 容器宽度 / 数据变化后让虚拟器丢掉旧估算
+  // 模式 / 缩放 / 列数 / 数据变化后让虚拟器丢掉旧估算
   useEffect(() => {
     virtualizer.measure();
-  }, [blocks, virtualizer]);
+  }, [rows, itemRowHeight, layout.columns, virtualizer]);
+
+  const selectedItems = useMemo(
+    () => displayItems.filter((item) => selected.has(item.history.id)),
+    [displayItems, selected],
+  );
+
+  const activeItem = useMemo(
+    () =>
+      displayItems.find((item) => item.history.id === activeId) ??
+      selectedItems[0] ??
+      null,
+    [displayItems, activeId, selectedItems],
+  );
+
+  const changePrefs = useCallback((patch: Partial<GalleryPrefs>) => {
+    setPrefs((prev) => ({ ...prev, ...patch }));
+  }, []);
+
+  const changeMode = useCallback((next: ViewMode) => {
+    setPrefs((prev) => ({
+      ...prev,
+      mode: next,
+      iconSize: defaultIconSizeForMode(next),
+    }));
+  }, []);
+
+  const changeIconSize = useCallback((value: number) => {
+    setPrefs((prev) => {
+      const next = snapIconSize(value);
+      return {
+        ...prev,
+        iconSize: next,
+        mode: isIconMode(prev.mode) ? iconModeForSize(next) : prev.mode,
+      };
+    });
+  }, []);
+
+  const changeSort = useCallback((next: GallerySort) => {
+    setPrefs((prev) => {
+      const state = nextSortState(next, prev.sort, prev.order);
+      return { ...prev, sort: state.sort, order: state.order };
+    });
+  }, []);
+
+  // Ctrl + 滚轮缩放；输入框聚焦时不拦截
+  useEffect(() => {
+    const el = parentRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey && !e.metaKey) return;
+      if (isTypingTarget(e.target) || isTypingTarget(document.activeElement)) {
+        return;
+      }
+      e.preventDefault();
+      setPrefs((prev) => {
+        const next = zoomIconSize(prev.iconSize, e.deltaY < 0 ? 1 : -1);
+        return {
+          ...prev,
+          iconSize: next,
+          mode: isIconMode(prev.mode) ? iconModeForSize(next) : prev.mode,
+        };
+      });
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
+  /// 单选 / Shift 区间 / Ctrl 追加
+  const toggleSelect = useCallback(
+    (item: HistoryItem, shift: boolean, additive: boolean) => {
+      const id = item.history.id;
+      setActiveId(id);
+      setSelected((prev) => {
+        const next = new Set(prev);
+        const anchor = anchorRef.current;
+        if (shift && anchor !== null) {
+          const from = displayItems.findIndex((i) => i.history.id === anchor);
+          const to = displayItems.findIndex((i) => i.history.id === id);
+          if (from >= 0 && to >= 0) {
+            const [lo, hi] = from < to ? [from, to] : [to, from];
+            for (let i = lo; i <= hi; i += 1) {
+              next.add(displayItems[i].history.id);
+            }
+            return next;
+          }
+        }
+        if (additive) {
+          if (next.has(id)) next.delete(id);
+          else next.add(id);
+          anchorRef.current = id;
+          return next;
+        }
+        if (next.has(id) && next.size === 1) {
+          next.delete(id);
+          return next;
+        }
+        anchorRef.current = id;
+        return new Set([id]);
+      });
+    },
+    [displayItems],
+  );
+
+  // Esc 清空选择；Ctrl/⌘ A 全选；Ctrl+0 复位缩放
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (isTypingTarget(e.target)) return;
+      if ((e.ctrlKey || e.metaKey) && e.key === "0") {
+        e.preventDefault();
+        setPrefs((prev) => ({
+          ...prev,
+          iconSize: DEFAULT_ICON_SIZE,
+          mode: isIconMode(prev.mode) ? "large" : prev.mode,
+        }));
+        return;
+      }
+      if (e.key === "Escape" && selected.size > 0) {
+        setSelected(new Set());
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+        if (displayItems.length === 0) return;
+        e.preventDefault();
+        setSelected(new Set(displayItems.map((i) => i.history.id)));
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [displayItems, selected.size]);
 
   const toggleFav = async (item: HistoryItem) => {
     const next = !item.history.favorite;
@@ -330,10 +457,14 @@ export default function GalleryView() {
                 : i,
             ),
       );
-      if (favOnly && !next && selected.has(item.history.id)) {
-        const nextSel = new Set(selected);
-        nextSel.delete(item.history.id);
-        setSelected(nextSel);
+      if (favOnly && !next) {
+        setSelected((prev) => {
+          if (!prev.has(item.history.id)) return prev;
+          const copy = new Set(prev);
+          copy.delete(item.history.id);
+          return copy;
+        });
+        if (activeId === item.history.id) setActiveId(null);
       }
     } catch {
       toast(t("收藏操作失败，请稍后重试"), "error");
@@ -344,117 +475,22 @@ export default function GalleryView() {
     try {
       await api.deleteHistory(item.history.id);
       setItems((prev) => prev.filter((i) => i.history.id !== item.history.id));
-      if (selected.has(item.history.id)) {
-        const nextSel = new Set(selected);
-        nextSel.delete(item.history.id);
-        setSelected(nextSel);
-      }
+      setSelected((prev) => {
+        if (!prev.has(item.history.id)) return prev;
+        const copy = new Set(prev);
+        copy.delete(item.history.id);
+        return copy;
+      });
+      if (activeId === item.history.id) setActiveId(null);
     } catch {
       toast(t("删除失败，请稍后重试"), "error");
     }
   };
 
-  const selectedItems = useMemo(
-    () => items.filter((i) => selected.has(i.history.id)),
-    [items, selected],
-  );
-
-  /// 单选 / Shift 连选：Shift 以最近一次单独点选为锚，选中区间内的所有作品
-  const toggleSelect = (item: HistoryItem, shift: boolean) => {
-    const id = item.history.id;
-    setSelected((prev) => {
-      const next = new Set(prev);
-      const anchor = anchorRef.current;
-      if (shift && anchor !== null) {
-        const from = items.findIndex((i) => i.history.id === anchor);
-        const to = items.findIndex((i) => i.history.id === id);
-        if (from >= 0 && to >= 0) {
-          const [lo, hi] = from < to ? [from, to] : [to, from];
-          for (let i = lo; i <= hi; i += 1) next.add(items[i].history.id);
-          return next;
-        }
-      }
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      anchorRef.current = id;
-      return next;
-    });
-  };
-
-  // Esc 清空选择；Ctrl/⌘ A 选中当前已加载的全部作品
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement | null;
-      const typing =
-        target?.tagName === "INPUT" ||
-        target?.tagName === "TEXTAREA" ||
-        target?.isContentEditable;
-      if (typing) return;
-      if (e.key === "Escape" && selected.size > 0) {
-        setSelected(new Set());
-        return;
-      }
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
-        if (items.length === 0) return;
-        e.preventDefault();
-        setSelected(new Set(items.map((i) => i.history.id)));
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [items, selected.size]);
-
-  // 触底自动续页：哨兵进入视口即加载；按钮作为 IO 不可用时的兜底保留
-  useEffect(() => {
-    const el = sentinelRef.current;
-    if (!el || !hasMore || loadError) return;
-    const observer = new IntersectionObserver(
-      (entries) => {
-        if (entries.some((e) => e.isIntersecting) && !loading) {
-          void load(cursorRef.current, modelFilter, styleFilter, favOnly);
-        }
-      },
-      { root: parentRef.current, rootMargin: "400px" },
-    );
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [
-    hasMore,
-    loadError,
-    loading,
-    items.length,
-    modelFilter,
-    styleFilter,
-    favOnly,
-    load,
-  ]);
-
-  const doExport = async () => {
-    const picked = selectedItems;
-    if (picked.length === 0) return;
-    setExporting(true);
-    try {
-      const res = await exportZip(picked);
-      if (!res) return; // 用户取消保存
-      toast(
-        res.skipped > 0
-          ? t("已导出 {{saved}} 张，{{skipped}} 张因缺图被跳过", {
-              saved: res.saved,
-              skipped: res.skipped,
-            })
-          : t("已导出 {{n}} 张", { n: res.saved }),
-      );
-    } catch {
-      toast(t("打包导出失败，请重试"), "error");
-    } finally {
-      setExporting(false);
-    }
-  };
-
   const reuse = (item: HistoryItem) => {
     const p = paramsOf(item);
-    const { setPrefs, setView } = useAppStore.getState();
-    setPrefs({
+    const { setPrefs: setAppPrefs, setView } = useAppStore.getState();
+    setAppPrefs({
       ratio: p.ratio,
       width: p.width,
       height: p.height,
@@ -497,7 +533,6 @@ export default function GalleryView() {
       useAppStore.getState().openRetouch({
         dataUrl: img.dataUrl,
         historyId: item.history.id,
-        // 自动尺寸记录是 0×0：当“未知”处理，不参与画布同尺寸判定
         ...(width > 0 && height > 0 ? { width, height } : {}),
         title: item.history.prompt,
         returnView: "gallery",
@@ -507,335 +542,314 @@ export default function GalleryView() {
     }
   };
 
+  const openViewer = async (item: HistoryItem) => {
+    try {
+      const img = await api.getHistoryImage(item.history.id);
+      setViewer({
+        dataUrl: img.dataUrl,
+        title: item.history.prompt,
+        prompt: item.history.prompt,
+        historyId: item.history.id,
+      });
+    } catch (e) {
+      toast(t("图片不可用：{{error}}", { error: String(e) }), "error");
+    }
+  };
+
+  const download = (item: HistoryItem) => {
+    void downloadOne(item, true, t("已保存图片")).catch(() =>
+      toast(t("下载失败：原图不可用"), "error"),
+    );
+  };
+
+  const actions: GalleryActions = {
+    select: toggleSelect,
+    open: (item) => void openViewer(item),
+    toggleFavorite: (item) => void toggleFav(item),
+    retouch: (item) => void retouchOne(item),
+    reuse,
+    addToCanvas: (item) => void addToCanvas(item),
+    collectPrompt: (item) => void collectPrompt(item),
+    download,
+    remove: (item) => void remove(item),
+    openAnimation: (item) => openAnimation({ historyId: item.history.id }),
+  };
+
+  const doExport = async () => {
+    const picked = selectedItems;
+    if (picked.length === 0) return;
+    setExporting(true);
+    try {
+      const res = await exportZip(picked);
+      if (!res) return; // 用户取消保存
+      toast(
+        res.skipped > 0
+          ? t("已导出 {{saved}} 张，{{skipped}} 张因缺图被跳过", {
+              saved: res.saved,
+              skipped: res.skipped,
+            })
+          : t("已导出 {{n}} 张", { n: res.saved }),
+      );
+    } catch {
+      toast(t("打包导出失败，请重试"), "error");
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  // 触底自动续页：哨兵进入视口即加载；按钮作为 IO 不可用时的兜底保留
+  useEffect(() => {
+    const el = sentinelRef.current;
+    if (!el || !hasMore || loadError) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((e) => e.isIntersecting) && !loading) {
+          void load(cursorRef.current);
+        }
+      },
+      { root: parentRef.current, rootMargin: "400px" },
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [hasMore, loadError, loading, items.length, load]);
+
+  const renderItemRow = (row: Extract<GalleryRow, { type: "items" }>) => {
+    switch (mode) {
+      case "xlarge":
+      case "large":
+      case "medium":
+      case "small":
+        return (
+          <GalleryGrid
+            items={row.items}
+            iconSize={iconSize}
+            cellWidth={layout.cellWidth}
+            selected={selected}
+            actions={actions}
+          />
+        );
+      case "tiles":
+        return (
+          <GalleryTiles
+            items={row.items}
+            iconSize={iconSize}
+            cellWidth={layout.cellWidth}
+            selected={selected}
+            actions={actions}
+          />
+        );
+      case "list":
+        return (
+          <GalleryList
+            item={row.items[0]}
+            thumbSize={thumbSize}
+            selected={selected.has(row.items[0].history.id)}
+            actions={actions}
+          />
+        );
+      case "details":
+        return (
+          <GalleryDetailsRow
+            item={row.items[0]}
+            thumbSize={thumbSize}
+            selected={selected.has(row.items[0].history.id)}
+            actions={actions}
+          />
+        );
+      default:
+        return (
+          <GalleryContent
+            item={row.items[0]}
+            thumbSize={thumbSize}
+            selected={selected.has(row.items[0].history.id)}
+            actions={actions}
+          />
+        );
+    }
+  };
+
+  const showDetails = detailsPane && wide;
+
   return (
-    <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+    <div
+      ref={rootRef}
+      className="relative flex min-h-0 min-w-0 flex-1 flex-col"
+    >
       <PageHeader
         title={t("作品")}
-        subtitle={t("{{n}} 张作品", { n: items.length })}
+        actions={
+          <span className="tabular text-footnote text-tertiary">
+            {t("{{n}} 张作品", { n: displayItems.length })}
+          </span>
+        }
         footer={
-          <div className="flex flex-wrap items-center gap-1.5">
-            <Select
-              value={modelFilter || "all"}
-              onValueChange={(v) => setModelFilter(v === "all" ? "" : v)}
-              options={[
-                { value: "all", label: t("全部模型") },
-                ...models.map((m) => ({ value: m, label: m })),
-              ]}
-              label={t("按模型筛选")}
-              variant="chip"
-              widthClass="w-36"
-            />
-            <Select
-              value={styleFilter || "all"}
-              onValueChange={(v) => setStyleFilter(v === "all" ? "" : v)}
-              options={[
-                { value: "all", label: t("全部风格") },
-                ...styles.map((s) => ({ value: s.id, label: s.label })),
-              ]}
-              label={t("按风格筛选")}
-              variant="chip"
-              widthClass="w-32"
-            />
-            <SegmentedControl
-              value={favOnly ? "fav" : "all"}
-              onValueChange={(v) => setFavOnly(v === "fav")}
-              label={t("收藏筛选")}
-              size="sm"
-              options={[
-                { value: "all", label: t("全部") },
-                { value: "fav", label: t("只看收藏") },
-              ]}
-            />
-            <div className="ml-auto flex items-center gap-1.5">
-              <IconButton
-                size="sm"
-                label={t("刷新")}
-                icon={<IconRotate size={14} />}
-                onClick={reload}
-              />
-            </div>
-          </div>
+          <GalleryToolbar
+            mode={mode}
+            sort={sort}
+            order={order}
+            group={group}
+            detailsPane={detailsPane}
+            searchText={searchText}
+            modelFilter={modelFilter}
+            models={models}
+            styleFilter={styleFilter}
+            styles={styles}
+            favOnly={favOnly}
+            onSearchChange={setSearchText}
+            onModeChange={changeMode}
+            onSortChange={changeSort}
+            onOrderChange={(next: SortOrder) => changePrefs({ order: next })}
+            onGroupChange={(next: GroupBy) => changePrefs({ group: next })}
+            onToggleDetails={() => changePrefs({ detailsPane: !detailsPane })}
+            onModelChange={setModelFilter}
+            onStyleChange={setStyleFilter}
+            onFavOnlyChange={setFavOnly}
+            onRefresh={reload}
+          />
         }
       />
 
-      <div
-        ref={parentRef}
-        className="scroll-edge min-h-0 flex-1 overflow-y-auto"
-      >
-        {items.length === 0 && !loading ? (
-          loadError ? (
-            <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
-              <p className="text-footnote text-secondary">
-                {t("加载画廊失败")}
-              </p>
-              <Button size="sm" variant="ghost" onClick={reload}>
-                {t("重试")}
-              </Button>
-            </div>
-          ) : (
-            <EmptyState
-              className="h-full"
-              eyebrow={t("作品")}
-              title={favOnly ? t("还没有收藏的作品") : t("还没有生成记录")}
-              description={
-                favOnly
-                  ? t("在聊天里生成图片后点星标即可收藏")
-                  : t("回到聊天描述一个画面，生成结果会自动归档到这里")
-              }
+      <div className="flex min-h-0 flex-1">
+        <div className="relative flex min-h-0 flex-1 flex-col">
+          {mode === "details" && displayItems.length > 0 && (
+            <GalleryDetailsHeader
+              sort={sort}
+              order={order}
+              onSort={changeSort}
             />
-          )
-        ) : (
+          )}
           <div
-            className="relative w-full"
-            style={{ height: virtualizer.getTotalSize() }}
+            ref={parentRef}
+            className="scroll-edge min-h-0 flex-1 overflow-y-auto"
           >
-            {virtualizer.getVirtualItems().map((vrow) => {
-              const block = blocks[vrow.index];
-              if (!block) return null;
-              if (block.type === "header") {
-                return (
-                  <div
-                    key={vrow.key}
-                    className="absolute left-0 flex h-11 w-full items-center gap-3 px-4"
-                    style={{ transform: `translateY(${vrow.start}px)` }}
-                  >
-                    <span className="shrink-0 font-kai text-callout text-secondary">
-                      {block.label}
-                    </span>
-                    <span aria-hidden className="h-px flex-1 bg-line" />
-                    <span className="shrink-0 text-caption text-quaternary">
-                      {t("{{n}} 张", { n: block.count })}
-                    </span>
-                  </div>
-                );
-              }
-              return (
-                <div
-                  key={vrow.key}
-                  className="absolute left-0 w-full px-4"
-                  style={{
-                    transform: `translateY(${vrow.start}px)`,
-                    height: block.height + GRID_GAP,
-                  }}
-                >
-                  <div
-                    className="flex items-start"
-                    style={{ gap: GRID_GAP, height: block.height }}
-                  >
-                    {block.items.map(({ item, ratio }) => (
-                      <div
-                        key={item.history.id}
-                        className="group relative shrink-0 overflow-hidden rounded-card bg-sunken"
-                        style={{
-                          width: ratio * block.height,
-                          height: block.height,
-                        }}
-                      >
-                        {item.thumbUrl ? (
-                          <SafeImg
-                            src={item.thumbUrl}
-                            alt={item.history.prompt}
-                            className="h-full w-full object-contain"
-                            loading="lazy"
-                            decoding="async"
-                          />
-                        ) : (
-                          <div className="flex h-full w-full items-center justify-center px-2 text-center text-caption text-tertiary">
-                            {t("缩略图生成中")}
-                          </div>
-                        )}
-                        <label
-                          className={`glass-media absolute left-2 top-2 flex h-5 w-5 cursor-pointer items-center justify-center rounded-chip transition-opacity focus-within:opacity-100 group-hover:opacity-100 ${
-                            selected.has(item.history.id)
-                              ? "opacity-100"
-                              : "opacity-0"
-                          }`}
-                        >
-                          <input
-                            type="checkbox"
-                            aria-label={t("选择作品：{{prompt}}", {
-                              prompt: item.history.prompt,
-                            })}
-                            checked={selected.has(item.history.id)}
-                            onChange={() => toggleSelect(item, false)}
-                            onClick={(e) => {
-                              if (e.shiftKey) {
-                                e.preventDefault();
-                                toggleSelect(item, true);
-                              }
-                            }}
-                            className="size-3.5 cursor-pointer accent-accent-fill"
-                          />
-                        </label>
-                        <button
-                          type="button"
-                          onClick={() => void toggleFav(item)}
-                          aria-label={
-                            item.history.favorite
-                              ? t("取消收藏")
-                              : t("收藏该作品")
-                          }
-                          className="glass-media pressable absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-pill text-caption text-on-accent transition-opacity hover:bg-on-accent/15"
-                        >
-                          {item.history.favorite ? "★" : "☆"}
-                        </button>
-                        {(isGifPath(item.history.filePath) ||
-                          item.history.parentId != null) && (
-                          <div className="pointer-events-none absolute bottom-2 left-2 flex flex-col items-start gap-1">
-                            {isGifPath(item.history.filePath) && (
-                              <span className="glass-media rounded-pill px-2 py-0.5 text-caption text-on-accent">
-                                {item.animation
-                                  ? t("动图 · {{n}} 帧", {
-                                      n: item.animation.frames,
-                                    })
-                                  : t("动图")}
-                              </span>
-                            )}
-                            {item.history.parentId != null && (
-                              <span className="glass-media rounded-pill px-2 py-0.5 text-caption text-on-accent">
-                                {t("派生 #{{id}}", {
-                                  id: item.history.parentId,
-                                })}
-                              </span>
-                            )}
-                          </div>
-                        )}
-                        <div className="pointer-events-none absolute inset-x-0 bottom-0 flex justify-center p-2 opacity-0 transition-opacity duration-200 group-focus-within:opacity-100 group-hover:opacity-100">
-                          <div className="glass-media pointer-events-auto flex items-center gap-0.5 rounded-pill p-0.5">
-                            <Tooltip label={t("修图")} side="top">
-                              <button
-                                type="button"
-                                onClick={() => void retouchOne(item)}
-                                aria-label={t("修图")}
-                                className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent hover:bg-on-accent/15"
-                              >
-                                <IconSparkle size={13} />
-                              </button>
-                            </Tooltip>
-                            <Tooltip label={t("复用参数")} side="top">
-                              <button
-                                type="button"
-                                onClick={() => reuse(item)}
-                                aria-label={t("复用参数")}
-                                className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent hover:bg-on-accent/15"
-                              >
-                                <IconQuote size={13} />
-                              </button>
-                            </Tooltip>
-                            <Tooltip label={t("加入画布")} side="top">
-                              <button
-                                type="button"
-                                onClick={() => void addToCanvas(item)}
-                                aria-label={t("加入画布")}
-                                className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent hover:bg-on-accent/15"
-                              >
-                                <IconCanvas size={13} />
-                              </button>
-                            </Tooltip>
-                            <Tooltip label={t("收藏提示词")} side="top">
-                              <button
-                                type="button"
-                                onClick={() => void collectPrompt(item)}
-                                aria-label={t("收藏提示词")}
-                                className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent hover:bg-on-accent/15"
-                              >
-                                <IconStar size={13} />
-                              </button>
-                            </Tooltip>
-                            {isGifPath(item.history.filePath) && (
-                              <Tooltip label={t("打开动图编辑器")} side="top">
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    openAnimation({
-                                      historyId: item.history.id,
-                                    })
-                                  }
-                                  aria-label={t("打开动图编辑器")}
-                                  className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent hover:bg-on-accent/15"
-                                >
-                                  <IconImage size={13} />
-                                </button>
-                              </Tooltip>
-                            )}
-                            <Tooltip label={t("下载原图与参数")} side="top">
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  void downloadOne(
-                                    item,
-                                    true,
-                                    t("已保存图片"),
-                                  ).catch(() =>
-                                    toast(t("下载失败：原图不可用"), "error"),
-                                  )
-                                }
-                                aria-label={t("下载原图与参数")}
-                                className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent hover:bg-on-accent/15"
-                              >
-                                <IconDownload size={13} />
-                              </button>
-                            </Tooltip>
-                            <Tooltip label={t("删除")} side="top">
-                              <button
-                                type="button"
-                                onClick={() => void remove(item)}
-                                aria-label={t("删除")}
-                                className="pressable flex h-7 w-7 items-center justify-center rounded-pill text-on-accent hover:bg-on-accent/15"
-                              >
-                                <IconTrash size={13} />
-                              </button>
-                            </Tooltip>
-                          </div>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
+            {displayItems.length === 0 && !loading ? (
+              loadError ? (
+                <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
+                  <p className="text-footnote text-secondary">
+                    {t("加载画廊失败")}
+                  </p>
+                  <Button size="sm" variant="ghost" onClick={reload}>
+                    {t("重试")}
+                  </Button>
                 </div>
-              );
-            })}
+              ) : (
+                <EmptyState
+                  className="h-full"
+                  eyebrow={t("作品")}
+                  title={
+                    query
+                      ? t("没有匹配的作品")
+                      : favOnly
+                        ? t("还没有收藏的作品")
+                        : t("还没有生成记录")
+                  }
+                  description={
+                    query
+                      ? t("试试其他关键词或清除筛选")
+                      : favOnly
+                        ? t("在聊天里生成图片后点星标即可收藏")
+                        : t("回到聊天描述一个画面，生成结果会自动归档到这里")
+                  }
+                />
+              )
+            ) : displayItems.length === 0 && loading ? (
+              <div className="py-10 text-center text-footnote text-tertiary">
+                {t("加载中…")}
+              </div>
+            ) : (
+              <div
+                className="relative w-full"
+                style={{ height: virtualizer.getTotalSize() }}
+              >
+                {virtualizer.getVirtualItems().map((vrow) => {
+                  const row = rows[vrow.index];
+                  if (!row) return null;
+                  if (row.type === "header") {
+                    return (
+                      <div
+                        key={vrow.key}
+                        className="absolute left-0 flex h-10 w-full items-center gap-3 px-4 pt-2"
+                        style={{ transform: `translateY(${vrow.start}px)` }}
+                      >
+                        <span className="shrink-0 font-kai text-callout text-secondary">
+                          {row.label}
+                        </span>
+                        <span aria-hidden className="h-px flex-1 bg-line" />
+                        <span className="shrink-0 text-caption text-quaternary">
+                          {t("{{n}} 张", { n: row.count })}
+                        </span>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div
+                      key={vrow.key}
+                      className="absolute left-0 w-full"
+                      style={{
+                        transform: `translateY(${vrow.start}px)`,
+                        height: vrow.size,
+                      }}
+                    >
+                      {renderItemRow(row)}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+            <div ref={sentinelRef} aria-hidden className="h-6 w-full" />
+            {loadError && items.length > 0 && (
+              <div className="flex flex-col items-center gap-2 py-3 text-center">
+                <span className="text-footnote text-secondary">
+                  {t("加载更多失败")}
+                </span>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => void load(cursorRef.current)}
+                >
+                  {t("重试")}
+                </Button>
+              </div>
+            )}
+            {hasMore && !loading && !loadError && items.length > 0 && (
+              <div className="py-3 text-center">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => void load(cursorRef.current)}
+                >
+                  {t("加载更多")}
+                </Button>
+              </div>
+            )}
+            {loading && (
+              <div className="py-3 text-center text-footnote text-tertiary">
+                {t("加载中…")}
+              </div>
+            )}
           </div>
-        )}
-        <div ref={sentinelRef} aria-hidden className="h-6 w-full" />
-        {loadError && items.length > 0 && (
-          <div className="flex flex-col items-center gap-2 py-3 text-center">
-            <span className="text-footnote text-secondary">
-              {t("加载更多失败")}
-            </span>
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() =>
-                void load(cursorRef.current, modelFilter, styleFilter, favOnly)
-              }
-            >
-              {t("重试")}
-            </Button>
-          </div>
-        )}
-        {hasMore && !loading && !loadError && items.length > 0 && (
-          <div className="py-3 text-center">
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() =>
-                void load(cursorRef.current, modelFilter, styleFilter, favOnly)
-              }
-            >
-              {t("加载更多")}
-            </Button>
-          </div>
-        )}
-        {loading && (
-          <div className="py-3 text-center text-footnote text-tertiary">
-            {t("加载中…")}
-          </div>
+        </div>
+
+        {showDetails && (
+          <GalleryDetailsPane
+            item={activeItem}
+            actions={actions}
+            onClose={() => changePrefs({ detailsPane: false })}
+          />
         )}
       </div>
 
+      <GalleryStatusBar
+        total={displayItems.length}
+        selectedCount={selectedItems.length}
+        iconSize={iconSize}
+        mode={mode}
+        onIconSizeChange={changeIconSize}
+      />
+
       {/* 选择工具条：只在有选择时浮出，避免常驻按钮占位 */}
       {selectedItems.length > 0 && (
-        <div className="pointer-events-none absolute inset-x-0 bottom-3 z-20 flex justify-center px-4">
+        <div className="pointer-events-none absolute inset-x-0 bottom-12 z-20 flex justify-center px-4">
           <div className="pointer-events-auto flex items-center gap-1 rounded-pill border border-line bg-elevated p-1 pl-3 shadow-sheet">
             <span className="tabular text-footnote text-secondary">
               {t("已选 {{n}}", { n: selectedItems.length })}
@@ -876,6 +890,17 @@ export default function GalleryView() {
         right={selectedItems[1] ?? null}
         onClose={() => setCompareOpen(false)}
       />
+
+      {viewer &&
+        createPortal(
+          <ImageViewer
+            images={[viewer]}
+            index={0}
+            onIndexChange={() => {}}
+            onClose={() => setViewer(null)}
+          />,
+          document.body,
+        )}
     </div>
   );
 }
