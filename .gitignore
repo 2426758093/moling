@@ -32,6 +32,8 @@ src-tauri/tauri.release.conf.json
 
 # 本地 AI 助手的会话记忆，不属于工程产物
 .workbuddy/
+# 设计协作会话的分享包，不属于工程产物
+.trae-html-share-packages/
 
 # 文档（产品 / 开发 / 设计规范等）只保留在本地，禁止提交到 GitHub
 *.md
