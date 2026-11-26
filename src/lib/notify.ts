@@ -19,7 +19,7 @@ function ensureHost(): HTMLDivElement {
 }
 
 const BASE =
-  "anim-pop pointer-events-auto max-w-reading rounded-pop glass px-3.5 py-2 text-callout shadow-sheet";
+  "anim-pop pointer-events-auto max-w-reading rounded-pop border border-line bg-elevated px-3.5 py-2 text-callout shadow-sheet";
 
 export function toast(message: string, kind: "info" | "error" = "info") {
   const box = ensureHost();

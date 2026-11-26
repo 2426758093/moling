@@ -57,6 +57,8 @@ const canvas = {
   放大: "Zoom in",
   "缩放 {{percent}}%": "Zoom {{percent}}%",
   适应: "Fit",
+  撤销: "Undo",
+  重做: "Redo",
 
   // CanvasNode
   "图片不可用：{{error}}": "Image unavailable: {{error}}",

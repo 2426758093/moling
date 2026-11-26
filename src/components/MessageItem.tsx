@@ -258,7 +258,7 @@ export default memo(function MessageItem({
                       <span>{t("可能已计费，重试会再次扣费")}</span>
                       {requestId && (
                         <button
-                          className="pressable font-mono text-[11px] underline decoration-dotted"
+                          className="pressable font-mono text-caption underline decoration-dotted"
                           onClick={() => {
                             void navigator.clipboard
                               .writeText(requestId)

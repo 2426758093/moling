@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from "react";
-import { motion, useReducedMotion } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import { useAppStore } from "../stores/appStore";
 import { useProviderStore } from "../stores/providerStore";
@@ -7,7 +6,6 @@ import { api, AnimationInfo, StickerResult } from "../lib/api";
 import { exportAnimationZip, saveDataUrl } from "../lib/save";
 import { emitHistoryChanged } from "../lib/historyEvents";
 import { toast } from "../lib/notify";
-import { DUR, EASE } from "../lib/motion";
 import {
   GIF_FRAME_MAX,
   GIF_FRAME_MS_MAX,
@@ -18,7 +16,8 @@ import { IconButton } from "./ui/IconButton";
 import { Input } from "./ui/Field";
 import { SegmentedControl } from "./ui/SegmentedControl";
 import { Switch } from "./ui/Switch";
-import { IconChevron, IconClose, IconCopy, IconTrash } from "./Icons";
+import { IconChevron, IconCopy, IconTrash } from "./Icons";
+import EditorShell from "./editors/EditorShell";
 import SafeImg from "./SafeImg";
 
 /// 时间轴条目：source 是源 GIF 的帧序号，重排 / 复制 / 删帧只动这个数组，
@@ -71,7 +70,6 @@ export default function AnimationView() {
   const canvasInline = useAppStore((s) => s.canvasInline);
   const defaultProviderId = useProviderStore((s) => s.defaultProviderId);
   const providers = useProviderStore((s) => s.providers);
-  const reduce = useReducedMotion();
 
   const targetId = target?.historyId ?? null;
   const [id, setId] = useState<number | null>(targetId);
@@ -189,13 +187,10 @@ export default function AnimationView() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const el = e.target as HTMLElement | null;
-      if (el?.closest("input, textarea, select, [contenteditable='true']")) {
-        if (e.key === "Escape") closeAnimation();
+      // Esc 关闭由 EditorShell 统一处理，这里只管播放控制
+      if (el?.closest("input, textarea, select, [contenteditable='true']"))
         return;
-      }
-      if (e.key === "Escape") {
-        closeAnimation();
-      } else if (e.key === " ") {
+      if (e.key === " ") {
         e.preventDefault();
         setPlaying((v) => !v);
       } else if (e.key === "ArrowLeft") {
@@ -208,7 +203,7 @@ export default function AnimationView() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [closeAnimation, entries.length]);
+  }, [entries.length]);
 
   if (!target) return null;
 
@@ -476,56 +471,33 @@ export default function AnimationView() {
     0;
 
   return (
-    <motion.div
-      initial={reduce ? false : { opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      transition={{ duration: reduce ? 0 : DUR.base, ease: EASE.ios }}
-      className={
-        inline
-          ? "flex h-full min-h-0 w-full flex-col bg-base"
-          : "fixed inset-x-0 bottom-0 top-12 z-30 flex flex-col bg-base"
+    <EditorShell
+      inline={inline}
+      onClose={closeAnimation}
+      title={t("动图编辑器")}
+      subtitle={
+        info
+          ? t("{{frames}} 帧 · {{w}}×{{h}} · {{seconds}} 秒 · {{kb}} KB", {
+              frames: entries.length,
+              w: info.width,
+              h: info.height,
+              seconds: (totalMs / 1000).toFixed(1),
+              kb: kb(info.bytes),
+            })
+          : t("加载中…")
       }
-    >
-      <header className="relative z-10 shrink-0 glass">
-        <div className="flex min-h-12 items-center gap-3 px-6 py-2">
-          <div className="flex min-w-0 flex-col">
-            <h1 className="truncate text-title3 text-primary">
-              {t("动图编辑器")}
-            </h1>
-            <p className="truncate text-footnote tabular-nums text-tertiary">
-              {info
-                ? t(
-                    "{{frames}} 帧 · {{w}}×{{h}} · {{seconds}} 秒 · {{kb}} KB",
-                    {
-                      frames: entries.length,
-                      w: info.width,
-                      h: info.height,
-                      seconds: (totalMs / 1000).toFixed(1),
-                      kb: kb(info.bytes),
-                    },
-                  )
-                : t("加载中…")}
-            </p>
-          </div>
-          <div className="ml-auto flex shrink-0 items-center gap-2">
-            <Button
-              variant="primary"
-              size="sm"
-              loading={busy === "save"}
-              disabled={!dirty || busy != null}
-              onClick={() => void save()}
-            >
-              {t("保存为新动图")}
-            </Button>
-            <IconButton
-              label={t("关闭动图编辑器")}
-              icon={<IconClose size={16} />}
-              onClick={closeAnimation}
-            />
-          </div>
-        </div>
-
+      headerExtra={
+        <Button
+          variant="primary"
+          size="sm"
+          loading={busy === "save"}
+          disabled={!dirty || busy != null}
+          onClick={() => void save()}
+        >
+          {t("保存为新动图")}
+        </Button>
+      }
+      toolbar={
         <div
           role="toolbar"
           aria-label={t("动图工具")}
@@ -564,306 +536,308 @@ export default function AnimationView() {
             {t("重置时间轴")}
           </Button>
         </div>
-      </header>
-
-      <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden p-6">
-        {loading ? (
-          <span className="text-body text-tertiary">{t("加载中…")}</span>
-        ) : entries.length === 0 ? (
-          <span className="text-body text-tertiary">{t("没有可用的帧")}</span>
-        ) : (
-          <div className="relative flex h-full min-h-0 w-full flex-col items-center gap-3">
-            <SafeImg
-              src={previewUrl ?? currentEntry?.thumbUrl ?? ""}
-              alt={t("动图预览")}
-              className="min-h-0 max-h-full max-w-full rounded-card border border-line object-contain shadow-pop"
-            />
-            {repairOpen && (
-              <div className="w-full max-w-xl shrink-0 rounded-card border border-line bg-elevated p-3">
-                <p className="mb-2 text-footnote text-tertiary">
-                  {t(
-                    "单帧修复会整帧重绘（GIF 无蒙版）；基于已保存版本，未保存的时间轴调整将丢失",
-                  )}
-                </p>
-                <div className="flex items-end gap-2">
-                  <div className="min-w-0 flex-1">
-                    <Input
-                      value={repairPrompt}
-                      onChange={(e) => setRepairPrompt(e.target.value)}
-                      placeholder={t("描述这一帧要改的内容…")}
-                      aria-label={t("单帧修复描述")}
-                      compact
-                    />
+      }
+    >
+      <div className="flex h-full min-h-0 w-full flex-col">
+        <div className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden p-6">
+          {loading ? (
+            <span className="text-body text-tertiary">{t("加载中…")}</span>
+          ) : entries.length === 0 ? (
+            <span className="text-body text-tertiary">{t("没有可用的帧")}</span>
+          ) : (
+            <div className="relative flex h-full min-h-0 w-full flex-col items-center gap-3">
+              <SafeImg
+                src={previewUrl ?? currentEntry?.thumbUrl ?? ""}
+                alt={t("动图预览")}
+                className="min-h-0 max-h-full max-w-full rounded-card border border-line object-contain shadow-pop"
+              />
+              {repairOpen && (
+                <div className="w-full max-w-xl shrink-0 rounded-card border border-line bg-elevated p-3">
+                  <p className="mb-2 text-footnote text-tertiary">
+                    {t(
+                      "单帧修复会整帧重绘（GIF 无蒙版）；基于已保存版本，未保存的时间轴调整将丢失",
+                    )}
+                  </p>
+                  <div className="flex items-end gap-2">
+                    <div className="min-w-0 flex-1">
+                      <Input
+                        value={repairPrompt}
+                        onChange={(e) => setRepairPrompt(e.target.value)}
+                        placeholder={t("描述这一帧要改的内容…")}
+                        aria-label={t("单帧修复描述")}
+                        compact
+                      />
+                    </div>
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      loading={busy === "repair"}
+                      disabled={busy != null}
+                      onClick={() => void repairFrame()}
+                    >
+                      {t("修复当前帧")}
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => setRepairOpen(false)}
+                    >
+                      {t("关闭单帧修复")}
+                    </Button>
                   </div>
-                  <Button
-                    size="sm"
-                    variant="primary"
-                    loading={busy === "repair"}
-                    disabled={busy != null}
-                    onClick={() => void repairFrame()}
-                  >
-                    {t("修复当前帧")}
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    onClick={() => setRepairOpen(false)}
-                  >
-                    {t("关闭单帧修复")}
-                  </Button>
                 </div>
-              </div>
-            )}
-          </div>
-        )}
-      </div>
+              )}
+            </div>
+          )}
+        </div>
 
-      <div className="shrink-0 border-t border-line bg-elevated/60 px-4 py-3">
-        <div className="mb-2 flex flex-wrap items-center gap-3">
-          <span className="text-footnote text-tertiary">{t("帧时长")}</span>
-          <div className="w-24">
-            <Input
-              type="number"
-              min={GIF_FRAME_MS_MIN}
-              max={GIF_FRAME_MS_MAX}
-              step={10}
-              value={currentEntry?.delayMs ?? GIF_FRAME_MS_MIN}
-              onChange={(e) => setDuration(current, e.target.value)}
-              aria-label={t("帧时长")}
-              suffix={t("毫秒")}
-              compact
-            />
-          </div>
-          <Button
-            size="sm"
-            variant="ghost"
-            disabled={!currentEntry}
-            onClick={applyDurationToAll}
-          >
-            {t("应用到全部")}
-          </Button>
-          <span className="text-footnote tabular-nums text-tertiary">
-            {t("实际 {{ms}} 毫秒", {
-              ms: currentEntry
-                ? effectiveDelay(currentEntry.delayMs, speed)
-                : 0,
-            })}
-          </span>
-          <div className="ml-auto flex flex-wrap items-center gap-2">
+        <div className="shrink-0 border-t border-line bg-elevated/60 px-4 py-3">
+          <div className="mb-2 flex flex-wrap items-center gap-3">
+            <span className="text-footnote text-tertiary">{t("帧时长")}</span>
+            <div className="w-24">
+              <Input
+                type="number"
+                min={GIF_FRAME_MS_MIN}
+                max={GIF_FRAME_MS_MAX}
+                step={10}
+                value={currentEntry?.delayMs ?? GIF_FRAME_MS_MIN}
+                onChange={(e) => setDuration(current, e.target.value)}
+                aria-label={t("帧时长")}
+                suffix={t("毫秒")}
+                compact
+              />
+            </div>
             <Button
               size="sm"
               variant="ghost"
               disabled={!currentEntry}
-              onClick={() => setRepairOpen((v) => !v)}
+              onClick={applyDurationToAll}
             >
-              {t("单帧修复")}
+              {t("应用到全部")}
             </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              loading={busy === "gif"}
-              disabled={busy != null}
-              onClick={() => void exportZip("gif")}
-            >
-              {t("导出 GIF 包")}
-            </Button>
-            <Button
-              size="sm"
-              variant="ghost"
-              loading={busy === "png-sequence"}
-              disabled={busy != null}
-              onClick={() => void exportZip("png-sequence")}
-            >
-              {t("导出 PNG 序列")}
-            </Button>
-          </div>
-        </div>
-
-        <div
-          role="listbox"
-          aria-label={t("时间轴")}
-          className="flex gap-2 overflow-x-auto pb-1"
-        >
-          {entries.map((entry, index) => (
-            <div
-              key={entry.key}
-              role="option"
-              aria-selected={index === current}
-              aria-label={t("第 {{n}} 帧", { n: index + 1 })}
-              tabIndex={0}
-              onClick={() => setCurrent(index)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  setCurrent(index);
-                }
-              }}
-              className={`shrink-0 rounded-chip p-1 outline-none ring-2 transition-shadow ${
-                index === current
-                  ? "ring-accent"
-                  : "ring-transparent hover:ring-line-strong"
-              }`}
-            >
-              <div className="relative h-16 w-24 overflow-hidden rounded-chip bg-sunken">
-                <SafeImg
-                  src={entry.thumbUrl}
-                  alt={t("第 {{n}} 帧", { n: index + 1 })}
-                  loading="lazy"
-                  className="h-full w-full object-cover"
-                />
-                <span className="absolute left-1 top-1 rounded-chip bg-black/55 px-1 text-caption tabular-nums text-white">
-                  {index + 1}
-                </span>
-                <span className="absolute bottom-1 right-1 rounded-chip bg-black/55 px-1 text-caption tabular-nums text-white">
-                  {effectiveDelay(entry.delayMs, speed)}ms
-                </span>
-              </div>
-              <div className="mt-1 flex items-center justify-between">
-                <IconButton
-                  label={t("左移")}
-                  icon={<IconChevron size={13} direction="left" />}
-                  size="sm"
-                  disabled={index === 0}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    move(index, -1);
-                  }}
-                />
-                <IconButton
-                  label={t("右移")}
-                  icon={<IconChevron size={13} />}
-                  size="sm"
-                  disabled={index === entries.length - 1}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    move(index, 1);
-                  }}
-                />
-                <IconButton
-                  label={t("复制帧")}
-                  icon={<IconCopy size={13} />}
-                  size="sm"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    duplicate(index);
-                  }}
-                />
-                <IconButton
-                  label={t("删除帧")}
-                  icon={<IconTrash size={13} />}
-                  size="sm"
-                  disabled={entries.length <= 2}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    remove(index);
-                  }}
-                />
-              </div>
-            </div>
-          ))}
-        </div>
-
-        <div className="mt-2 flex flex-wrap items-center gap-2">
-          <span className="text-footnote text-tertiary">{t("压缩体积")}</span>
-          <SegmentedControl
-            value={optimizeTarget}
-            onValueChange={setOptimizeTarget}
-            options={OPTIMIZE_OPTIONS.map((option) => ({
-              value: option.value,
-              label: option.value === "custom" ? t("自定义") : option.label,
-            }))}
-            label={t("压缩体积")}
-            size="sm"
-          />
-          {optimizeTarget === "custom" && (
-            <div className="w-24">
-              <Input
-                type="number"
-                min={10}
-                max={10240}
-                value={customKb}
-                onChange={(e) => setCustomKb(e.target.value)}
-                aria-label={t("自定义目标（KB）")}
-                suffix="KB"
-                compact
-              />
-            </div>
-          )}
-          <Button
-            size="sm"
-            variant="ghost"
-            loading={busy === "optimize"}
-            disabled={busy != null}
-            onClick={() => void optimize()}
-          >
-            {t("开始压缩")}
-          </Button>
-
-          <span className="ml-2 text-footnote text-tertiary">
-            {t("表情包")}
-          </span>
-          <SegmentedControl
-            value={stickerPreset}
-            onValueChange={setStickerPreset}
-            options={STICKER_OPTIONS.map((option) => ({
-              value: option.value,
-              label: t(option.label),
-            }))}
-            label={t("表情包")}
-            size="sm"
-          />
-          <Button
-            size="sm"
-            variant="ghost"
-            loading={busy === "sticker"}
-            disabled={busy != null}
-            onClick={() => void makeSticker()}
-          >
-            {t("生成表情包")}
-          </Button>
-          {sticker && (
-            <>
+            <span className="text-footnote tabular-nums text-tertiary">
+              {t("实际 {{ms}} 毫秒", {
+                ms: currentEntry
+                  ? effectiveDelay(currentEntry.delayMs, speed)
+                  : 0,
+              })}
+            </span>
+            <div className="ml-auto flex flex-wrap items-center gap-2">
               <Button
                 size="sm"
-                variant="secondary"
-                onClick={() => void saveSticker()}
+                variant="ghost"
+                disabled={!currentEntry}
+                onClick={() => setRepairOpen((v) => !v)}
               >
-                {t("保存表情包")}
+                {t("单帧修复")}
               </Button>
               <Button
                 size="sm"
                 variant="ghost"
-                onClick={() => void saveStickerCover()}
+                loading={busy === "gif"}
+                disabled={busy != null}
+                onClick={() => void exportZip("gif")}
               >
-                {t("保存封面")}
+                {t("导出 GIF 包")}
               </Button>
-              <span
-                className={`text-footnote ${
-                  sticker.withinLimit ? "text-tertiary" : "text-warning"
+              <Button
+                size="sm"
+                variant="ghost"
+                loading={busy === "png-sequence"}
+                disabled={busy != null}
+                onClick={() => void exportZip("png-sequence")}
+              >
+                {t("导出 PNG 序列")}
+              </Button>
+            </div>
+          </div>
+
+          <div
+            role="listbox"
+            aria-label={t("时间轴")}
+            className="flex gap-2 overflow-x-auto pb-1"
+          >
+            {entries.map((entry, index) => (
+              <div
+                key={entry.key}
+                role="option"
+                aria-selected={index === current}
+                aria-label={t("第 {{n}} 帧", { n: index + 1 })}
+                tabIndex={0}
+                onClick={() => setCurrent(index)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    setCurrent(index);
+                  }
+                }}
+                className={`shrink-0 rounded-chip p-1 outline-none ring-2 transition-shadow ${
+                  index === current
+                    ? "ring-accent"
+                    : "ring-transparent hover:ring-line-strong"
                 }`}
               >
-                {sticker.withinLimit
-                  ? t("{{kb}} KB / 上限 {{max}} KB", {
-                      kb: kb(sticker.animation.bytes),
-                      max: kb(sticker.maxBytes),
-                    })
-                  : t("超出 {{max}} KB 上限，请降帧或继续压缩", {
-                      max: kb(sticker.maxBytes),
-                    })}
-              </span>
-            </>
-          )}
-        </div>
-      </div>
+                <div className="relative h-16 w-24 overflow-hidden rounded-chip bg-sunken">
+                  <SafeImg
+                    src={entry.thumbUrl}
+                    alt={t("第 {{n}} 帧", { n: index + 1 })}
+                    loading="lazy"
+                    className="h-full w-full object-cover"
+                  />
+                  <span className="absolute left-1 top-1 rounded-chip bg-scrim/55 px-1 text-caption tabular-nums text-on-accent">
+                    {index + 1}
+                  </span>
+                  <span className="absolute bottom-1 right-1 rounded-chip bg-scrim/55 px-1 text-caption tabular-nums text-on-accent">
+                    {effectiveDelay(entry.delayMs, speed)}ms
+                  </span>
+                </div>
+                <div className="mt-1 flex items-center justify-between">
+                  <IconButton
+                    label={t("左移")}
+                    icon={<IconChevron size={13} direction="left" />}
+                    size="sm"
+                    disabled={index === 0}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      move(index, -1);
+                    }}
+                  />
+                  <IconButton
+                    label={t("右移")}
+                    icon={<IconChevron size={13} />}
+                    size="sm"
+                    disabled={index === entries.length - 1}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      move(index, 1);
+                    }}
+                  />
+                  <IconButton
+                    label={t("复制帧")}
+                    icon={<IconCopy size={13} />}
+                    size="sm"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      duplicate(index);
+                    }}
+                  />
+                  <IconButton
+                    label={t("删除帧")}
+                    icon={<IconTrash size={13} />}
+                    size="sm"
+                    disabled={entries.length <= 2}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      remove(index);
+                    }}
+                  />
+                </div>
+              </div>
+            ))}
+          </div>
 
-      {error && (
-        <div
-          role="alert"
-          className="shrink-0 border-t border-danger/25 bg-danger/10 px-6 py-2 text-footnote text-danger"
-        >
-          {error}
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <span className="text-footnote text-tertiary">{t("压缩体积")}</span>
+            <SegmentedControl
+              value={optimizeTarget}
+              onValueChange={setOptimizeTarget}
+              options={OPTIMIZE_OPTIONS.map((option) => ({
+                value: option.value,
+                label: option.value === "custom" ? t("自定义") : option.label,
+              }))}
+              label={t("压缩体积")}
+              size="sm"
+            />
+            {optimizeTarget === "custom" && (
+              <div className="w-24">
+                <Input
+                  type="number"
+                  min={10}
+                  max={10240}
+                  value={customKb}
+                  onChange={(e) => setCustomKb(e.target.value)}
+                  aria-label={t("自定义目标（KB）")}
+                  suffix="KB"
+                  compact
+                />
+              </div>
+            )}
+            <Button
+              size="sm"
+              variant="ghost"
+              loading={busy === "optimize"}
+              disabled={busy != null}
+              onClick={() => void optimize()}
+            >
+              {t("开始压缩")}
+            </Button>
+
+            <span className="ml-2 text-footnote text-tertiary">
+              {t("表情包")}
+            </span>
+            <SegmentedControl
+              value={stickerPreset}
+              onValueChange={setStickerPreset}
+              options={STICKER_OPTIONS.map((option) => ({
+                value: option.value,
+                label: t(option.label),
+              }))}
+              label={t("表情包")}
+              size="sm"
+            />
+            <Button
+              size="sm"
+              variant="ghost"
+              loading={busy === "sticker"}
+              disabled={busy != null}
+              onClick={() => void makeSticker()}
+            >
+              {t("生成表情包")}
+            </Button>
+            {sticker && (
+              <>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => void saveSticker()}
+                >
+                  {t("保存表情包")}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => void saveStickerCover()}
+                >
+                  {t("保存封面")}
+                </Button>
+                <span
+                  className={`text-footnote ${
+                    sticker.withinLimit ? "text-tertiary" : "text-warning"
+                  }`}
+                >
+                  {sticker.withinLimit
+                    ? t("{{kb}} KB / 上限 {{max}} KB", {
+                        kb: kb(sticker.animation.bytes),
+                        max: kb(sticker.maxBytes),
+                      })
+                    : t("超出 {{max}} KB 上限，请降帧或继续压缩", {
+                        max: kb(sticker.maxBytes),
+                      })}
+                </span>
+              </>
+            )}
+          </div>
         </div>
-      )}
-    </motion.div>
+
+        {error && (
+          <div
+            role="alert"
+            className="shrink-0 border-t border-danger/25 bg-danger/10 px-6 py-2 text-footnote text-danger"
+          >
+            {error}
+          </div>
+        )}
+      </div>
+    </EditorShell>
   );
 }

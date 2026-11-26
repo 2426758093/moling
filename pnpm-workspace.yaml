@@ -1,3 +1,10 @@
+allowBuilds:
+  # E2E 依赖（tsx/vite）用 esbuild 需要其 postinstall 校验二进制
+  esbuild: true
+  # tauri-driver 走外部 msedgedriver，不需要 npm 侧驱动下载
+  edgedriver: false
+  geckodriver: false
+
 minimumReleaseAgeExclude:
   - "@tauri-apps/plugin-opener@2.7.0"
 

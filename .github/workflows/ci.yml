@@ -50,3 +50,32 @@ jobs:
       - run: cargo test --locked
       # 漏洞扫描：只对漏洞失败（初始不启用 --deny warnings），已知不可修 advisory 记入 src-tauri/.cargo/audit.toml
       - run: cargo audit
+      # 许可 / 供应链门禁（F-015）：配置在 src-tauri/deny.toml；manifest 路径相对仓库根
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          manifest-path: src-tauri/Cargo.toml
+
+  e2e:
+    # E2E 基座（非阻塞）：依赖 tauri-driver、msedgedriver 与可交互 WebView2，
+    # 任一环境缺失都会失败，因此先 continue-on-error，不阻塞 frontend/rust 门禁
+    continue-on-error: true
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+      - uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          build-warnings: ""
+      - run: pnpm install --frozen-lockfile
+      - name: Install tauri-driver
+        run: cargo install tauri-driver --locked
+      # 注：tauri-driver 需要 PATH 中的 msedgedriver（版本与 Edge 对应）；
+      # Windows runner 若未预装，本 job 会失败并因 continue-on-error 仅记录结果
+      - run: pnpm e2e:build
+      - run: pnpm e2e:run

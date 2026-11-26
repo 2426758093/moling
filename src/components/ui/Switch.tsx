@@ -28,7 +28,7 @@ export function Switch({
       aria-label={label}
       className={cn(
         "relative h-5 w-9 shrink-0 rounded-pill transition-colors",
-        checked ? "bg-success-fill" : "bg-fill",
+        checked ? "bg-accent-fill" : "bg-fill",
         disabled && "cursor-not-allowed opacity-40",
         className,
       )}

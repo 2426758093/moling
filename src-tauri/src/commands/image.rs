@@ -2,6 +2,7 @@ use crate::adapters::{self, AdapterError, EditRequest, GenerateRequest, Transfor
 use crate::billing_journal::{self, AttemptCtx, AttemptSpec, BillingClass};
 use crate::image_store::{self, SAFE_NAME_MAX_CHARS};
 use crate::key_pool;
+use crate::rules;
 use crate::storage;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::Ordering;
@@ -128,8 +129,8 @@ fn timeout_billing_hint(err: AdapterError) -> AdapterError {
 }
 
 /// 参考图上限：前端三个入口（上传 / 拖拽 / 引用图）已统一限制，
-/// 后端再截断一次，防止绕过 UI 的超大请求。
-pub(crate) const MAX_REFERENCE_IMAGES: usize = 4;
+/// 后端再截断一次，防止绕过 UI 的超大请求。数值由 `rules` 统一维护。
+pub(crate) const MAX_REFERENCE_IMAGES: usize = rules::REFERENCE_MAX;
 
 /// 换背景合成时的蒙版羽化半径（像素）：1–2px 让边缘不出现硬锯齿
 const BACKGROUND_FEATHER: u32 = 2;
@@ -139,25 +140,19 @@ const GENERATE_MAX_ATTEMPTS: u32 = 2;
 /// 重试退避时长（仅瞬时错误使用，避免抖动期间立刻重击服务商）
 const GENERATE_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// 尺寸区间与吸附步长（F-016）：上限对齐前端 appStore 的 SIZE_MAX（4096，也是画布
-/// 输出上限），下限放宽到 64 以兼容 outpaint 的窄边与被编辑的小图；8 的倍数与服务商
-/// 常见的对齐要求一致。原值来自 IPC，必须在这里钳制而不是只信前端。
-const SIZE_MIN: u32 = 64;
-const SIZE_MAX: u32 = 4096;
-const SIZE_STEP: u32 = 8;
-/// 单次生成张数上限：与前端张数滑杆、队列 enqueue 的旧 clamp(1,4) 同口径
-const COUNT_MAX: u32 = 4;
-
+/// 尺寸区间与吸附步长（F-016）统一来自 `rules`：上限对齐前端 appStore 的 SIZE_MAX
+/// （4096，也是画布输出上限），下限按上下文区分——生成用 GEN_SIZE_MIN（512），
+/// 编辑 / 扩图用 EDIT_SIZE_MIN（64，兼容窄边与被编辑的小图）。原值来自 IPC，
+/// 必须在这里钳制而不是只信前端。
+///
 /// 先夹到区间再吸附到 8 的倍数：顺序不能反，否则 4090 吸附成 4096 后仍合法，
 /// 但 4097 若先吸附会变成 4104 再被夹回 4096，结果不一致。
-pub(crate) fn normalize_size(n: u32) -> u32 {
-    let clamped = n.clamp(SIZE_MIN, SIZE_MAX);
-    let snapped = (clamped + SIZE_STEP / 2) / SIZE_STEP * SIZE_STEP;
-    snapped.clamp(SIZE_MIN, SIZE_MAX)
+pub(crate) fn normalize_size(n: u32, min: u32) -> u32 {
+    rules::snap_size(n, min)
 }
 
 pub(crate) fn normalize_count(n: u32) -> u32 {
-    n.clamp(1, COUNT_MAX)
+    rules::clamp_count(n)
 }
 
 /// 质量档位白名单：auto/未知值一律视为「不发送」，防止任意字符串透传给服务商。
@@ -181,16 +176,20 @@ pub(crate) fn normalize_generation(width: u32, height: u32, count: u32) -> (u32,
         return (0, 0, normalize_count(count));
     }
     (
-        normalize_size(width),
-        normalize_size(height),
+        normalize_size(width, rules::GEN_SIZE_MIN),
+        normalize_size(height, rules::GEN_SIZE_MIN),
         normalize_count(count),
     )
 }
 
+/// 动图帧数硬上限：模型能力可以高于前端默认上限（`rules::GIF_FRAME_MAX`），
+/// 但超过 64 帧的 GIF 体积与编码耗时都不可接受。
+const GIF_FRAME_HARD_MAX: u32 = 64;
+
 /// GIF 参数统一归一化：非 gif 输出时四个字段全部丢弃，保证静态请求形状不变。
-/// 帧数按模型的 `gif_max_frames` 收敛（直连 OpenAI 为 16），时长 20–2000ms 并按 10ms 取整。
-/// 显式 "png" 会原样保留：它只是内部「必须返回位图」的提示（单帧修复 / 分区重绘），
-/// 真实适配器只在 gif 时下发该字段，因此不会改变请求形状。
+/// 帧数按模型的 `gif_max_frames` 收敛（直连 OpenAI 为 16），时长 20–2000ms 并按 10ms 取整；
+/// 上下限来自 `rules`。显式 "png" 会原样保留：它只是内部「必须返回位图」的提示
+/// （单帧修复 / 分区重绘），真实适配器只在 gif 时下发该字段，因此不会改变请求形状。
 pub(crate) fn normalize_gif(
     output_format: Option<&str>,
     frame_count: Option<u32>,
@@ -204,9 +203,17 @@ pub(crate) fn normalize_gif(
     if !adapters::wants_gif(output_format) {
         return (None, None, None, None);
     }
-    let max_frames = max_frames.clamp(2, 64);
-    let frames = frame_count.unwrap_or(9).clamp(2, max_frames);
-    let rounded = (frame_duration_ms.unwrap_or(200).clamp(20, 2000) + 5) / 10 * 10;
+    // 模型能力可高于前端默认上限（rules::GIF_FRAME_MAX），但 64 帧是体积与编码耗时的硬顶
+    let max_frames = max_frames.clamp(rules::GIF_FRAME_MIN, GIF_FRAME_HARD_MAX);
+    let frames = frame_count
+        .unwrap_or(9)
+        .clamp(rules::GIF_FRAME_MIN, max_frames);
+    let rounded = (frame_duration_ms
+        .unwrap_or(200)
+        .clamp(rules::GIF_MS_MIN, rules::GIF_MS_MAX)
+        + 5)
+        / 10
+        * 10;
     let complexity = match complexity.map(str::trim) {
         Some("low") => Some("low".to_string()),
         Some("medium") => Some("medium".to_string()),
@@ -931,9 +938,9 @@ pub async fn edit_image(
              the surrounding background naturally."
             .to_string();
     }
-    // 尺寸归一化（F-016）：编辑同样走 IPC，不能只信前端
-    input.width = normalize_size(input.width);
-    input.height = normalize_size(input.height);
+    // 尺寸归一化（F-016）：编辑同样走 IPC，不能只信前端；下限用编辑上下文（64）
+    input.width = normalize_size(input.width, rules::EDIT_SIZE_MIN);
+    input.height = normalize_size(input.height, rules::EDIT_SIZE_MIN);
     let max_frames = gif_max_frames(input.provider_id, &input.model);
     let (output_format, frame_count, frame_duration_ms, complexity) = normalize_gif(
         input.output_format.as_deref(),
@@ -1327,6 +1334,20 @@ pub async fn apply_edit(
         "op": "basic-edit",
         "parentId": input.parent_id,
     }))
+}
+
+/// 自动拉直：估算画面倾斜角（度）。返回值可直接作为 `rotateFree` 的 `deg` 应用，
+/// 即 `apply_edit` 里下发一条 `{ type: "rotateFree", deg }` 即可拉正。
+#[tauri::command]
+pub async fn estimate_skew(image_b64: String) -> Result<f32, String> {
+    use base64::Engine;
+    let raw = image_store::strip_data_url(&image_b64);
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(raw)
+        .map_err(|e| format!("图片 base64 解码失败: {e}"))?;
+    // 与 apply_edit 同一套解码：EXIF 摆正 + 8K / 4000 万像素上限
+    let img = crate::exif::decode_oriented(&bytes).map_err(|e| format!("图片解码失败: {e}"))?;
+    crate::basic_edit::estimate_skew(&img)
 }
 
 fn encode_png_data_url(img: &image::DynamicImage) -> Result<String, String> {
@@ -1914,11 +1935,14 @@ mod tests {
 
     #[test]
     fn normalize_generation_keeps_auto_size() {
-        // 0×0 是自动尺寸哨兵：不能被钳到 64×64
+        // 0×0 是自动尺寸哨兵：不能被钳到 512×512
         assert_eq!(normalize_generation(0, 0, 0), (0, 0, 1));
         assert_eq!(normalize_generation(0, 0, 9), (0, 0, 4));
-        // 只有一边为 0 时仍按普通尺寸归一化
-        assert_eq!(normalize_generation(0, 1024, 1), (SIZE_MIN, 1024, 1));
+        // 只有一边为 0 时按普通尺寸归一化，下限用生成上下文（512）
+        assert_eq!(
+            normalize_generation(0, 1024, 1),
+            (rules::GEN_SIZE_MIN, 1024, 1)
+        );
     }
 
     #[test]
@@ -1942,22 +1966,32 @@ mod tests {
         assert_eq!(value["requested"], 4);
     }
 
-    /// F-016：尺寸先夹区间再吸附 8 的倍数，0/超大值都不再透传给服务商
+    /// F-016：尺寸先夹区间再吸附 8 的倍数，生成 / 编辑各自的最小尺寸生效
     #[test]
     fn normalize_size_clamps_then_snaps() {
-        assert_eq!(normalize_size(0), SIZE_MIN);
-        assert_eq!(normalize_size(1), SIZE_MIN);
-        assert_eq!(normalize_size(512), 512);
-        assert_eq!(normalize_size(1024), 1024);
+        assert_eq!(normalize_size(0, rules::GEN_SIZE_MIN), 512);
+        assert_eq!(normalize_size(1, rules::GEN_SIZE_MIN), 512);
+        assert_eq!(normalize_size(0, rules::EDIT_SIZE_MIN), 64);
+        assert_eq!(normalize_size(1, rules::EDIT_SIZE_MIN), 64);
+        assert_eq!(normalize_size(512, rules::GEN_SIZE_MIN), 512);
+        assert_eq!(normalize_size(1024, rules::GEN_SIZE_MIN), 1024);
         // 4090 就近吸附到 4088（与前端 appStore 的 round 口径一致），不会越过上限
-        assert_eq!(normalize_size(4090), 4088);
-        assert_eq!(normalize_size(4097), SIZE_MAX);
-        assert_eq!(normalize_size(u32::MAX), SIZE_MAX);
-        // 结果永远是 8 的倍数且在区间内
-        for n in [0, 7, 63, 64, 65, 100, 1001, 4095, 5000] {
-            let v = normalize_size(n);
-            assert!(v.is_multiple_of(SIZE_STEP), "{n} -> {v} 不是 8 的倍数");
-            assert!((SIZE_MIN..=SIZE_MAX).contains(&v), "{n} -> {v} 越界");
+        assert_eq!(normalize_size(4090, rules::GEN_SIZE_MIN), 4088);
+        assert_eq!(normalize_size(4097, rules::EDIT_SIZE_MIN), rules::SIZE_MAX);
+        assert_eq!(
+            normalize_size(u32::MAX, rules::EDIT_SIZE_MIN),
+            rules::SIZE_MAX
+        );
+        // 结果永远是 8 的倍数且在上下文区间内
+        for min in [rules::GEN_SIZE_MIN, rules::EDIT_SIZE_MIN] {
+            for n in [0, 7, 63, 64, 65, 100, 511, 1001, 4095, 5000] {
+                let v = normalize_size(n, min);
+                assert!(
+                    v.is_multiple_of(rules::SIZE_STEP),
+                    "{n} -> {v} 不是 8 的倍数"
+                );
+                assert!((min..=rules::SIZE_MAX).contains(&v), "{n} -> {v} 越界");
+            }
         }
     }
 
@@ -1967,8 +2001,8 @@ mod tests {
         assert_eq!(normalize_count(0), 1);
         assert_eq!(normalize_count(1), 1);
         assert_eq!(normalize_count(4), 4);
-        assert_eq!(normalize_count(9), COUNT_MAX);
-        assert_eq!(normalize_generation(0, 100_000, 0), (64, 4096, 1));
+        assert_eq!(normalize_count(9), rules::COUNT_MAX);
+        assert_eq!(normalize_generation(0, 100_000, 0), (512, 4096, 1));
     }
 
     /// GIF 归一化：非 gif 输出清空全部字段，静态请求形状不变；显式 png 提示只保留格式

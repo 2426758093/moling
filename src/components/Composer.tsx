@@ -8,21 +8,12 @@ import {
 import { motion, AnimatePresence } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import { useChatStore } from "../stores/chatStore";
-import {
-  useAppStore,
-  SIZE_MIN,
-  SIZE_MAX,
-  type GenPrefs,
-} from "../stores/appStore";
+import { useAppStore, type GenPrefs } from "../stores/appStore";
 import { useProviderStore } from "../stores/providerStore";
 import { useQueueStore } from "../stores/queueStore";
 import {
   RATIO_OPTIONS,
   COMPLEXITY_OPTIONS,
-  GIF_FRAME_MIN,
-  GIF_FRAME_MAX,
-  GIF_FRAME_MS_MIN,
-  GIF_FRAME_MS_MAX,
   qualityLabel,
   qualityOptionsFor,
   REFERENCE_ROLES,
@@ -32,6 +23,14 @@ import {
   OutputFormat,
   GifComplexity,
 } from "../lib/types";
+import {
+  GEN_SIZE_MIN,
+  SIZE_MAX,
+  GIF_FRAME_MIN,
+  GIF_FRAME_MAX,
+  GIF_FRAME_MS_MIN,
+  GIF_FRAME_MS_MAX,
+} from "../lib/rules";
 import { api } from "../lib/api";
 import { validateImageFile } from "../lib/file";
 import { toast } from "../lib/notify";
@@ -106,7 +105,7 @@ function CustomSizeRow({
         <Input
           type="number"
           inputMode="numeric"
-          min={SIZE_MIN}
+          min={GEN_SIZE_MIN}
           max={SIZE_MAX}
           step={8}
           value={w}
@@ -122,7 +121,7 @@ function CustomSizeRow({
         <Input
           type="number"
           inputMode="numeric"
-          min={SIZE_MIN}
+          min={GEN_SIZE_MIN}
           max={SIZE_MAX}
           step={8}
           value={h}
@@ -741,7 +740,7 @@ export default function Composer() {
           onDrop={onComposerDrop}
           className={cn(
             // 焦点环用 outline：.glass 自己的 box-shadow 会压过 ring-* 工具类
-            "glass relative overflow-hidden rounded-card shadow-pop",
+            "relative overflow-hidden rounded-card border border-line bg-elevated shadow-card",
             dropActive
               ? "outline-2 outline-dashed outline-accent/50"
               : inputFocused

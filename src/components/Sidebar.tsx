@@ -1,88 +1,51 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { useTranslation } from "react-i18next";
-import { useAppStore, AppView } from "../stores/appStore";
+import { useAppStore } from "../stores/appStore";
 import { useChatStore } from "../stores/chatStore";
-import { useQueueStore } from "../stores/queueStore";
 import { useCompact } from "../hooks/useMediaQuery";
 import { useMotionTokens } from "../lib/useMotion";
 import { DUR } from "../lib/motion";
 import { FOCUS_SIDEBAR_SEARCH_EVENT } from "../lib/commands";
 import { Button } from "./ui/Button";
 import { IconButton } from "./ui/IconButton";
-import { Tooltip } from "./ui/Tooltip";
-import { Kbd } from "./ui/Kbd";
-import { cn } from "./ui/cn";
 import {
-  IconPlus,
   IconChat,
-  IconGrid,
-  IconCanvas,
-  IconQueue,
-  IconGear,
-  IconSparkle,
-  IconClose,
-  IconSun,
-  IconMoon,
-  IconMonitor,
-  IconCommand,
-  IconSearch,
   IconChevron,
+  IconClose,
+  IconPlus,
+  IconSearch,
 } from "./Icons";
-
-const NAV_ITEMS = [
-  { id: "retouch", label: "修图", icon: IconSparkle },
-  { id: "canvas", label: "画布", icon: IconCanvas },
-  { id: "gallery", label: "画廊", icon: IconGrid },
-  { id: "queue", label: "队列", icon: IconQueue },
-  { id: "settings", label: "设置", icon: IconGear },
-] as const satisfies readonly {
-  id: AppView;
-  label: string;
-  icon: typeof IconGrid;
-}[];
+import { cn } from "./ui/cn";
 
 const ROW_BASE =
   "pressable relative flex h-8 w-full items-center gap-2 rounded-btn text-callout transition-colors";
 
-function SectionLabel({ children }: { children: string }) {
-  return (
-    <div className="px-4 pb-1 pt-3 text-subhead text-tertiary">{children}</div>
-  );
-}
-
+/// 二级面板：只在创作页显示会话列表。导航已移到 NavRail，这里不再承担「去哪」，
+/// 只回答「在这个工作区里，我正在做哪一件」。
 export default function Sidebar() {
   const { t } = useTranslation();
-  const view = useAppStore((s) => s.view);
-  const setView = useAppStore((s) => s.setView);
   const manualCollapsed = useAppStore((s) => s.sidebarCollapsed);
   const toggleSidebar = useAppStore((s) => s.toggleSidebar);
   const setPaletteOpen = useAppStore((s) => s.setPaletteOpen);
-  const theme = useAppStore((s) => s.theme);
-  const setTheme = useAppStore((s) => s.setTheme);
   const conversations = useChatStore((s) => s.conversations);
   const activeId = useChatStore((s) => s.activeId);
   const newConversation = useChatStore((s) => s.newConversation);
   const selectConversation = useChatStore((s) => s.selectConversation);
   const deleteConvo = useChatStore((s) => s.deleteConvo);
-  const queuePending = useQueueStore(
-    (s) => (s.counts.queued ?? 0) + (s.counts.running ?? 0),
-  );
   const [query, setQuery] = useState("");
   const motionTokens = useMotionTokens();
-  // 窄窗口自动收成图标栏；用户的手动折叠仍然独立生效，两者取"或"
   const compact = useCompact();
   const collapsed = manualCollapsed || compact;
   const searchRef = useRef<HTMLInputElement>(null);
 
-  // Ctrl F / 命令面板"搜索对话"：收起的侧栏先展开，再聚焦搜索框
   useEffect(() => {
     const focusSearch = () => {
-      if (manualCollapsed) toggleSidebar();
       if (compact) {
         setPaletteOpen(true);
         return;
       }
+      if (manualCollapsed) toggleSidebar();
       requestAnimationFrame(() => {
         requestAnimationFrame(() => searchRef.current?.focus());
       });
@@ -98,30 +61,10 @@ export default function Sidebar() {
     return conversations.filter((c) => c.title.toLowerCase().includes(q));
   }, [conversations, query]);
 
-  const cycleTheme = () => {
-    setTheme(
-      theme === "system" ? "dark" : theme === "dark" ? "light" : "system",
-    );
-  };
-  const ThemeIcon =
-    theme === "dark" ? IconMoon : theme === "light" ? IconSun : IconMonitor;
-  const themeLabel =
-    theme === "system"
-      ? t("跟随系统")
-      : theme === "dark"
-        ? t("暗色")
-        : t("浅色");
-
-  const pickConvo = async (id: number) => {
-    await selectConversation(id);
-    setView("chat");
-  };
-
-  // 选中竖条：同 layoutId 在对话/导航之间迁移，切换视图时是滑动而不是闪现
   const rail = (on: boolean) =>
     on ? (
       <motion.span
-        layoutId="sidebar-active"
+        layoutId="conversation-active"
         transition={motionTokens.spring("snappy")}
         className="absolute left-0 top-1/2 h-4 w-0.5 -translate-y-1/2 rounded-pill bg-accent"
       />
@@ -129,41 +72,29 @@ export default function Sidebar() {
 
   return (
     <motion.aside
-      animate={{ width: collapsed ? 56 : 256 }}
+      animate={{ width: collapsed ? 0 : 248 }}
       transition={motionTokens.spring("gentle")}
-      className="glass flex shrink-0 flex-col overflow-hidden"
+      aria-hidden={collapsed}
+      className="relative shrink-0 overflow-hidden border-r border-separator bg-window"
     >
       <div
         className={cn(
-          "shrink-0 space-y-1.5 pb-1 pt-2",
-          collapsed ? "px-2" : "px-2.5",
+          "flex h-full w-[248px] flex-col",
+          collapsed && "pointer-events-none opacity-0",
         )}
+        style={{ visibility: collapsed ? "hidden" : "visible" }}
       >
-        {collapsed ? (
-          <IconButton
-            label={t("新对话")}
-            icon={<IconPlus size={16} />}
-            variant="secondary"
-            className="w-full"
-            onClick={async () => {
-              await newConversation();
-              setView("chat");
-            }}
-          />
-        ) : (
+        <div className="shrink-0 space-y-1.5 px-3 pb-1 pt-3">
           <Button
             variant="primary"
             block
             icon={<IconPlus size={15} />}
-            onClick={async () => {
-              await newConversation();
-              setView("chat");
+            onClick={() => {
+              void newConversation();
             }}
           >
             {t("新对话")}
           </Button>
-        )}
-        {!collapsed && (
           <div className="relative">
             <span className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-tertiary">
               <IconSearch size={13} />
@@ -174,54 +105,54 @@ export default function Sidebar() {
               onChange={(e) => setQuery(e.target.value)}
               placeholder={t("搜索对话")}
               aria-label={t("搜索对话")}
-              className="h-7 w-full rounded-btn bg-fill pl-7 pr-2 text-callout text-primary outline-none transition-shadow placeholder:text-tertiary focus:ring-2 focus:ring-accent/25"
+              className="h-8 w-full rounded-btn bg-fill pl-7 pr-2 text-callout text-primary outline-none transition-shadow placeholder:text-tertiary focus:ring-2 focus:ring-accent/25"
             />
           </div>
-        )}
-      </div>
+        </div>
 
-      {!collapsed && <SectionLabel>{t("对话")}</SectionLabel>}
+        <div className="px-5 pb-1 pt-3 text-caption text-quaternary">
+          {t("对话")}
+        </div>
 
-      <nav
-        aria-label={t("对话列表")}
-        className="min-h-0 flex-1 space-y-px overflow-y-auto px-2 py-0.5"
-      >
-        <AnimatePresence initial={false}>
-          {visible.map((c) => {
-            const active = view === "chat" && activeId === c.id;
-            return (
-              <motion.div
-                key={c.id}
-                layout
-                initial={motionTokens.reduce ? { opacity: 1 } : { opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={motionTokens.reduce ? { opacity: 1 } : { opacity: 0 }}
-                transition={motionTokens.fade(DUR.base)}
-                className="group relative"
-              >
-                <button
-                  onClick={() => pickConvo(c.id)}
-                  aria-label={t("打开对话：{{title}}", { title: c.title })}
-                  aria-current={active ? "page" : undefined}
-                  className={cn(
-                    ROW_BASE,
-                    collapsed ? "justify-center px-2" : "pl-3 pr-8",
-                    active
-                      ? "bg-accent-soft font-medium text-accent-text"
-                      : "text-secondary hover:bg-hover hover:text-primary",
-                  )}
+        <nav
+          aria-label={t("对话列表")}
+          className="min-h-0 flex-1 space-y-px overflow-y-auto px-2 pb-2"
+        >
+          <AnimatePresence initial={false}>
+            {visible.map((c) => {
+              const active = activeId === c.id;
+              return (
+                <motion.div
+                  key={c.id}
+                  layout
+                  initial={
+                    motionTokens.reduce ? { opacity: 1 } : { opacity: 0 }
+                  }
+                  animate={{ opacity: 1 }}
+                  exit={motionTokens.reduce ? { opacity: 1 } : { opacity: 0 }}
+                  transition={motionTokens.fade(DUR.base)}
+                  className="group relative"
                 >
-                  {rail(active && !collapsed)}
-                  <span className="shrink-0">
-                    <IconChat size={15} />
-                  </span>
-                  {!collapsed && (
+                  <button
+                    onClick={() => void selectConversation(c.id)}
+                    aria-label={t("打开对话：{{title}}", { title: c.title })}
+                    aria-current={active ? "page" : undefined}
+                    className={cn(
+                      ROW_BASE,
+                      "pl-3 pr-8",
+                      active
+                        ? "bg-accent-soft font-medium text-accent-text"
+                        : "text-secondary hover:bg-hover hover:text-primary",
+                    )}
+                  >
+                    {rail(active)}
+                    <span className="shrink-0">
+                      <IconChat size={15} />
+                    </span>
                     <span className="min-w-0 flex-1 truncate text-left">
                       {c.title}
                     </span>
-                  )}
-                </button>
-                {!collapsed && (
+                  </button>
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
@@ -233,114 +164,29 @@ export default function Sidebar() {
                   >
                     <IconClose size={11} />
                   </button>
-                )}
-              </motion.div>
-            );
-          })}
-        </AnimatePresence>
-        {visible.length === 0 && !collapsed && (
-          <div className="px-2.5 py-4 text-footnote text-tertiary">
-            {query ? t("没有匹配的对话") : t("还没有对话")}
-          </div>
-        )}
-      </nav>
+                </motion.div>
+              );
+            })}
+          </AnimatePresence>
+          {visible.length === 0 && (
+            <div className="px-2.5 py-4 text-footnote text-tertiary">
+              {query ? t("没有匹配的对话") : t("还没有对话")}
+            </div>
+          )}
+        </nav>
 
-      {!collapsed && <SectionLabel>{t("导航")}</SectionLabel>}
-      <div className={cn("shrink-0 space-y-px px-2 pb-1", collapsed && "pt-1")}>
-        {NAV_ITEMS.map((item) => {
-          const active = view === item.id;
-          const content = (
-            <button
-              onClick={() => setView(item.id)}
-              aria-label={t(item.label)}
-              aria-current={active ? "page" : undefined}
-              className={cn(
-                ROW_BASE,
-                collapsed ? "justify-center px-2" : "px-2.5",
-                active
-                  ? "bg-accent-soft font-medium text-accent-text"
-                  : "text-secondary hover:bg-hover hover:text-primary",
-              )}
-            >
-              {rail(active && !collapsed)}
-              <item.icon size={15} />
-              {!collapsed && (
-                <span className="flex-1 text-left">{t(item.label)}</span>
-              )}
-              {item.id === "queue" && queuePending > 0 && (
-                <span
-                  aria-label={t("{{n}} 个任务待执行", { n: queuePending })}
-                  className="tabular rounded-pill bg-accent-fill px-1.5 text-caption leading-4 text-on-accent"
-                >
-                  {queuePending}
-                </span>
-              )}
-            </button>
-          );
-          return collapsed ? (
-            <Tooltip key={item.id} label={t(item.label)} side="right">
-              {content}
-            </Tooltip>
-          ) : (
-            <div key={item.id}>{content}</div>
-          );
-        })}
-      </div>
-
-      {!collapsed && <SectionLabel>{t("系统")}</SectionLabel>}
-      <div className={cn("shrink-0 space-y-px px-2 pb-2", collapsed && "pt-1")}>
-        <Tooltip
-          label={t("主题：{{theme}}", { theme: themeLabel })}
-          side={collapsed ? "right" : "top"}
-        >
-          <button
-            onClick={cycleTheme}
-            aria-label={t("主题：{{theme}}，点击切换", { theme: themeLabel })}
-            className={cn(
-              ROW_BASE,
-              collapsed ? "justify-center px-2" : "px-2.5",
-              "text-secondary hover:bg-hover hover:text-primary",
-            )}
-          >
-            <ThemeIcon size={15} />
-            {!collapsed && (
-              <span className="flex-1 text-left">{themeLabel}</span>
-            )}
-          </button>
-        </Tooltip>
-        <Tooltip label={t("命令面板")} side={collapsed ? "right" : "top"}>
-          <button
-            onClick={() => setPaletteOpen(true)}
-            aria-label={t("打开命令面板")}
-            className={cn(
-              ROW_BASE,
-              collapsed ? "justify-center px-2" : "px-2.5",
-              "text-secondary hover:bg-hover hover:text-primary",
-            )}
-          >
-            <IconCommand size={15} />
-            {!collapsed && (
-              <>
-                <span className="flex-1 text-left">{t("命令")}</span>
-                <Kbd>Ctrl K</Kbd>
-              </>
-            )}
-          </button>
-        </Tooltip>
-        {/* 窄窗口下侧栏是自动收起的，手动折叠按钮隐藏，避免出现"点了没反应" */}
-        {!compact && (
-          <button
+        <div className="flex shrink-0 items-center justify-between border-t border-separator px-3 py-2">
+          <span className="text-caption text-quaternary">
+            {t("留白，是画面的一部分")}
+          </span>
+          <IconButton
+            label={t("折叠侧栏")}
+            size="sm"
+            tooltip={false}
+            icon={<IconChevron direction="left" size={13} />}
             onClick={toggleSidebar}
-            aria-label={collapsed ? t("展开侧栏") : t("折叠侧栏")}
-            className={cn(
-              "pressable flex h-7 w-full items-center gap-2.5 rounded-btn px-2.5 text-footnote text-tertiary transition-colors hover:bg-hover hover:text-secondary",
-              collapsed && "justify-center px-2",
-            )}
-          >
-            <IconChevron direction={collapsed ? "right" : "left"} size={13} />
-            {!collapsed && <span>{t("折叠侧栏")}</span>}
-          </button>
-        )}
+          />
+        </div>
       </div>
     </motion.aside>
   );

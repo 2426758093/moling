@@ -16,6 +16,7 @@ mod paths;
 mod redact;
 mod reference;
 mod retouch;
+mod rules;
 mod segment;
 mod storage;
 
@@ -154,6 +155,7 @@ pub fn run() {
             commands::edit_image,
             commands::transform_image,
             commands::apply_edit,
+            commands::estimate_skew,
             commands::retouch_analyze,
             commands::apply_retouch,
             commands::import_image,

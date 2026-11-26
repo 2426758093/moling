@@ -27,8 +27,8 @@ export function Tooltip({
           side={side}
           sideOffset={6}
           className={cn(
-            "anim-pop z-[65] select-none rounded-chip bg-elevated px-2 py-1",
-            "text-footnote text-primary shadow-pop",
+            "anim-pop z-[65] select-none rounded-chip bg-primary px-2 py-1",
+            "text-footnote text-window shadow-pop",
             className,
           )}
         >

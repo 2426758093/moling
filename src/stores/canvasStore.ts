@@ -326,6 +326,27 @@ let inflight: Promise<void> | null = null;
 let boardSeq = 0;
 const requestedThumbs = new Set<number>();
 
+/** 撤销/重做快照：只含内容，不含 viewport（平移缩放不算编辑） */
+export interface CanvasSnapshot {
+  nodes: CanvasNode[];
+  edges: CanvasEdge[];
+}
+
+export const MAX_HISTORY = 50;
+
+// 模块级栈：历史不落盘，切板/新建/删除/加载外部数据时清空
+let pastSnapshots: CanvasSnapshot[] = [];
+let futureSnapshots: CanvasSnapshot[] = [];
+/** 指针按下时记下的拖拽起点；首次真正移动才入栈，避免每帧压栈 */
+let gestureBase: CanvasSnapshot | null = null;
+
+/** 清空撤销/重做栈（切板与测试隔离用；标志位由 store 内部同步） */
+export function clearCanvasHistory(): void {
+  pastSnapshots = [];
+  futureSnapshots = [];
+  gestureBase = null;
+}
+
 interface CanvasState {
   boards: CanvasBoardMeta[];
   activeId: number | null;
@@ -346,6 +367,12 @@ interface CanvasState {
   dirty: boolean;
   saving: boolean;
   savedAt: string | null;
+  canUndo: boolean;
+  canRedo: boolean;
+  /** 拖拽/缩放开始前调用一次：只在首次真正移动时入栈 */
+  beginHistory: () => void;
+  undo: () => void;
+  redo: () => void;
   ensureLoaded: () => Promise<void>;
   createBoard: (name: string) => Promise<number | null>;
   selectBoard: (id: number) => Promise<void>;
@@ -409,7 +436,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
     }, SAVE_DEBOUNCE_MS);
   };
 
-  const resetToEmpty = (boards: CanvasBoardMeta[]) =>
+  const resetToEmpty = (boards: CanvasBoardMeta[]) => {
     set({
       boards,
       activeId: null,
@@ -423,6 +450,69 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
       selectedNodeId: null,
       layerPanelOpen: false,
     });
+    clearHistory();
+  };
+
+  const snapshotKeyOf = (nodes: CanvasNode[], edges: CanvasEdge[]) =>
+    JSON.stringify({ nodes, edges });
+
+  const syncHistoryFlags = () =>
+    set({
+      canUndo: pastSnapshots.length > 0,
+      canRedo: futureSnapshots.length > 0,
+    });
+
+  const pushSnapshot = (snap: CanvasSnapshot) => {
+    const top = pastSnapshots[pastSnapshots.length - 1];
+    // 状态没变（例如只是点击/平移）：不产生空的撤销步，也不清掉重做分支
+    if (
+      top &&
+      snapshotKeyOf(top.nodes, top.edges) ===
+        snapshotKeyOf(snap.nodes, snap.edges)
+    ) {
+      return;
+    }
+    pastSnapshots.push(snap);
+    if (pastSnapshots.length > MAX_HISTORY) {
+      pastSnapshots.splice(0, pastSnapshots.length - MAX_HISTORY);
+    }
+    futureSnapshots = [];
+    syncHistoryFlags();
+  };
+
+  /** 离散变更前调用：把当前状态压栈 */
+  const pushHistory = () => {
+    gestureBase = null;
+    const s = get();
+    pushSnapshot({ nodes: s.nodes, edges: s.edges });
+  };
+
+  /** 拖拽首次移动：把指针按下时的快照入栈，同一手势后续帧不再入栈 */
+  const commitGesture = () => {
+    if (!gestureBase) return;
+    const base = gestureBase;
+    gestureBase = null;
+    pushSnapshot(base);
+  };
+
+  const clearHistory = () => {
+    clearCanvasHistory();
+    syncHistoryFlags();
+  };
+
+  const restoreSnapshot = (snap: CanvasSnapshot) => {
+    const s = get();
+    const keepSelection =
+      s.selectedNodeId != null &&
+      snap.nodes.some((n) => n.id === s.selectedNodeId);
+    set({
+      nodes: snap.nodes,
+      edges: snap.edges,
+      ...(keepSelection ? {} : { selectedNodeId: null, layerPanelOpen: false }),
+    });
+    scheduleSave();
+    syncHistoryFlags();
+  };
 
   /** 首次加图层时物化基准层：锁定在最底层，指向节点基准图 */
   const withBaseLayer = (node: CanvasNode): CanvasLayer[] =>
@@ -458,6 +548,61 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
     dirty: false,
     saving: false,
     savedAt: null,
+    canUndo: false,
+    canRedo: false,
+
+    beginHistory: () => {
+      const s = get();
+      gestureBase = { nodes: s.nodes, edges: s.edges };
+    },
+
+    undo: () => {
+      gestureBase = null;
+      const s = get();
+      const currentKey = snapshotKeyOf(s.nodes, s.edges);
+      let target: CanvasSnapshot | null = null;
+      while (pastSnapshots.length > 0) {
+        const candidate = pastSnapshots.pop() as CanvasSnapshot;
+        if (snapshotKeyOf(candidate.nodes, candidate.edges) === currentKey) {
+          continue;
+        }
+        target = candidate;
+        break;
+      }
+      if (!target) {
+        syncHistoryFlags();
+        return;
+      }
+      futureSnapshots.push({ nodes: s.nodes, edges: s.edges });
+      if (futureSnapshots.length > MAX_HISTORY) {
+        futureSnapshots.splice(0, futureSnapshots.length - MAX_HISTORY);
+      }
+      restoreSnapshot(target);
+    },
+
+    redo: () => {
+      gestureBase = null;
+      const s = get();
+      const currentKey = snapshotKeyOf(s.nodes, s.edges);
+      let target: CanvasSnapshot | null = null;
+      while (futureSnapshots.length > 0) {
+        const candidate = futureSnapshots.pop() as CanvasSnapshot;
+        if (snapshotKeyOf(candidate.nodes, candidate.edges) === currentKey) {
+          continue;
+        }
+        target = candidate;
+        break;
+      }
+      if (!target) {
+        syncHistoryFlags();
+        return;
+      }
+      pastSnapshots.push({ nodes: s.nodes, edges: s.edges });
+      if (pastSnapshots.length > MAX_HISTORY) {
+        pastSnapshots.splice(0, pastSnapshots.length - MAX_HISTORY);
+      }
+      restoreSnapshot(target);
+    },
 
     ensureLoaded: async () => {
       if (get().loaded || get().loading) return;
@@ -510,6 +655,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
           selectedNodeId: null,
           layerPanelOpen: false,
         }));
+        clearHistory();
         return board.id;
       } catch (e) {
         toast(i18n.t("新建画布失败：{{error}}", { error: String(e) }), "error");
@@ -549,6 +695,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
           selectedNodeId: null,
           layerPanelOpen: false,
         });
+        clearHistory();
         void get().loadThumbs(collectThumbIds(data.nodes));
       } catch (e) {
         if (seq === boardSeq) {
@@ -592,6 +739,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
         layerPanelOpen: false,
       });
       savedKey = null;
+      clearHistory();
       const next = rest[0];
       if (next) await get().selectBoard(next.id);
     },
@@ -627,6 +775,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
         y,
         width: NODE_WIDTH,
       };
+      pushHistory();
       set((s) => ({ nodes: [...s.nodes, node] }));
       scheduleSave();
       void get().loadThumbs([historyId]);
@@ -634,17 +783,17 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
     },
 
     updateNode: (id, patch) => {
-      if (!get().nodes.some((n) => n.id === id)) return;
+      const node = get().nodes.find((n) => n.id === id);
+      if (!node) return;
+      const x =
+        patch.x !== undefined && Number.isFinite(patch.x) ? patch.x : node.x;
+      const y =
+        patch.y !== undefined && Number.isFinite(patch.y) ? patch.y : node.y;
+      if (x === node.x && y === node.y) return;
+      // 连续拖拽只在首次移动时入栈（beginHistory 已记下起点）
+      commitGesture();
       set((s) => ({
-        nodes: s.nodes.map((n) => {
-          if (n.id !== id) return n;
-          const x =
-            patch.x !== undefined && Number.isFinite(patch.x) ? patch.x : n.x;
-          const y =
-            patch.y !== undefined && Number.isFinite(patch.y) ? patch.y : n.y;
-          if (x === n.x && y === n.y) return n;
-          return { ...n, x, y };
-        }),
+        nodes: s.nodes.map((n) => (n.id === id ? { ...n, x, y } : n)),
       }));
       scheduleSave();
     },
@@ -652,6 +801,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
     removeNode: (id) => {
       const s = get();
       if (!s.nodes.some((n) => n.id === id)) return;
+      pushHistory();
       set({
         nodes: s.nodes.filter((n) => n.id !== id),
         edges: s.edges.filter((e) => e.from !== id && e.to !== id),
@@ -685,12 +835,14 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
         return;
       }
       if (edges.some((e) => e.from === from && e.to === to)) return;
+      pushHistory();
       set({ edges: [...edges, { id: newId("e"), from, to }] });
       scheduleSave();
     },
 
     removeEdge: (id) => {
       if (!get().edges.some((e) => e.id === id)) return;
+      pushHistory();
       set((s) => ({ edges: s.edges.filter((e) => e.id !== id) }));
       scheduleSave();
     },
@@ -720,6 +872,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
       }
       const id = newId("l");
       const next = [...layers, { ...layer, id }];
+      pushHistory();
       set({
         nodes: s.nodes.map((n) =>
           n.id === nodeId ? { ...n, layers: next } : n,
@@ -754,6 +907,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
         return next;
       });
       if (!changed) return;
+      pushHistory();
       set({
         nodes: s.nodes.map((n) => (n.id === nodeId ? { ...n, layers } : n)),
       });
@@ -767,6 +921,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
       const target = node.layers.find((l) => l.id === layerId);
       if (!target || target.locked) return;
       const layers = node.layers.filter((l) => l.id !== layerId);
+      pushHistory();
       set({
         nodes: s.nodes.map((n) => (n.id === nodeId ? { ...n, layers } : n)),
       });
@@ -783,6 +938,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
       if (node.layers[index].locked || node.layers[target].locked) return;
       const layers = [...node.layers];
       [layers[index], layers[target]] = [layers[target], layers[index]];
+      pushHistory();
       set({
         nodes: s.nodes.map((n) => (n.id === nodeId ? { ...n, layers } : n)),
       });
@@ -795,6 +951,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
       const limited = layers.slice(0, MAX_LAYERS_PER_NODE);
       const base =
         historyId !== undefined && historyId > 0 ? historyId : undefined;
+      pushHistory();
       set({
         nodes: s.nodes.map((n) => {
           if (n.id !== nodeId) return n;
@@ -842,6 +999,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
           ),
         },
       ];
+      pushHistory();
       set({
         nodes: s.nodes.map((n) =>
           n.id === nodeId ? { ...n, regions: next } : n,
@@ -869,6 +1027,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
         }
         return next;
       });
+      pushHistory();
       set({
         nodes: s.nodes.map((n) => (n.id === nodeId ? { ...n, regions } : n)),
       });
@@ -880,6 +1039,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
       const node = s.nodes.find((n) => n.id === nodeId);
       if (!node?.regions) return;
       const regions = node.regions.filter((r) => r.id !== regionId);
+      pushHistory();
       set({
         nodes: s.nodes.map((n) => {
           if (n.id !== nodeId) return n;
@@ -899,6 +1059,7 @@ export const useCanvasStore = create<CanvasState>((set, get) => {
       const regions = node.regions.map((r) =>
         r.id === regionId ? { ...r, appliedHistoryId, appliedLayerId } : r,
       );
+      pushHistory();
       set({
         nodes: s.nodes.map((n) => (n.id === nodeId ? { ...n, regions } : n)),
       });

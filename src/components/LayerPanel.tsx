@@ -27,7 +27,7 @@ import {
 } from "./Icons";
 import { cn } from "./ui/cn";
 
-/// 画布图层浮层：296px 玻璃面板，挂在选中节点旁。
+/// 画布图层浮层：296px 纸卡面板，挂在选中节点旁。
 /// 行高 44px、缩略图 40px；显隐/锁定/不透明度/换序/删除，底部合并与导出。
 export default function LayerPanel({
   node,
@@ -198,7 +198,7 @@ export default function LayerPanel({
       role="dialog"
       aria-label={t("图层")}
       onPointerDown={(e) => e.stopPropagation()}
-      className="glass absolute right-4 top-4 z-20 flex max-h-[calc(100%-2rem)] w-[296px] flex-col overflow-hidden rounded-panel shadow-pop"
+      className="absolute right-4 top-4 z-20 flex max-h-[calc(100%-2rem)] w-[296px] flex-col overflow-hidden rounded-panel border border-line bg-elevated shadow-pop"
     >
       <header className="flex h-11 shrink-0 items-center gap-2 border-b border-separator px-3">
         <IconLayers size={15} className="text-tertiary" />

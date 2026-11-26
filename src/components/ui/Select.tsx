@@ -77,7 +77,7 @@ export function Select({
         <SelectPrimitive.Content
           position="popper"
           sideOffset={6}
-          className="anim-pop z-50 max-h-72 overflow-hidden rounded-pop glass shadow-pop"
+          className="anim-pop z-50 max-h-72 overflow-hidden rounded-pop border border-line bg-elevated shadow-pop"
         >
           <SelectPrimitive.Viewport className="max-h-72 overflow-y-auto p-1.5">
             {options.map((opt) => (

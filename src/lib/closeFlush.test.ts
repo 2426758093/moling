@@ -69,6 +69,62 @@ describe("installCloseFlush（F-010）", () => {
     off();
   });
 
+  it("confirm 返回 false 时不 destroy，并复位后可再次关闭", async () => {
+    const order: string[] = [];
+    vi.mocked(destroy).mockImplementation(async () => {
+      order.push("destroy");
+    });
+    const confirm = vi
+      .fn()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    const off = await installCloseFlush({
+      confirm,
+      flush: async () => {
+        order.push("flush");
+      },
+    });
+
+    await triggerCloseRequest();
+    expect(destroy).not.toHaveBeenCalled();
+    expect(order).toEqual([]);
+
+    // closing 已复位：再次点关闭会重新询问并继续落盘
+    await triggerCloseRequest();
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(order).toEqual(["flush", "destroy"]);
+    off();
+  });
+
+  it("confirm 返回 true 时先 flush 再 destroy", async () => {
+    const order: string[] = [];
+    vi.mocked(destroy).mockImplementation(async () => {
+      order.push("destroy");
+    });
+    const off = await installCloseFlush({
+      confirm: async () => true,
+      flush: async () => {
+        order.push("flush");
+      },
+    });
+
+    await triggerCloseRequest();
+    expect(order).toEqual(["flush", "destroy"]);
+    off();
+  });
+
+  it("确认期间 flush 超时仍会关闭", async () => {
+    const off = await installCloseFlush({
+      confirm: async () => true,
+      flush: () => new Promise<void>(() => undefined),
+      timeoutMs: 10,
+    });
+
+    await triggerCloseRequest();
+    expect(destroy).toHaveBeenCalledTimes(1);
+    off();
+  });
+
   it("卸载后不再接管关闭请求", async () => {
     const off = await installCloseFlush({});
     off();

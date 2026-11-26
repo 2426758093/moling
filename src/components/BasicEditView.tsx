@@ -1,17 +1,23 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { motion, useReducedMotion } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import { BasicEditTarget, useAppStore } from "../stores/appStore";
 import { api } from "../lib/api";
 import { deliverEditResult } from "../lib/deliverEditResult";
 import { toast } from "../lib/notify";
-import { DUR, EASE } from "../lib/motion";
 import { ensureRasterDataUrl } from "../lib/file";
 import { Button } from "./ui/Button";
 import { IconButton } from "./ui/IconButton";
 import { Slider } from "./ui/Slider";
 import { ToolbarGroup, ToolbarSeparator } from "./ui/Toolbar";
-import { IconClose, IconCrop, IconFlip, IconRotate } from "./Icons";
+import { IconCrop, IconFlip, IconRotate } from "./Icons";
+import EditorShell from "./editors/EditorShell";
+import {
+  buildBasicEditOps,
+  normalizeFreeDeg,
+  rotationBoundingBox,
+  FREE_DEG_EPSILON,
+  type QuarterTurns,
+} from "../lib/basicEditRotation";
 
 /** 裁剪框（变换后坐标：旋转 / 翻转之后的画布） */
 interface Crop {
@@ -71,7 +77,8 @@ function BasicEditBody({
   const { t } = useTranslation();
   const [image, setImage] = useState<HTMLImageElement | null>(null);
   const [scale, setScale] = useState(1);
-  const [deg, setDeg] = useState<0 | 90 | 180 | 270>(0);
+  const [quarterTurns, setQuarterTurns] = useState<QuarterTurns>(0);
+  const [freeDeg, setFreeDeg] = useState(0);
   const [flipH, setFlipH] = useState(false);
   const [flipV, setFlipV] = useState(false);
   const [crop, setCrop] = useState<Crop | null>(null);
@@ -79,9 +86,9 @@ function BasicEditBody({
   const [contrast, setContrast] = useState(0);
   const [saturation, setSaturation] = useState(0);
   const [busy, setBusy] = useState(false);
+  const [straightening, setStraightening] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const canvasInline = useAppStore((s) => s.canvasInline);
-  const reduce = useReducedMotion();
   const inline = canvasInline && target.host === "canvas";
 
   useEffect(() => {
@@ -90,29 +97,30 @@ function BasicEditBody({
     img.src = target.dataUrl;
   }, [target.dataUrl]);
 
-  // 旋转后画布尺寸（90/270 长宽互换）
+  // 总角度 = 直角档 × 90 + 自由角；预览与提交都按总角度计算
+  const rotation = quarterTurns * 90 + freeDeg;
   const natW = image?.naturalWidth ?? 0;
   const natH = image?.naturalHeight ?? 0;
-  const canvasW = deg % 180 === 0 ? natW : natH;
-  const canvasH = deg % 180 === 0 ? natH : natW;
+  const { w: canvasW, h: canvasH } = image
+    ? rotationBoundingBox(natW, natH, rotation)
+    : { w: 0, h: 0 };
+  // 与后端 rotate_free 的恒等阈值一致：极小角（仅自动拉直可能产生）不算自由旋转
+  const free = Math.abs(freeDeg) >= FREE_DEG_EPSILON;
+  // 自由旋转会留透明边，裁剪坐标失去意义，禁用框选与手柄
+  const cropLocked = free;
 
-  // 进入 / 换图 / 转向时重新贴合容器，并把裁剪框重置为全图
+  // 进入 / 换图 / 旋转时重新贴合容器，并把裁剪框重置为全图
   useEffect(() => {
     if (!image || !containerRef.current) return;
     const box = containerRef.current.getBoundingClientRect();
-    const w = deg % 180 === 0 ? image.naturalWidth : image.naturalHeight;
-    const h = deg % 180 === 0 ? image.naturalHeight : image.naturalWidth;
+    const { w, h } = rotationBoundingBox(
+      image.naturalWidth,
+      image.naturalHeight,
+      rotation,
+    );
     setScale(Math.min((box.width - 48) / w, (box.height - 48) / h, 1));
     setCrop({ x: 0, y: 0, w, h });
-  }, [image, deg]);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [close]);
+  }, [image, rotation]);
 
   const displayW = Math.round(canvasW * scale);
   const displayH = Math.round(canvasH * scale);
@@ -122,7 +130,8 @@ function BasicEditBody({
   const outH = Math.round(shown.h);
   const changed = useMemo(
     () =>
-      deg !== 0 ||
+      quarterTurns !== 0 ||
+      free ||
       flipH ||
       flipV ||
       brightness !== 0 ||
@@ -131,7 +140,8 @@ function BasicEditBody({
       outW !== canvasW ||
       outH !== canvasH,
     [
-      deg,
+      quarterTurns,
+      free,
       flipH,
       flipV,
       brightness,
@@ -153,7 +163,7 @@ function BasicEditBody({
   };
 
   const onStageDown = (e: React.PointerEvent) => {
-    if (e.button !== 0 || busy) return;
+    if (e.button !== 0 || busy || cropLocked) return;
     const p = pointOf(e);
     e.currentTarget.setPointerCapture(e.pointerId);
     dragRef.current = {
@@ -203,7 +213,7 @@ function BasicEditBody({
   };
 
   const startResize = (corner: Corner) => (e: React.PointerEvent) => {
-    if (e.button !== 0 || busy) return;
+    if (e.button !== 0 || busy || cropLocked) return;
     e.stopPropagation();
     e.currentTarget.setPointerCapture(e.pointerId);
     dragRef.current = { mode: "resize", corner, base: shown };
@@ -211,30 +221,42 @@ function BasicEditBody({
 
   const resetCrop = () => setCrop({ x: 0, y: 0, w: canvasW, h: canvasH });
 
+  /// 自动拉直：后端返回的就是「可抵消的倾斜角」（正值 = 顺时针），
+  /// 直接作为自由角即可拉正；失败只提示，不影响手动旋转。
+  const autoStraighten = async () => {
+    if (!image || busy || straightening) return;
+    setStraightening(true);
+    try {
+      const angle = normalizeFreeDeg(
+        await api.estimateSkew(await ensureRasterDataUrl(target.dataUrl)),
+      );
+      setFreeDeg(angle);
+      if (Math.abs(angle) < 0.1) toast(t("画面已经很正"));
+    } catch (e) {
+      toast(t("自动拉直失败：{{error}}", { error: String(e) }), "error");
+    } finally {
+      setStraightening(false);
+    }
+  };
+
   const submit = async () => {
     if (!image || busy) return;
     if (!changed) {
       toast(t("还没有任何改动"), "error");
       return;
     }
-    const ops: Parameters<typeof api.applyEdit>[0]["ops"] = [];
-    if (deg !== 0) ops.push({ type: "rotate", deg });
-    if (flipH) ops.push({ type: "flip", axis: "horizontal" });
-    if (flipV) ops.push({ type: "flip", axis: "vertical" });
-    if (shown.x > 0 || shown.y > 0 || outW < canvasW || outH < canvasH) {
-      const x = clamp(Math.round(shown.x), 0, Math.max(0, canvasW - 1));
-      const y = clamp(Math.round(shown.y), 0, Math.max(0, canvasH - 1));
-      ops.push({
-        type: "crop",
-        x,
-        y,
-        width: clamp(outW, 1, canvasW - x),
-        height: clamp(outH, 1, canvasH - y),
-      });
-    }
-    if (brightness !== 0 || contrast !== 0 || saturation !== 0) {
-      ops.push({ type: "adjust", brightness, contrast, saturation });
-    }
+    const ops = buildBasicEditOps({
+      quarterTurns,
+      freeDeg,
+      flipH,
+      flipV,
+      canvasW,
+      canvasH,
+      crop: cropLocked ? null : shown,
+      brightness,
+      contrast,
+      saturation,
+    });
     setBusy(true);
     setError(null);
     try {
@@ -257,45 +279,23 @@ function BasicEditBody({
   }) saturate(${1 + saturation / 100})`;
 
   return (
-    <motion.div
-      initial={reduce ? false : { opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      transition={{ duration: reduce ? 0 : DUR.base, ease: EASE.ios }}
-      className={
-        inline
-          ? "flex h-full min-h-0 w-full flex-col bg-base"
-          : "fixed inset-x-0 bottom-0 top-12 z-30 flex flex-col bg-base"
+    <EditorShell
+      inline={inline}
+      onClose={close}
+      title={t("基础编辑")}
+      subtitle={t("裁剪、旋转、翻转与调色全在本地完成，不消耗接口额度")}
+      headerExtra={
+        <Button
+          variant="primary"
+          size="sm"
+          loading={busy}
+          disabled={!image || !changed}
+          onClick={() => void submit()}
+        >
+          {t("应用编辑")}
+        </Button>
       }
-    >
-      <header className="relative z-10 shrink-0 glass">
-        <div className="flex min-h-12 items-center gap-3 px-6 py-2">
-          <div className="flex min-w-0 flex-col">
-            <h1 className="truncate text-title3 text-primary">
-              {t("基础编辑")}
-            </h1>
-            <p className="truncate text-footnote text-tertiary">
-              {t("裁剪、旋转、翻转与调色全在本地完成，不消耗接口额度")}
-            </p>
-          </div>
-          <div className="ml-auto flex shrink-0 items-center gap-2">
-            <Button
-              variant="primary"
-              size="sm"
-              loading={busy}
-              disabled={!image || !changed}
-              onClick={() => void submit()}
-            >
-              {t("应用编辑")}
-            </Button>
-            <IconButton
-              label={t("关闭编辑器")}
-              icon={<IconClose size={16} />}
-              onClick={close}
-            />
-          </div>
-        </div>
-
+      toolbar={
         <div
           role="toolbar"
           aria-label={t("基础编辑工具")}
@@ -305,12 +305,16 @@ function BasicEditBody({
             <IconButton
               label={t("左转 90°")}
               icon={<IconRotate size={16} className="-scale-x-100" />}
-              onClick={() => setDeg((d) => ((d + 270) % 360) as typeof d)}
+              onClick={() =>
+                setQuarterTurns((q) => ((q + 3) % 4) as QuarterTurns)
+              }
             />
             <IconButton
               label={t("右转 90°")}
               icon={<IconRotate size={16} />}
-              onClick={() => setDeg((d) => ((d + 90) % 360) as typeof d)}
+              onClick={() =>
+                setQuarterTurns((q) => ((q + 1) % 4) as QuarterTurns)
+              }
             />
             <IconButton
               label={flipH ? t("取消水平翻转") : t("水平翻转")}
@@ -330,11 +334,47 @@ function BasicEditBody({
 
           <ToolbarSeparator />
 
+          <div className="flex items-center gap-2">
+            <span className="px-1 text-footnote text-tertiary">
+              {t("任意角度")}
+            </span>
+            <div className="w-28">
+              <Slider
+                value={freeDeg}
+                onValueChange={(v) => setFreeDeg(normalizeFreeDeg(v))}
+                min={-180}
+                max={180}
+                step={1}
+                disabled={busy}
+                label={t("旋转角度")}
+              />
+            </div>
+            <span className="w-9 text-right text-footnote tabular-nums text-tertiary">
+              {Math.round(freeDeg)}°
+            </span>
+            <Button
+              size="sm"
+              variant="ghost"
+              loading={straightening}
+              disabled={!image || busy}
+              onClick={() => void autoStraighten()}
+            >
+              {t("自动拉直")}
+            </Button>
+          </div>
+
+          <ToolbarSeparator />
+
           <ToolbarGroup>
             <span className="px-1 text-tertiary">
               <IconCrop size={16} />
             </span>
-            <Button size="sm" variant="ghost" onClick={resetCrop}>
+            <Button
+              size="sm"
+              variant="ghost"
+              disabled={cropLocked}
+              onClick={resetCrop}
+            >
               {t("全图")}
             </Button>
           </ToolbarGroup>
@@ -376,11 +416,34 @@ function BasicEditBody({
             {t("重置色彩")}
           </Button>
         </div>
-      </header>
+      }
+      footer={
+        <>
+          <footer className="flex shrink-0 items-center gap-3 border-t border-line px-6 py-2">
+            <span className="text-footnote tabular-nums text-tertiary">
+              {t("输出 {{w}} × {{h}}", { w: outW, h: outH })}
+            </span>
+            <span className="text-footnote text-tertiary">
+              {cropLocked
+                ? t("自由旋转时不可裁剪")
+                : t("在图上拖拽框选裁剪区域，拖动角点可微调")}
+            </span>
+          </footer>
 
+          {error && (
+            <div
+              role="alert"
+              className="shrink-0 border-t border-danger/25 bg-danger/10 px-6 py-2 text-footnote text-danger"
+            >
+              {error}
+            </div>
+          )}
+        </>
+      }
+    >
       <div
         ref={containerRef}
-        className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden p-6"
+        className="relative flex h-full w-full items-center justify-center overflow-hidden p-6"
       >
         {image ? (
           <div
@@ -389,7 +452,7 @@ function BasicEditBody({
             style={{
               width: displayW,
               height: displayH,
-              cursor: "crosshair",
+              cursor: cropLocked ? "default" : "crosshair",
             }}
             onPointerDown={onStageDown}
             onPointerMove={onStageMove}
@@ -406,66 +469,54 @@ function BasicEditBody({
                 height: natH * scale,
                 transform: `translate(-50%, -50%) scaleX(${
                   flipH ? -1 : 1
-                }) scaleY(${flipV ? -1 : 1}) rotate(${deg}deg)`,
+                }) scaleY(${flipV ? -1 : 1}) rotate(${rotation}deg)`,
                 filter,
               }}
             />
-            <div
-              className="pointer-events-none absolute border border-on-accent"
-              style={{
-                left: shown.x * scale,
-                top: shown.y * scale,
-                width: Math.max(1, shown.w * scale),
-                height: Math.max(1, shown.h * scale),
-                boxShadow: "0 0 0 9999px rgba(0, 0, 0, 0.45)",
-              }}
-            />
-            {CORNERS.map((c) => {
-              const left =
-                (c === "nw" || c === "sw" ? shown.x : shown.x + shown.w) *
-                scale;
-              const top =
-                (c === "nw" || c === "ne" ? shown.y : shown.y + shown.h) *
-                scale;
-              return (
-                <span
-                  key={c}
-                  role="presentation"
-                  onPointerDown={startResize(c)}
-                  className="absolute z-10 block h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-chip border border-on-accent bg-elevated"
+            {!cropLocked && (
+              <>
+                <div
+                  className="pointer-events-none absolute border border-on-accent"
                   style={{
-                    left,
-                    top,
-                    cursor:
-                      c === "nw" || c === "se" ? "nwse-resize" : "nesw-resize",
-                    touchAction: "none",
+                    left: shown.x * scale,
+                    top: shown.y * scale,
+                    width: Math.max(1, shown.w * scale),
+                    height: Math.max(1, shown.h * scale),
+                    boxShadow: "0 0 0 9999px rgba(0, 0, 0, 0.45)",
                   }}
                 />
-              );
-            })}
+                {CORNERS.map((c) => {
+                  const left =
+                    (c === "nw" || c === "sw" ? shown.x : shown.x + shown.w) *
+                    scale;
+                  const top =
+                    (c === "nw" || c === "ne" ? shown.y : shown.y + shown.h) *
+                    scale;
+                  return (
+                    <span
+                      key={c}
+                      role="presentation"
+                      onPointerDown={startResize(c)}
+                      className="absolute z-10 block h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-chip border border-on-accent bg-elevated"
+                      style={{
+                        left,
+                        top,
+                        cursor:
+                          c === "nw" || c === "se"
+                            ? "nwse-resize"
+                            : "nesw-resize",
+                        touchAction: "none",
+                      }}
+                    />
+                  );
+                })}
+              </>
+            )}
           </div>
         ) : (
           <span className="text-body text-tertiary">{t("加载中…")}</span>
         )}
       </div>
-
-      <footer className="flex shrink-0 items-center gap-3 border-t border-line px-6 py-2">
-        <span className="text-footnote tabular-nums text-tertiary">
-          {t("输出 {{w}} × {{h}}", { w: outW, h: outH })}
-        </span>
-        <span className="text-footnote text-tertiary">
-          {t("在图上拖拽框选裁剪区域，拖动角点可微调")}
-        </span>
-      </footer>
-
-      {error && (
-        <div
-          role="alert"
-          className="shrink-0 border-t border-danger/25 bg-danger/10 px-6 py-2 text-footnote text-danger"
-        >
-          {error}
-        </div>
-      )}
-    </motion.div>
+    </EditorShell>
   );
 }

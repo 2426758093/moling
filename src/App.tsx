@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import i18n from "./i18n";
 import {
@@ -8,13 +8,14 @@ import {
   useReducedMotion,
 } from "framer-motion";
 import Sidebar from "./components/Sidebar";
+import NavRail from "./components/shell/NavRail";
+import Inspector from "./components/Inspector";
 import ChatView from "./components/ChatView";
 import GalleryView from "./components/GalleryView";
 import CanvasView from "./components/CanvasView";
 import RetouchView from "./components/retouch/RetouchView";
 import QueueView from "./components/QueueView";
 import SettingsView from "./components/SettingsView";
-import SettingsRail from "./components/SettingsRail";
 import EditorView from "./components/EditorView";
 import OutpaintView from "./components/OutpaintView";
 import TransformDialog from "./components/TransformDialog";
@@ -23,6 +24,7 @@ import BackgroundView from "./components/BackgroundView";
 import AnimationView from "./components/AnimationView";
 import { TooltipProvider } from "./components/ui/Tooltip";
 import { CommandPalette } from "./components/ui/CommandPalette";
+import { ConfirmDialog } from "./components/ui/Dialog";
 import TitleBar from "./components/shell/TitleBar";
 import ResizeHandles from "./components/shell/ResizeHandles";
 import ShortcutsSheet from "./components/shell/ShortcutsSheet";
@@ -76,6 +78,21 @@ function AppShell() {
   const { isMaximized, platform } = useWindowState();
   const [dragging, setDragging] = useState(false);
   const dragDepth = useRef(0);
+  const [closeConfirmOpen, setCloseConfirmOpen] = useState(false);
+  const closeConfirmResolve = useRef<((close: boolean) => void) | null>(null);
+
+  // 关闭确认：只有停留在画布视图且画布有未保存改动时才询问，其它情况静默落盘。
+  // 确认按钮沿用 ConfirmDialog 的既有顺序（先 onOpenChange(false) 再 onConfirm），
+  // 因此取消侧延到微任务落定，让 onConfirm 先决定结果。
+  const confirmClose = useCallback((): Promise<boolean> => {
+    const inCanvas = useAppStore.getState().view === "canvas";
+    const dirty = useCanvasStore.getState().dirty;
+    if (!inCanvas || !dirty) return Promise.resolve(true);
+    return new Promise<boolean>((resolve) => {
+      closeConfirmResolve.current = resolve;
+      setCloseConfirmOpen(true);
+    });
+  }, []);
 
   // 减少动态：位移与淡入都必须停 —— framer-motion 的 reducedMotion="user" 只关
   // 位移不关透明度，所以这里显式分支，实际效果才和"减少动态"的承诺一致。
@@ -95,6 +112,7 @@ function AppShell() {
     let cancelled = false;
     void installCloseFlush({
       flush: () => useCanvasStore.getState().flush(),
+      confirm: confirmClose,
     })
       .then((off) => {
         if (cancelled) off();
@@ -105,7 +123,7 @@ function AppShell() {
       cancelled = true;
       unlisten?.();
     };
-  }, []);
+  }, [confirmClose]);
 
   useEffect(() => {
     useProviderStore
@@ -165,6 +183,15 @@ function AppShell() {
   // 离开画布时关闭这些目标，避免返回其他视图时突然弹出全屏编辑器。
   const overlayVisible = (target: { host?: "canvas" } | null) =>
     !!target && !(canvasInline && target.host === "canvas");
+  // 编辑器占用内容面时，收起会话面板与检查器，把整张纸让给舞台
+  const editing =
+    overlayVisible(editTarget) ||
+    overlayVisible(outpaintTarget) ||
+    overlayVisible(basicEditTarget) ||
+    overlayVisible(backgroundTarget) ||
+    overlayVisible(animationTarget);
+  const showSidebar = view === "chat" && !editing;
+  const showInspector = view === "chat" && !editing;
   useEffect(() => {
     if (view === "canvas") return;
     const app = useAppStore.getState();
@@ -232,7 +259,8 @@ function AppShell() {
       <TitleBar isMaximized={isMaximized} platform={platform} />
 
       <div className="relative z-10 flex min-h-0 flex-1 pt-12">
-        <Sidebar />
+        <NavRail />
+        {showSidebar && <Sidebar />}
         <main className="flex min-w-0 flex-1 flex-col p-2">
           <div className="content-sheet relative flex min-h-0 flex-1 flex-col">
             {/* 新旧视图叠放交叉淡入：wait 模式会先退场再入场，切页中间有 300ms 空屏 */}
@@ -261,9 +289,26 @@ function AppShell() {
                 ) : null}
               </motion.div>
             </AnimatePresence>
+
+            {/* 编辑器作为工作区模式：留在纸面里，导航轨仍然可见，不再整屏盖住应用 */}
+            <AnimatePresence>
+              {overlayVisible(editTarget) && <EditorView />}
+            </AnimatePresence>
+            <AnimatePresence>
+              {overlayVisible(outpaintTarget) && <OutpaintView />}
+            </AnimatePresence>
+            <AnimatePresence>
+              {overlayVisible(basicEditTarget) && <BasicEditView />}
+            </AnimatePresence>
+            <AnimatePresence>
+              {overlayVisible(backgroundTarget) && <BackgroundView />}
+            </AnimatePresence>
+            <AnimatePresence>
+              {overlayVisible(animationTarget) && <AnimationView />}
+            </AnimatePresence>
           </div>
         </main>
-        {view === "chat" && <SettingsRail />}
+        {showInspector && <Inspector />}
       </div>
 
       <ResizeHandles isMaximized={isMaximized} />
@@ -271,21 +316,28 @@ function AppShell() {
       <CommandPalette />
       <ShortcutsSheet />
       <UpdateDialog />
-      <AnimatePresence>
-        {overlayVisible(editTarget) && <EditorView />}
-      </AnimatePresence>
-      <AnimatePresence>
-        {overlayVisible(outpaintTarget) && <OutpaintView />}
-      </AnimatePresence>
-      <AnimatePresence>
-        {overlayVisible(basicEditTarget) && <BasicEditView />}
-      </AnimatePresence>
-      <AnimatePresence>
-        {overlayVisible(backgroundTarget) && <BackgroundView />}
-      </AnimatePresence>
-      <AnimatePresence>
-        {overlayVisible(animationTarget) && <AnimationView />}
-      </AnimatePresence>
+      <ConfirmDialog
+        open={closeConfirmOpen}
+        onOpenChange={(open) => {
+          if (open) return;
+          setCloseConfirmOpen(false);
+          // 取消/点遮罩/Esc：让同一次点击里可能触发的 onConfirm 先落定
+          queueMicrotask(() => {
+            const resolve = closeConfirmResolve.current;
+            closeConfirmResolve.current = null;
+            resolve?.(false);
+          });
+        }}
+        title={t("画布有未保存的改动")}
+        cancelLabel={t("取消")}
+        confirmLabel={t("关闭并保存")}
+        onConfirm={() => {
+          const resolve = closeConfirmResolve.current;
+          closeConfirmResolve.current = null;
+          setCloseConfirmOpen(false);
+          resolve?.(true);
+        }}
+      />
       <TransformDialog />
     </div>
   );

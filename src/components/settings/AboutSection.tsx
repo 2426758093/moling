@@ -33,6 +33,11 @@ export default function AboutSection() {
           {currentVersion || "—"}
         </span>
       </Row>
+      <Row label={t("字体")}>
+        <span className="text-subhead text-tertiary">
+          思源宋体 · 霞鹜文楷 · OFL
+        </span>
+      </Row>
       <Row label={t("检查更新")} hint={hint}>
         <Button
           size="sm"

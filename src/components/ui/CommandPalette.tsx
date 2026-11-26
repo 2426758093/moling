@@ -175,7 +175,7 @@ function PaletteContent({ onClose }: { onClose: () => void }) {
       <DialogPrimitive.Portal>
         <DialogPrimitive.Overlay className="fixed inset-0 z-[59] bg-scrim" />
         <DialogPrimitive.Content
-          className="glass fixed left-1/2 top-[15vh] z-[60] flex w-[min(640px,calc(100vw-32px))] -translate-x-1/2 flex-col overflow-hidden rounded-pop shadow-sheet outline-none"
+          className="fixed left-1/2 top-[15vh] z-[60] flex w-[min(640px,calc(100vw-32px))] -translate-x-1/2 flex-col overflow-hidden rounded-pop border border-line bg-elevated shadow-sheet outline-none"
           onOpenAutoFocus={(e) => {
             e.preventDefault();
           }}

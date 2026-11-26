@@ -31,7 +31,7 @@ export function Popover({
           sideOffset={8}
           collisionPadding={12}
           className={cn(
-            "anim-pop z-[55] rounded-pop glass p-3 shadow-pop",
+            "anim-pop z-[55] rounded-pop border border-line bg-elevated p-3 shadow-pop",
             className,
           )}
         >

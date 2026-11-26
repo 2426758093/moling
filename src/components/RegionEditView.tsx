@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { motion, useReducedMotion } from "framer-motion";
 import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
 import { useAppStore } from "../stores/appStore";
@@ -18,7 +17,6 @@ import {
   RegionProgressEvent,
 } from "../lib/api";
 import { toast } from "../lib/notify";
-import { DUR, EASE } from "../lib/motion";
 import { Button } from "./ui/Button";
 import { IconButton } from "./ui/IconButton";
 import { Input } from "./ui/Field";
@@ -26,7 +24,8 @@ import { Slider } from "./ui/Slider";
 import { Badge } from "./ui/Badge";
 import { ConfirmDialog } from "./ui/Dialog";
 import { ToolbarGroup, ToolbarSeparator } from "./ui/Toolbar";
-import { IconBrush, IconClose, IconEraser, IconPlus, IconTrash } from "./Icons";
+import { IconBrush, IconEraser, IconPlus, IconTrash } from "./Icons";
+import EditorShell from "./editors/EditorShell";
 import SafeImg from "./SafeImg";
 import MaskCanvas, { MaskCanvasHandle } from "./MaskCanvas";
 
@@ -79,7 +78,6 @@ export default function RegionEditView() {
   const [status, setStatus] = useState<Record<string, RegionStatus>>({});
   const [error, setError] = useState<string | null>(null);
   const [confirmOpen, setConfirmOpen] = useState(false);
-  const reduce = useReducedMotion();
 
   const regions = useMemo(() => node?.regions ?? [], [node]);
   const maskPaths = useMemo(() => regions.map((r) => r.maskPath), [regions]);
@@ -159,14 +157,6 @@ export default function RegionEditView() {
       cancelled = true;
     };
   }, [maskPaths]);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") closeRegionEdit();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [closeRegionEdit]);
 
   if (!target) return null;
 
@@ -416,54 +406,34 @@ export default function RegionEditView() {
   };
 
   return (
-    <motion.div
-      initial={reduce ? false : { opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      transition={{ duration: reduce ? 0 : DUR.base, ease: EASE.ios }}
-      className={
-        inline
-          ? "flex h-full min-h-0 w-full flex-col bg-base"
-          : "fixed inset-x-0 bottom-0 top-12 z-30 flex flex-col bg-base"
-      }
-    >
-      <header className="relative z-10 shrink-0 glass">
-        <div className="flex min-h-12 items-center gap-3 px-6 py-2">
-          <div className="flex min-w-0 flex-col">
-            <h1 className="truncate text-title3 text-primary">
-              {t("分区重绘")}
-            </h1>
-            <p className="truncate text-footnote text-tertiary">
-              {t("涂抹多个区域，逐区重绘后本地羽化合成")}
-            </p>
-          </div>
-          <div className="ml-auto flex shrink-0 items-center gap-2">
-            {busy ? (
-              <Button variant="ghost" size="sm" onClick={cancel}>
-                {t("取消分区重绘")}
-              </Button>
-            ) : null}
-            <Button
-              variant="primary"
-              size="sm"
-              loading={busy}
-              disabled={tooMany || batch.length === 0}
-              onClick={() => setConfirmOpen(true)}
-            >
-              {tooMany
-                ? t("一批最多 {{max}} 个区域", { max: MAX_BATCH })
-                : batch.length > 0
-                  ? t("提交 {{count}} 个区域", { count: batch.length })
-                  : t("没有待重绘的区域")}
+    <EditorShell
+      inline={inline}
+      onClose={closeRegionEdit}
+      title={t("分区重绘")}
+      subtitle={t("涂抹多个区域，逐区重绘后本地羽化合成")}
+      headerExtra={
+        <>
+          {busy ? (
+            <Button variant="ghost" size="sm" onClick={cancel}>
+              {t("取消分区重绘")}
             </Button>
-            <IconButton
-              label={t("关闭分区重绘")}
-              icon={<IconClose size={16} />}
-              onClick={closeRegionEdit}
-            />
-          </div>
-        </div>
-
+          ) : null}
+          <Button
+            variant="primary"
+            size="sm"
+            loading={busy}
+            disabled={tooMany || batch.length === 0}
+            onClick={() => setConfirmOpen(true)}
+          >
+            {tooMany
+              ? t("一批最多 {{max}} 个区域", { max: MAX_BATCH })
+              : batch.length > 0
+                ? t("提交 {{count}} 个区域", { count: batch.length })
+                : t("没有待重绘的区域")}
+          </Button>
+        </>
+      }
+      toolbar={
         <div
           role="toolbar"
           aria-label={t("蒙版工具")}
@@ -540,9 +510,19 @@ export default function RegionEditView() {
             </span>
           )}
         </div>
-      </header>
-
-      <div className="flex min-h-0 flex-1">
+      }
+      footer={
+        error && (
+          <div
+            role="alert"
+            className="shrink-0 border-t border-danger/25 bg-danger/10 px-6 py-2 text-footnote text-danger"
+          >
+            {error}
+          </div>
+        )
+      }
+    >
+      <div className="flex h-full min-h-0 w-full">
         <div
           ref={containerRef}
           className="relative flex min-h-0 min-w-0 flex-1 items-center justify-center overflow-hidden p-4"
@@ -714,15 +694,6 @@ export default function RegionEditView() {
         </aside>
       </div>
 
-      {error && (
-        <div
-          role="alert"
-          className="shrink-0 border-t border-danger/25 bg-danger/10 px-6 py-2 text-footnote text-danger"
-        >
-          {error}
-        </div>
-      )}
-
       <ConfirmDialog
         open={confirmOpen}
         onOpenChange={setConfirmOpen}
@@ -738,6 +709,6 @@ export default function RegionEditView() {
           void submit();
         }}
       />
-    </motion.div>
+    </EditorShell>
   );
 }

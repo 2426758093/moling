@@ -5,12 +5,13 @@ import { useAppStore } from "./stores/appStore";
 
 // 视图与外壳组件会各自拉起数据依赖：这里只验证「离开画布时关掉挂在画布上的编辑目标」
 vi.mock("./components/Sidebar", () => ({ default: () => null }));
+vi.mock("./components/shell/NavRail", () => ({ default: () => null }));
+vi.mock("./components/Inspector", () => ({ default: () => null }));
 vi.mock("./components/ChatView", () => ({ default: () => null }));
 vi.mock("./components/GalleryView", () => ({ default: () => null }));
 vi.mock("./components/CanvasView", () => ({ default: () => null }));
 vi.mock("./components/QueueView", () => ({ default: () => null }));
 vi.mock("./components/SettingsView", () => ({ default: () => null }));
-vi.mock("./components/SettingsRail", () => ({ default: () => null }));
 vi.mock("./components/EditorView", () => ({ default: () => null }));
 vi.mock("./components/OutpaintView", () => ({ default: () => null }));
 vi.mock("./components/TransformDialog", () => ({ default: () => null }));

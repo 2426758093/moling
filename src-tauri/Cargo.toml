@@ -1,8 +1,9 @@
 [package]
 name = "moling"
-version = "2.1.1"
+version = "2.2.0"
 description = "MoLing - AI drawing client for any API"
 authors = ["MoLing Contributors"]
+license = "MIT"
 edition = "2021"
 rust-version = "1.98"
 

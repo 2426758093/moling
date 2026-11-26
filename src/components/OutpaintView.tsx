@@ -1,17 +1,14 @@
 import { useEffect, useRef, useState } from "react";
-import { motion, useReducedMotion } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import { useAppStore } from "../stores/appStore";
 import { useProviderStore } from "../stores/providerStore";
 import { api, parseAdapterError, adapterErrorTitle } from "../lib/api";
 import { deliverEditResult } from "../lib/deliverEditResult";
 import { toast } from "../lib/notify";
-import { DUR, EASE } from "../lib/motion";
 import { Button } from "./ui/Button";
-import { IconButton } from "./ui/IconButton";
 import { Input } from "./ui/Field";
 import { SegmentedControl } from "./ui/SegmentedControl";
-import { IconClose } from "./Icons";
+import EditorShell from "./editors/EditorShell";
 import SafeImg from "./SafeImg";
 
 type Side = "top" | "right" | "bottom" | "left";
@@ -56,7 +53,6 @@ export default function OutpaintView() {
   const dragSide = useRef<Side | null>(null);
   const dragStart = useRef({ x: 0, y: 0, offsets: offsets });
   const canvasInline = useAppStore((s) => s.canvasInline);
-  const reduce = useReducedMotion();
 
   useEffect(() => {
     if (!target) return;
@@ -80,14 +76,6 @@ export default function OutpaintView() {
     });
     setOffsets({ top: 0, right: 0, bottom: 0, left: 0 });
   }, [image]);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") closeOutpaint();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [closeOutpaint]);
 
   if (!target) return null;
 
@@ -287,43 +275,23 @@ export default function OutpaintView() {
   ];
 
   return (
-    <motion.div
-      initial={reduce ? false : { opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      transition={{ duration: reduce ? 0 : DUR.base, ease: EASE.ios }}
-      className={
-        inline
-          ? "flex h-full min-h-0 w-full flex-col bg-base"
-          : "fixed inset-x-0 bottom-0 top-12 z-30 flex flex-col bg-base"
+    <EditorShell
+      inline={inline}
+      onClose={closeOutpaint}
+      title={t("扩图")}
+      subtitle={t("向外拖动手柄扩展画面，AI 补全内容")}
+      headerExtra={
+        <Button
+          variant="primary"
+          size="sm"
+          loading={busy}
+          disabled={!changed}
+          onClick={() => void submit()}
+        >
+          {t("生成扩图")}
+        </Button>
       }
-    >
-      <header className="relative z-10 shrink-0 glass">
-        <div className="flex min-h-12 items-center gap-3 px-6 py-2">
-          <div className="flex min-w-0 flex-col">
-            <h1 className="truncate text-title3 text-primary">{t("扩图")}</h1>
-            <p className="truncate text-footnote text-tertiary">
-              {t("向外拖动手柄扩展画面，AI 补全内容")}
-            </p>
-          </div>
-          <div className="ml-auto flex shrink-0 items-center gap-2">
-            <Button
-              variant="primary"
-              size="sm"
-              loading={busy}
-              disabled={!changed}
-              onClick={() => void submit()}
-            >
-              {t("生成扩图")}
-            </Button>
-            <IconButton
-              label={t("关闭扩图")}
-              icon={<IconClose size={16} />}
-              onClick={closeOutpaint}
-            />
-          </div>
-        </div>
-
+      toolbar={
         <div
           role="toolbar"
           aria-label={t("扩图工具")}
@@ -353,11 +321,21 @@ export default function OutpaintView() {
             />
           </div>
         </div>
-      </header>
-
+      }
+      footer={
+        error && (
+          <div
+            role="alert"
+            className="shrink-0 border-t border-danger/25 bg-danger/10 px-6 py-2 text-footnote text-danger"
+          >
+            {error}
+          </div>
+        )
+      }
+    >
       <div
         ref={containerRef}
-        className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden p-8"
+        className="relative flex h-full w-full items-center justify-center overflow-hidden p-8"
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
       >
@@ -433,15 +411,6 @@ export default function OutpaintView() {
           <span className="text-body text-tertiary">{t("加载中…")}</span>
         )}
       </div>
-
-      {error && (
-        <div
-          role="alert"
-          className="shrink-0 border-t border-danger/25 bg-danger/10 px-6 py-2 text-footnote text-danger"
-        >
-          {error}
-        </div>
-      )}
-    </motion.div>
+    </EditorShell>
   );
 }

@@ -458,7 +458,7 @@ function CanvasNodeCard({
         }
       }}
       className={cn(
-        "group absolute select-none rounded-card border bg-elevated shadow-card outline-none transition-shadow",
+        "group absolute select-none rounded-card border bg-elevated p-1 shadow-card outline-none transition-shadow",
         selected || wireArmed
           ? "border-transparent ring-2 ring-accent"
           : "border-line",
@@ -475,7 +475,7 @@ function CanvasNodeCard({
       <SafeImg
         src={shouldPlay && fullGifUrl ? fullGifUrl : (thumbUrl ?? "")}
         alt={t("作品 #{{id}}", { id: node.historyId })}
-        className="pointer-events-none block aspect-square w-full rounded-card object-cover"
+        className="pointer-events-none block aspect-square w-full rounded-btn object-cover"
         draggable={false}
         loading="lazy"
         decoding="async"

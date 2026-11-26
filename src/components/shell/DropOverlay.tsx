@@ -7,7 +7,7 @@ export default function DropOverlay() {
 
   return (
     <div className="pointer-events-none fixed inset-0 z-[45] flex items-center justify-center bg-scrim/40 p-8">
-      <div className="glass flex flex-col items-center gap-2 rounded-panel border-2 border-dashed border-accent/60 px-12 py-9 text-center shadow-sheet">
+      <div className="flex flex-col items-center gap-2 rounded-panel border-2 border-dashed border-accent/60 bg-elevated px-12 py-9 text-center shadow-sheet">
         <span className="flex size-11 items-center justify-center rounded-card bg-accent-soft text-accent">
           <IconImage size={22} strokeWidth={1.6} />
         </span>

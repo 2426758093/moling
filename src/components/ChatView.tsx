@@ -145,7 +145,7 @@ export default function ChatView() {
               type="button"
               onClick={() => setPaletteOpen(true)}
               aria-label={t("打开命令面板")}
-              className="pressable glass-inset flex h-7 items-center gap-1.5 rounded-btn px-2 text-caption text-tertiary transition-colors hover:text-secondary"
+              className="pressable flex h-7 items-center gap-1.5 rounded-btn bg-fill px-2 text-caption text-tertiary transition-colors hover:text-secondary"
             >
               <IconCommand size={13} />
               <span className="hidden sm:inline">{t("命令")}</span>
@@ -160,26 +160,39 @@ export default function ChatView() {
         className="scroll-edge min-h-0 flex-1 overflow-y-auto"
       >
         {empty ? (
-          <div className="flex h-full flex-col items-center justify-center gap-9 px-6 pb-14">
+          <div className="relative flex h-full flex-col items-center justify-center gap-8 overflow-hidden px-6 pb-12">
+            <div
+              aria-hidden
+              className="pointer-events-none absolute inset-x-0 bottom-0 h-1/2"
+              style={{
+                background:
+                  "radial-gradient(50% 90% at 20% 100%, rgba(44,90,124,.16), transparent 70%), radial-gradient(55% 80% at 82% 108%, rgba(27,26,23,.10), transparent 72%)",
+                maskImage:
+                  "linear-gradient(to top, #000 6%, rgba(0,0,0,.5) 45%, transparent 92%)",
+                WebkitMaskImage:
+                  "linear-gradient(to top, #000 6%, rgba(0,0,0,.5) 45%, transparent 92%)",
+              }}
+            />
             <motion.div
               initial={
                 motionTokens.reduce ? { opacity: 1 } : { opacity: 0, y: 14 }
               }
               animate={{ opacity: 1, y: 0 }}
               transition={motionTokens.spring("smooth")}
-              className="max-w-reading text-center"
+              className="relative max-w-reading text-center"
             >
-              <div className="mb-3 text-caption uppercase tracking-wider text-tertiary">
+              <span className="seal mx-auto mb-4 h-9 w-9 text-title1">墨</span>
+              <div className="mb-2 text-caption text-quaternary">
                 {t("AI 绘图")}
               </div>
-              <h2 className="text-display text-primary">
+              <h2 className="font-kai text-display text-primary">
                 {t("描述画面，即刻成图")}
               </h2>
               <p className="mt-2 text-body text-tertiary">
                 {t("像聊天一样描述想法，墨灵会读懂原话并绘制出来")}
               </p>
             </motion.div>
-            <div className="grid w-full max-w-chat grid-cols-1 gap-2.5 wide:max-w-chat-wide sm:grid-cols-2">
+            <div className="relative grid w-full max-w-chat grid-cols-1 gap-2.5 wide:max-w-chat-wide sm:grid-cols-2">
               {SUGGESTIONS.map((s, i) => (
                 <motion.button
                   key={s}
@@ -195,7 +208,7 @@ export default function ChatView() {
                   onClick={() => {
                     if (!sending) void send(s);
                   }}
-                  className="pressable flex items-start gap-2.5 rounded-card bg-elevated px-3.5 py-3 text-left text-callout text-secondary shadow-card ring-1 ring-line transition-colors duration-150 hover:text-primary"
+                  className="pressable flex items-start gap-2.5 rounded-card border border-line bg-elevated px-3.5 py-3 text-left text-callout text-secondary shadow-card transition-colors duration-150 hover:text-primary"
                 >
                   <span className="mt-0.5 shrink-0 text-tertiary">
                     <IconSparkle size={14} />
@@ -204,7 +217,7 @@ export default function ChatView() {
                 </motion.button>
               ))}
             </div>
-            <div className="text-footnote text-quaternary">
+            <div className="relative text-footnote text-quaternary">
               {t("拖入图片作为参考 · Ctrl K 打开命令面板")}
             </div>
           </div>

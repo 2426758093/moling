@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from "react";
-import { motion, useReducedMotion } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import { useAppStore } from "../stores/appStore";
 import { useProviderStore } from "../stores/providerStore";
@@ -12,14 +11,14 @@ import {
 } from "../lib/api";
 import { deliverEditResult } from "../lib/deliverEditResult";
 import { toast } from "../lib/notify";
-import { DUR, EASE } from "../lib/motion";
 import { Button } from "./ui/Button";
 import { IconButton } from "./ui/IconButton";
 import { Input } from "./ui/Field";
 import { Slider } from "./ui/Slider";
 import { ConfirmDialog } from "./ui/Dialog";
 import { ToolbarGroup, ToolbarSeparator } from "./ui/Toolbar";
-import { IconBrush, IconClose, IconEraser } from "./Icons";
+import { IconBrush, IconEraser } from "./Icons";
+import EditorShell from "./editors/EditorShell";
 import SafeImg from "./SafeImg";
 import MaskCanvas, { MaskCanvasHandle } from "./MaskCanvas";
 
@@ -50,7 +49,6 @@ export default function EditorView() {
   const [pickMode, setPickMode] = useState(false);
   const [picking, setPicking] = useState(false);
   const canvasInline = useAppStore((s) => s.canvasInline);
-  const reduce = useReducedMotion();
 
   useEffect(() => {
     let alive = true;
@@ -92,14 +90,6 @@ export default function EditorView() {
     });
     setResultUrl(null);
   }, [image]);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") closeEditor();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [closeEditor]);
 
   if (!source) return null;
 
@@ -230,51 +220,30 @@ export default function EditorView() {
   };
 
   return (
-    <motion.div
-      initial={reduce ? false : { opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      transition={{ duration: reduce ? 0 : DUR.base, ease: EASE.ios }}
-      className={
-        inline
-          ? "flex h-full min-h-0 w-full flex-col bg-base"
-          : "fixed inset-x-0 bottom-0 top-12 z-30 flex flex-col bg-base"
+    <EditorShell
+      inline={inline}
+      onClose={closeEditor}
+      title={isErase ? t("AI 消除") : t("局部重绘")}
+      subtitle={
+        pickMode
+          ? t(
+              "点击要修改的物体自动选中；Shift 加选、Alt 减选，可继续用画笔修整",
+            )
+          : isErase
+            ? t("涂抹要消除的对象，一键补全背景")
+            : t("涂抹要修改的区域，其余像素保持不变")
       }
-    >
-      {/* 栏头与工具条合并为同一块玻璃：中间不夹第二条分割玻璃 */}
-      <header className="relative z-10 shrink-0 glass">
-        <div className="flex min-h-12 items-center gap-3 px-6 py-2">
-          <div className="flex min-w-0 flex-col">
-            <h1 className="truncate text-title3 text-primary">
-              {isErase ? t("AI 消除") : t("局部重绘")}
-            </h1>
-            <p className="truncate text-footnote text-tertiary">
-              {pickMode
-                ? t(
-                    "点击要修改的物体自动选中；Shift 加选、Alt 减选，可继续用画笔修整",
-                  )
-                : isErase
-                  ? t("涂抹要消除的对象，一键补全背景")
-                  : t("涂抹要修改的区域，其余像素保持不变")}
-            </p>
-          </div>
-          <div className="ml-auto flex shrink-0 items-center gap-2">
-            <Button
-              variant="primary"
-              size="sm"
-              loading={busy}
-              onClick={() => void submit()}
-            >
-              {isErase ? t("一键消除") : t("局部重绘")}
-            </Button>
-            <IconButton
-              label={t("关闭编辑器")}
-              icon={<IconClose size={16} />}
-              onClick={closeEditor}
-            />
-          </div>
-        </div>
-
+      headerExtra={
+        <Button
+          variant="primary"
+          size="sm"
+          loading={busy}
+          onClick={() => void submit()}
+        >
+          {isErase ? t("一键消除") : t("局部重绘")}
+        </Button>
+      }
+      toolbar={
         <div
           role="toolbar"
           aria-label={t("蒙版工具")}
@@ -358,11 +327,51 @@ export default function EditorView() {
             </>
           )}
         </div>
-      </header>
-
+      }
+      footer={
+        error && (
+          <div
+            role="alert"
+            className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-t border-danger/25 bg-danger/10 px-6 py-2 text-footnote text-danger"
+          >
+            <span className="min-w-0 flex-1">{error}</span>
+            {unconfirmed && (
+              <span className="text-warning">
+                {t("可能已计费，重试会再次扣费")}
+              </span>
+            )}
+            {requestId && (
+              <button
+                type="button"
+                onClick={() => {
+                  void navigator.clipboard
+                    .writeText(requestId)
+                    .then(() => toast(t("已复制请求 ID")))
+                    .catch(() => toast(t("复制失败"), "error"));
+                }}
+                className="break-all text-left transition-colors hover:text-primary"
+                title={t("复制请求 ID（对账用）")}
+              >
+                {t("请求 ID：{{id}}", { id: requestId })}
+              </button>
+            )}
+            {requestId && (
+              <Button
+                size="sm"
+                variant="ghost"
+                loading={recovering}
+                onClick={() => void recover()}
+              >
+                {t("尝试恢复")}
+              </Button>
+            )}
+          </div>
+        )
+      }
+    >
       <div
         ref={containerRef}
-        className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden p-6"
+        className="relative flex h-full w-full items-center justify-center overflow-hidden p-6"
       >
         {resultUrl ? (
           <div className="flex h-full min-h-0 flex-col items-center gap-3">
@@ -412,45 +421,6 @@ export default function EditorView() {
         )}
       </div>
 
-      {error && (
-        <div
-          role="alert"
-          className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-t border-danger/25 bg-danger/10 px-6 py-2 text-footnote text-danger"
-        >
-          <span className="min-w-0 flex-1">{error}</span>
-          {unconfirmed && (
-            <span className="text-warning">
-              {t("可能已计费，重试会再次扣费")}
-            </span>
-          )}
-          {requestId && (
-            <button
-              type="button"
-              onClick={() => {
-                void navigator.clipboard
-                  .writeText(requestId)
-                  .then(() => toast(t("已复制请求 ID")))
-                  .catch(() => toast(t("复制失败"), "error"));
-              }}
-              className="break-all text-left transition-colors hover:text-primary"
-              title={t("复制请求 ID（对账用）")}
-            >
-              {t("请求 ID：{{id}}", { id: requestId })}
-            </button>
-          )}
-          {requestId && (
-            <Button
-              size="sm"
-              variant="ghost"
-              loading={recovering}
-              onClick={() => void recover()}
-            >
-              {t("尝试恢复")}
-            </Button>
-          )}
-        </div>
-      )}
-
       <ConfirmDialog
         open={confirmRetry}
         onOpenChange={setConfirmRetry}
@@ -462,6 +432,6 @@ export default function EditorView() {
         danger
         onConfirm={() => void submit(true)}
       />
-    </motion.div>
+    </EditorShell>
   );
 }

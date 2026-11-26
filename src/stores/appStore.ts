@@ -15,6 +15,12 @@ import {
   GIF_FRAME_MS_DEFAULT,
 } from "../lib/types";
 import { api } from "../lib/api";
+import {
+  COUNT_MAX,
+  GEN_SIZE_MIN,
+  SIZE_MAX,
+  snapGenerationSize,
+} from "../lib/rules";
 import i18n, { applyLocale, Locale, readLocaleMirror } from "../i18n";
 import { toast } from "../lib/notify";
 import {
@@ -188,18 +194,16 @@ interface AppState {
 
 const BASE = 1024;
 
-/// 自由尺寸：512–4096 且 8 对齐（部分服务商只接受 8 的倍数）
-export const SIZE_MIN = 512;
-export const SIZE_MAX = 4096;
+/// 自由尺寸：生成下限 512–4096 且 8 对齐（部分服务商只接受 8 的倍数）
+export const SIZE_MIN = GEN_SIZE_MIN;
+export { SIZE_MAX };
 
 export function snapSize(
   width: number,
   height: number,
 ): { width: number; height: number } {
-  const snap = (v: number) => {
-    const n = Number.isFinite(v) ? v : BASE;
-    return Math.min(SIZE_MAX, Math.max(SIZE_MIN, Math.round(n / 8) * 8));
-  };
+  // 非有限值回退到默认 1024，避免输入框清空时尺寸变成 NaN
+  const snap = (v: number) => snapGenerationSize(Number.isFinite(v) ? v : BASE);
   return { width: snap(width), height: snap(height) };
 }
 
@@ -227,7 +231,7 @@ export function sanitizePrefs(raw: unknown): Partial<GenPrefs> {
     if (typeof v !== "number" || !Number.isFinite(v) || v < 0) return undefined;
     // 0 = 自动尺寸；其余按 8 对齐并限制在 512–4096
     if (v === 0) return 0;
-    return Math.min(SIZE_MAX, Math.max(SIZE_MIN, Math.round(v / 8) * 8));
+    return snapGenerationSize(v);
   };
   if (typeof src.ratio === "string" && src.ratio.length > 0) {
     out.ratio = src.ratio;
@@ -238,7 +242,7 @@ export function sanitizePrefs(raw: unknown): Partial<GenPrefs> {
   if (height !== undefined) out.height = height;
   if (typeof src.style === "string") out.style = src.style;
   if (typeof src.count === "number" && Number.isFinite(src.count)) {
-    out.count = Math.min(4, Math.max(1, Math.round(src.count)));
+    out.count = Math.min(COUNT_MAX, Math.max(1, Math.round(src.count)));
   }
   const quality = src.quality;
   if (

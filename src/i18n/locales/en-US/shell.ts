@@ -64,6 +64,11 @@ const shell = {
   画廊连续多选: "Multi-select in gallery",
   画廊全选已加载作品: "Select all loaded gallery items",
 
+  // 关闭确认
+  画布有未保存的改动: "The canvas has unsaved changes",
+  取消: "Cancel",
+  关闭并保存: "Close and save",
+
   // 拖拽遮罩
   松开以添加参考图: "Drop to add reference images",
   "支持 PNG / JPG / WebP，会加入当前对话的参考图":
@@ -84,6 +89,27 @@ const shell = {
   "配置思考模型…": "Configure thinking model…",
   "保存思考模型配置失败：{{error}}": "Failed to save thinking model: {{error}}",
   "保存默认模型失败：{{error}}": "Failed to save default model: {{error}}",
+
+  // 导航轨与检查器
+  主导航: "Main navigation",
+  创作: "Create",
+  作品: "Works",
+  墨灵: "MoLing",
+  字体: "Typeface",
+  "留白，是画面的一部分": "Whitespace is part of the picture",
+  检查器分区: "Inspector sections",
+  参数: "Parameters",
+  参考: "References",
+  助手: "Assistant",
+  生成参数: "Generation parameters",
+  画幅: "Aspect ratio",
+  生成数量: "Count",
+  自定义: "Custom",
+  暂无参考图: "No references yet",
+  去落笔坞添加: "Add in the composer",
+  移除参考图: "Remove reference",
+  "模板、灵感、反推、优化与翻译都在落笔坞的提示词助手里。":
+    "Templates, inspiration, reverse prompts, refinement and translation all live in the composer assistant.",
 
   // 更新弹窗
   发现新版本: "Update available",

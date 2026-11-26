@@ -454,7 +454,7 @@ export default function SettingsView() {
                 </Row>
                 <div className="px-3 pb-3">
                   <div className="rounded-card bg-grouped p-3">
-                    <div className="glass rounded-card px-3 py-2 text-footnote text-secondary shadow-card">
+                    <div className="paper rounded-card px-3 py-2 text-footnote text-secondary shadow-card">
                       {t("浮层控制预览 · 玻璃只用在内容之上")}
                     </div>
                   </div>

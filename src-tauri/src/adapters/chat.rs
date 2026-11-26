@@ -61,13 +61,28 @@ pub async fn chat_complete_at(
     extract_reply_text(&parsed)
 }
 
-/// SSE 单帧解析结果：正文增量 / 流结束 / 服务商错误帧 / 无价值帧（心跳、role 帧、坏帧）
+/// SSE 错误来源：服务商在流内声明的错误 / 本地协议层错误（帧超限、缓冲膨胀）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SseErrorKind {
+    /// 服务端错误帧（`data: {"error": ...}`）
+    Server,
+    /// 协议错误：单帧超限、缓冲异常膨胀
+    Protocol,
+}
+
+/// SSE 单帧解析结果：正文增量 / 流结束 / 错误帧 / 无价值帧（心跳、role 帧、坏帧）
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SseItem {
     Delta(String),
-    Done,
-    /// 服务商在流内返回的错误（`data: {"error": ...}`），旧实现会静默丢弃
-    Error(String),
+    /// 流结束；`finish_reason` 取 `choices[0].finish_reason`（stop / length / content_filter …）
+    Done {
+        finish_reason: Option<String>,
+    },
+    /// 服务商在流内返回的错误（`data: {"error": ...}`）或本地协议错误，旧实现会静默丢弃
+    Error {
+        message: String,
+        kind: SseErrorKind,
+    },
     Ignored,
 }
 
@@ -123,14 +138,17 @@ impl SseDecoder {
             let too_big_buffer = self.buf.len() > MAX_SSE_BUFFER;
             self.buf.clear();
             self.scan_from = 0;
-            items.push(SseItem::Error(if too_big_buffer {
-                format!(
-                    "流响应异常膨胀（缓冲超过 {} KiB），已中止",
-                    MAX_SSE_BUFFER / 1024
-                )
-            } else {
-                format!("流响应单帧超过 {} KiB，已中止", MAX_SSE_FRAME / 1024)
-            }));
+            items.push(SseItem::Error {
+                message: if too_big_buffer {
+                    format!(
+                        "流响应异常膨胀（缓冲超过 {} KiB），已中止",
+                        MAX_SSE_BUFFER / 1024
+                    )
+                } else {
+                    format!("流响应单帧超过 {} KiB，已中止", MAX_SSE_FRAME / 1024)
+                },
+                kind: SseErrorKind::Protocol,
+            });
         }
         items
     }
@@ -158,17 +176,28 @@ impl SseDecoder {
             return SseItem::Ignored;
         }
         if data.trim() == "[DONE]" {
-            return SseItem::Done;
+            return SseItem::Done {
+                finish_reason: None,
+            };
         }
         match serde_json::from_str::<serde_json::Value>(&data) {
             Ok(parsed) => {
                 // F-005：错误帧必须上浮，不能当作「无价值帧」静默丢弃
                 if let Some(message) = sse_error_message(&parsed) {
-                    return SseItem::Error(message);
+                    return SseItem::Error {
+                        message,
+                        kind: SseErrorKind::Server,
+                    };
                 }
+                // 正文优先：同一帧既有增量又有 finish_reason 时不丢字（结束标记可由 [DONE]/EOF 兜底）
                 match parsed["choices"][0]["delta"]["content"].as_str() {
                     Some(text) if !text.is_empty() => SseItem::Delta(text.to_string()),
-                    _ => SseItem::Ignored,
+                    _ => match parsed["choices"][0]["finish_reason"].as_str() {
+                        Some(reason) if !reason.is_empty() => SseItem::Done {
+                            finish_reason: Some(reason.to_string()),
+                        },
+                        _ => SseItem::Ignored,
+                    },
                 }
             }
             Err(e) => {
@@ -316,12 +345,24 @@ where
                     acc.push_str(&delta);
                     on_delta(&delta);
                 }
-                SseItem::Done => done = true,
+                SseItem::Done { finish_reason } => {
+                    // 截断/内容过滤仍按结束处理：已产出的文本由上层决定是否降级
+                    if let Some(reason) = finish_reason.as_deref() {
+                        if reason != "stop" {
+                            tracing::warn!("chat 流结束但 finish_reason={reason}");
+                        }
+                    }
+                    done = true;
+                }
                 // F-005：流内错误直接上抛，由上层降级为原文并展示原因
-                SseItem::Error(message) => {
+                SseItem::Error { message, kind } => {
+                    let prefix = match kind {
+                        SseErrorKind::Server => "chat/completions 返回错误",
+                        SseErrorKind::Protocol => "chat/completions 流协议错误",
+                    };
                     return Err(AdapterError::Other {
-                        message: format!("chat/completions 返回错误: {message}"),
-                    })
+                        message: format!("{prefix}: {message}"),
+                    });
                 }
                 SseItem::Ignored => {}
             }
@@ -554,7 +595,36 @@ mod tests {
     #[test]
     fn detects_done_marker() {
         let mut decoder = SseDecoder::new();
-        assert_eq!(decoder.feed(b"data: [DONE]\n\n"), vec![SseItem::Done]);
+        assert_eq!(
+            decoder.feed(b"data: [DONE]\n\n"),
+            vec![SseItem::Done {
+                finish_reason: None
+            }]
+        );
+    }
+
+    /// finish_reason 必须从 choices[0] 读出并随 Done 带回（stop / length / content_filter …）
+    #[test]
+    fn parses_finish_reason_into_done() {
+        for reason in ["stop", "length", "content_filter"] {
+            let mut decoder = SseDecoder::new();
+            let frame = format!(
+                "data: {{\"choices\":[{{\"delta\":{{}},\"finish_reason\":\"{reason}\"}}]}}\n\n"
+            );
+            assert_eq!(
+                decoder.feed(frame.as_bytes()),
+                vec![SseItem::Done {
+                    finish_reason: Some(reason.to_string())
+                }],
+                "finish_reason={reason} 应被解析"
+            );
+        }
+        // finish_reason 为 null / 未知形态时不产出 Done，交给 [DONE] 或 EOF 收尾
+        let mut decoder = SseDecoder::new();
+        assert_eq!(
+            decoder.feed(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":null}]}\n\n"),
+            vec![SseItem::Ignored]
+        );
     }
 
     #[test]
@@ -612,9 +682,9 @@ mod tests {
         );
     }
 
-    /// C1：单帧超过上限必须报错中止，而不是无限占内存
+    /// C1：单帧超过上限必须报协议错误中止，而不是无限占内存
     #[test]
-    fn oversized_frame_reports_error() {
+    fn oversized_frame_reports_protocol_error() {
         let mut decoder = SseDecoder::new();
         let chunk = [b'x'; 1024];
         let mut items = Vec::new();
@@ -623,7 +693,18 @@ mod tests {
         }
         assert!(items.iter().any(|item| matches!(
             item,
-            SseItem::Error(message) if message.contains("单帧超过") || message.contains("异常膨胀")
+            SseItem::Error { message, kind: SseErrorKind::Protocol } if message.contains("单帧超过")
+        )));
+    }
+
+    /// 一次涌入超过整体上限的缓冲：报「异常膨胀」协议错误
+    #[test]
+    fn oversized_buffer_reports_protocol_error() {
+        let mut decoder = SseDecoder::new();
+        let items = decoder.feed(&vec![b'y'; MAX_SSE_BUFFER + 1]);
+        assert!(items.iter().any(|item| matches!(
+            item,
+            SseItem::Error { message, kind: SseErrorKind::Protocol } if message.contains("异常膨胀")
         )));
     }
 
@@ -638,12 +719,14 @@ mod tests {
             vec![
                 SseItem::Delta("a".into()),
                 SseItem::Delta("b".into()),
-                SseItem::Done,
+                SseItem::Done {
+                    finish_reason: None
+                },
             ]
         );
     }
 
-    /// F-005：服务商错误帧必须变成 Error 而不是静默 Ignored
+    /// F-005：服务商错误帧必须变成 Server 类 Error 而不是静默 Ignored
     #[test]
     fn surfaces_error_object_frame() {
         let mut decoder = SseDecoder::new();
@@ -651,17 +734,23 @@ mod tests {
             decoder.feed(
                 b"data: {\"error\":{\"message\":\"quota exceeded\",\"type\":\"insufficient_quota\"}}\n\n"
             ),
-            vec![SseItem::Error("quota exceeded".into())]
+            vec![SseItem::Error {
+                message: "quota exceeded".into(),
+                kind: SseErrorKind::Server,
+            }]
         );
     }
 
-    /// F-005：`{"error":"..."}` 字符串形态同样上浮
+    /// F-005：`{"error":"..."}` 字符串形态同样上浮，且归类为服务端错误
     #[test]
     fn surfaces_error_string_frame() {
         let mut decoder = SseDecoder::new();
         assert_eq!(
             decoder.feed(b"data: {\"error\":\"stream boom\"}\n\n"),
-            vec![SseItem::Error("stream boom".into())]
+            vec![SseItem::Error {
+                message: "stream boom".into(),
+                kind: SseErrorKind::Server,
+            }]
         );
     }
 
@@ -689,7 +778,10 @@ mod tests {
             decoder.feed(payload.as_bytes()),
             vec![
                 SseItem::Delta("partial".into()),
-                SseItem::Error("interrupted".into()),
+                SseItem::Error {
+                    message: "interrupted".into(),
+                    kind: SseErrorKind::Server,
+                },
             ]
         );
     }

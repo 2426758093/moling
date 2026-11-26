@@ -510,7 +510,7 @@ export default function GalleryView() {
   return (
     <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
       <PageHeader
-        title={t("画廊")}
+        title={t("作品")}
         subtitle={t("{{n}} 张作品", { n: items.length })}
         footer={
           <div className="flex flex-wrap items-center gap-1.5">
@@ -575,7 +575,7 @@ export default function GalleryView() {
           ) : (
             <EmptyState
               className="h-full"
-              eyebrow={t("画廊")}
+              eyebrow={t("作品")}
               title={favOnly ? t("还没有收藏的作品") : t("还没有生成记录")}
               description={
                 favOnly
@@ -596,13 +596,14 @@ export default function GalleryView() {
                 return (
                   <div
                     key={vrow.key}
-                    className="absolute left-0 flex h-11 w-full items-center justify-between px-4"
+                    className="absolute left-0 flex h-11 w-full items-center gap-3 px-4"
                     style={{ transform: `translateY(${vrow.start}px)` }}
                   >
-                    <span className="text-footnote font-medium text-secondary">
+                    <span className="shrink-0 font-kai text-callout text-secondary">
                       {block.label}
                     </span>
-                    <span className="text-caption text-tertiary">
+                    <span aria-hidden className="h-px flex-1 bg-line" />
+                    <span className="shrink-0 text-caption text-quaternary">
                       {t("{{n}} 张", { n: block.count })}
                     </span>
                   </div>
@@ -835,7 +836,7 @@ export default function GalleryView() {
       {/* 选择工具条：只在有选择时浮出，避免常驻按钮占位 */}
       {selectedItems.length > 0 && (
         <div className="pointer-events-none absolute inset-x-0 bottom-3 z-20 flex justify-center px-4">
-          <div className="glass pointer-events-auto flex items-center gap-1 rounded-pill p-1 pl-3 shadow-sheet">
+          <div className="pointer-events-auto flex items-center gap-1 rounded-pill border border-line bg-elevated p-1 pl-3 shadow-sheet">
             <span className="tabular text-footnote text-secondary">
               {t("已选 {{n}}", { n: selectedItems.length })}
             </span>

@@ -2,13 +2,16 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { api } from "../lib/api";
 import {
   CANVAS_VERSION,
+  MAX_HISTORY,
   MAX_LAYERS_PER_CANVAS,
   MAX_LAYERS_PER_NODE,
+  clearCanvasHistory,
   parseCanvasData,
   useCanvasStore,
 } from "./canvasStore";
 
 function resetStore() {
+  clearCanvasHistory();
   useCanvasStore.setState({
     thumbs: {},
     gifIds: {},
@@ -21,11 +24,117 @@ function resetStore() {
     layerPanelOpen: false,
     dirty: false,
     saving: false,
+    canUndo: false,
+    canRedo: false,
   });
 }
 
 beforeEach(() => {
   resetStore();
+});
+
+describe("撤销 / 重做", () => {
+  const node = (id: string, historyId: number) => ({
+    id,
+    historyId,
+    x: 0,
+    y: 0,
+    width: 220,
+  });
+
+  it("离散变更可撤销与重做，并清理恢复后失效的选中", () => {
+    useCanvasStore.setState({
+      nodes: [node("a", 1), node("b", 2)],
+      selectedNodeId: "b",
+      layerPanelOpen: true,
+    });
+    const store = () => useCanvasStore.getState();
+
+    store().removeNode("a");
+    expect(store().nodes.map((n) => n.id)).toEqual(["b"]);
+    expect(store().canUndo).toBe(true);
+
+    store().undo();
+    expect(store().nodes.map((n) => n.id)).toEqual(["a", "b"]);
+    expect(store().selectedNodeId).toBe("b");
+    expect(store().canRedo).toBe(true);
+
+    // 重做前选中的节点在目标状态里已不存在：恢复后必须清掉选中
+    store().selectNode("a");
+    store().redo();
+    expect(store().nodes.map((n) => n.id)).toEqual(["b"]);
+    expect(store().selectedNodeId).toBeNull();
+    expect(store().layerPanelOpen).toBe(false);
+    expect(store().canRedo).toBe(false);
+  });
+
+  it("历史最多保留 50 步", () => {
+    useCanvasStore.setState({ nodes: [node("n1", 1)] });
+    const store = () => useCanvasStore.getState();
+
+    for (let i = 1; i <= MAX_HISTORY + 10; i += 1) {
+      store().beginHistory();
+      store().updateNode("n1", { x: i });
+    }
+    expect(store().nodes[0].x).toBe(MAX_HISTORY + 10);
+
+    for (let i = 0; i < MAX_HISTORY; i += 1) store().undo();
+    expect(store().canUndo).toBe(false);
+    // 最早的 10 个快照已被丢弃：只能退回到 x=10
+    expect(store().nodes[0].x).toBe(10);
+  });
+
+  it("一次拖拽只入栈一次，而不是每帧入栈", () => {
+    useCanvasStore.setState({ nodes: [node("n1", 1)] });
+    const store = () => useCanvasStore.getState();
+
+    store().beginHistory();
+    store().updateNode("n1", { x: 5 });
+    store().updateNode("n1", { x: 12 });
+    store().updateNode("n1", { x: 20 });
+    expect(store().nodes[0].x).toBe(20);
+
+    store().undo();
+    expect(store().nodes[0].x).toBe(0);
+    expect(store().canUndo).toBe(false);
+  });
+
+  it("切画布会清空撤销 / 重做栈", async () => {
+    const board = {
+      id: 5,
+      name: "board-5",
+      createdAt: "t",
+      updatedAt: "t",
+      dataJson: JSON.stringify({
+        version: 2,
+        nodes: [],
+        edges: [],
+        viewport: { x: 0, y: 0, zoom: 1 },
+      }),
+    };
+    vi.spyOn(api, "getCanvasBoard").mockResolvedValue(board);
+    vi.spyOn(api, "batchHistoryThumbs").mockResolvedValue([]);
+    vi.spyOn(api, "saveCanvasBoard").mockResolvedValue({
+      id: 1,
+      name: "old",
+      dataJson: "",
+      createdAt: "t",
+      updatedAt: "t",
+    });
+
+    useCanvasStore.setState({
+      nodes: [node("n1", 1)],
+      activeId: 1,
+      activeName: "old",
+    });
+    useCanvasStore.getState().removeNode("n1");
+    expect(useCanvasStore.getState().canUndo).toBe(true);
+
+    await useCanvasStore.getState().selectBoard(5);
+    expect(useCanvasStore.getState().nodes).toEqual([]);
+    expect(useCanvasStore.getState().canUndo).toBe(false);
+    expect(useCanvasStore.getState().canRedo).toBe(false);
+  });
 });
 
 describe("缩略图加载失败后的重试（F-017）", () => {

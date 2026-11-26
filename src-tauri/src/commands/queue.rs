@@ -10,10 +10,11 @@
 use crate::billing_journal;
 use crate::commands::image::{
     generate_core, is_cancelled, normalize_generation, normalize_quality, CancelRegistration,
-    GenerateCommandInput, GenerationRegistry, MAX_REFERENCE_IMAGES,
+    GenerateCommandInput, GenerationRegistry,
 };
 use crate::image_store;
 use crate::reference::ReferenceSpec;
+use crate::rules;
 use crate::storage::{self, JobRow, NewJob};
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -255,13 +256,13 @@ impl JobExtras {
     }
 }
 
-/// 过滤空路径并截断到参考图上限
+/// 过滤空路径并截断到参考图上限（与生成路径同源的 `rules::REFERENCE_MAX`）
 pub fn normalize_reference_paths(paths: Vec<String>) -> Vec<String> {
     paths
         .into_iter()
         .map(|p| p.trim().to_string())
         .filter(|p| !p.is_empty())
-        .take(MAX_REFERENCE_IMAGES)
+        .take(rules::REFERENCE_MAX)
         .collect()
 }
 

@@ -630,6 +630,7 @@ export const api = {
     ops: Array<
       | { type: "crop"; x: number; y: number; width: number; height: number }
       | { type: "rotate"; deg: 90 | 180 | 270 }
+      | { type: "rotateFree"; deg: number }
       | { type: "flip"; axis: "horizontal" | "vertical" }
       | {
           type: "adjust";
@@ -652,6 +653,12 @@ export const api = {
   /** 本地分析：曝光/白平衡/对比/饱和/肤色占比与建议 */
   retouchAnalyze: (imageB64: string) =>
     invoke<RetouchAnalysis>("retouch_analyze", { imageB64 }),
+  /**
+   * 自动拉直：估算画面倾斜角（度），返回值可直接作为 `rotateFree` 的 deg 使用，
+   * 套用后可把画面拉正；无有效内容时返回 0。
+   */
+  estimateSkew: (imageB64: string) =>
+    invoke<number>("estimate_skew", { imageB64 }),
   /** 预览：只返回缩放后的 dataUrl，不写历史、不写盘 */
   previewRetouch: (input: {
     imageB64: string;

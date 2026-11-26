@@ -1,5 +1,6 @@
 import { useTranslation } from "react-i18next";
 import { useAppStore, type AppView } from "../../stores/appStore";
+import { useChatStore } from "../../stores/chatStore";
 import { useQueueStore } from "../../stores/queueStore";
 import { IconButton } from "../ui/IconButton";
 import { IconPanelLeft, IconSearch } from "../Icons";
@@ -8,19 +9,18 @@ import WindowControls from "./WindowControls";
 import type { WindowPlatform } from "../../hooks/useWindowState";
 
 const VIEW_TITLE = {
-  chat: "聊天",
-  gallery: "画廊",
+  chat: "创作",
+  gallery: "作品",
   retouch: "修图",
   canvas: "画布",
   queue: "队列",
   settings: "设置",
 } as const satisfies Record<AppView, string>;
 
-/// 自绘标题栏：48px 功能玻璃，整条是拖拽区。
+/// 自绘标题栏：48px 纸面，整条是拖拽区。
 ///
-/// `data-tauri-drag-region` 只标在栏体与中间的空白占位上 —— 按钮自己没这个
-/// 属性，所以点按钮不会触发拖拽。双击最大化交给 Tauri 内建
-/// （allow-internal-toggle-maximize），不写 onDoubleClick，否则会和拖拽抢事件。
+/// 左侧是印章字标与面包屑，中段留白供拖拽，右侧是命令入口、队列徽标与窗口控制。
+/// `data-tauri-drag-region` 只标在栏体与空白占位上，按钮不参与拖拽。
 export default function TitleBar({
   isMaximized,
   platform,
@@ -32,18 +32,22 @@ export default function TitleBar({
   const view = useAppStore((s) => s.view);
   const toggleSidebar = useAppStore((s) => s.toggleSidebar);
   const setPaletteOpen = useAppStore((s) => s.setPaletteOpen);
+  const activeTitle = useChatStore(
+    (s) => s.conversations.find((c) => c.id === s.activeId)?.title,
+  );
   const queuePending = useQueueStore(
     (s) => (s.counts.queued ?? 0) + (s.counts.running ?? 0),
   );
-  // 快捷键文案跟随平台：mac 用 ⌘，其余用 Ctrl
   const mod = platform === "macos" ? "⌘K" : "Ctrl K";
+  const crumb =
+    view === "chat" && activeTitle ? activeTitle : t(VIEW_TITLE[view]);
 
   return (
     <header
       data-tauri-drag-region
-      className="glass-titlebar fixed inset-x-0 top-0 z-40 flex h-12 select-none items-center"
+      className="fixed inset-x-0 top-0 z-40 flex h-12 select-none items-center gap-2 border-b border-separator bg-window px-2"
     >
-      <div className="flex shrink-0 items-center gap-1 pl-2">
+      <div className="flex shrink-0 items-center gap-1">
         <IconButton
           size="sm"
           label={t("切换侧栏")}
@@ -55,18 +59,18 @@ export default function TitleBar({
 
       <div
         data-tauri-drag-region
-        className="ml-1.5 flex min-w-0 shrink-0 items-baseline gap-2"
+        className="flex min-w-0 shrink-0 items-center gap-2.5 pl-1"
       >
-        <span className="text-callout font-semibold text-primary">墨灵</span>
+        <span className="seal h-5 w-5 text-caption">墨</span>
+        <span className="font-kai text-body text-primary">{t("墨灵")}</span>
         <span aria-hidden className="text-caption text-quaternary">
-          ·
+          /
         </span>
-        <span className="truncate text-callout text-secondary">
-          {t(VIEW_TITLE[view])}
+        <span className="max-w-72 truncate text-callout text-secondary">
+          {crumb}
         </span>
       </div>
 
-      {/* 中段空白：只这里拖拽，避免误拖文字 */}
       <div data-tauri-drag-region className="h-full min-w-4 flex-1" />
 
       <div className="flex shrink-0 items-center gap-2">
@@ -74,7 +78,7 @@ export default function TitleBar({
           type="button"
           onClick={() => setPaletteOpen(true)}
           className={cn(
-            "glass-inset pressable flex h-7 w-60 items-center gap-2 rounded-btn px-2.5",
+            "pressable flex h-8 w-56 items-center gap-2 rounded-btn bg-fill px-2.5",
             "text-caption text-tertiary hover:text-secondary",
           )}
         >
@@ -85,14 +89,14 @@ export default function TitleBar({
         {queuePending > 0 && (
           <span
             aria-label={t("{{n}} 个任务待执行", { n: queuePending })}
-            className="tabular rounded-pill bg-accent-fill px-1.5 py-0.5 text-caption text-on-accent"
+            className="tabular rounded-pill bg-accent-soft px-2 py-0.5 text-caption text-accent-text"
           >
             {queuePending}
           </span>
         )}
       </div>
 
-      <div className="ml-2 flex h-full items-stretch border-l border-separator">
+      <div className="ml-1 flex h-full items-stretch border-l border-separator">
         <WindowControls isMaximized={isMaximized} />
       </div>
     </header>

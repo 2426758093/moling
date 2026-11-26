@@ -143,6 +143,8 @@ export default function CanvasBoard({
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // 输入法组合期间不拦截快捷键，否则会打断中文/日文输入
+      if (e.isComposing) return;
       const target = e.target as HTMLElement | null;
       if (
         target &&
@@ -153,6 +155,17 @@ export default function CanvasBoard({
         return;
       }
       const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        if (e.shiftKey) useCanvasStore.getState().redo();
+        else useCanvasStore.getState().undo();
+        return;
+      }
+      if (mod && e.key.toLowerCase() === "y") {
+        e.preventDefault();
+        useCanvasStore.getState().redo();
+        return;
+      }
       if (mod && (e.key === "=" || e.key === "+")) {
         e.preventDefault();
         zoomBy(ZOOM_STEP);
@@ -354,6 +367,11 @@ export default function CanvasBoard({
       ref={containerRef}
       role="application"
       aria-label={t("画布：拖动空白处平移，滚轮缩放")}
+      onPointerDownCapture={(e) => {
+        // 节点拖拽会 stopPropagation，捕获阶段先记下起点，首次移动才真正入栈
+        if (e.button !== 0) return;
+        useCanvasStore.getState().beginHistory();
+      }}
       onPointerDown={pointerDown}
       onPointerMove={pointerMove}
       onPointerUp={pointerUp}
@@ -363,8 +381,7 @@ export default function CanvasBoard({
         panning ? "cursor-grabbing" : "cursor-grab",
       )}
       style={{
-        backgroundImage:
-          "radial-gradient(var(--line-strong) 1px, transparent 1px)",
+        backgroundImage: "radial-gradient(var(--line) 1px, transparent 1px)",
         backgroundSize: `${gridSize}px ${gridSize}px`,
         backgroundPosition: `${viewport.x}px ${viewport.y}px`,
       }}
@@ -497,7 +514,7 @@ export default function CanvasBoard({
       )}
 
       {wireMode && (
-        <div className="glass pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-pill px-3 py-1 text-footnote text-secondary">
+        <div className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-pill border border-line bg-elevated px-3 py-1 text-footnote text-secondary">
           {wireSource == null
             ? t("点击起点节点，再点击终点连线 · Esc 退出")
             : t("再点击一个节点完成连线 · Esc 取消")}
@@ -505,13 +522,13 @@ export default function CanvasBoard({
       )}
 
       {selectedEdge && (
-        <div className="glass pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-pill px-3 py-1 text-footnote text-secondary">
+        <div className="pointer-events-none absolute left-1/2 top-4 -translate-x-1/2 rounded-pill border border-line bg-elevated px-3 py-1 text-footnote text-secondary">
           {t("已选中连线 · 按 Delete 删除")}
         </div>
       )}
 
       <div
-        className="glass absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-0.5 rounded-pill p-1 shadow-pop"
+        className="absolute bottom-4 left-1/2 flex -translate-x-1/2 items-center gap-0.5 rounded-pill border border-line bg-elevated p-1 shadow-pop"
         onPointerDown={(e) => e.stopPropagation()}
       >
         <div className="flex items-center gap-0.5">

@@ -37,7 +37,7 @@ export function EmptyState({
           {eyebrow}
         </p>
       )}
-      <h2 className="text-display text-primary">{title}</h2>
+      <h2 className="font-kai text-display text-primary">{title}</h2>
       {description && (
         <p className="max-w-reading text-body text-tertiary">{description}</p>
       )}

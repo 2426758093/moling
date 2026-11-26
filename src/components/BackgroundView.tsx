@@ -1,12 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { motion, useReducedMotion } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import { BackgroundTarget, useAppStore } from "../stores/appStore";
 import { useProviderStore } from "../stores/providerStore";
 import { api, parseAdapterError, adapterErrorTitle } from "../lib/api";
 import { deliverEditResult } from "../lib/deliverEditResult";
 import { toast } from "../lib/notify";
-import { DUR, EASE } from "../lib/motion";
 import { Button } from "./ui/Button";
 import { IconButton } from "./ui/IconButton";
 import { Input } from "./ui/Field";
@@ -14,7 +12,8 @@ import { Slider } from "./ui/Slider";
 import { SegmentedControl } from "./ui/SegmentedControl";
 import { ColorField } from "./ui/ColorField";
 import { ToolbarGroup, ToolbarSeparator } from "./ui/Toolbar";
-import { IconBrush, IconClose, IconEraser } from "./Icons";
+import { IconBrush, IconEraser } from "./Icons";
+import EditorShell from "./editors/EditorShell";
 import SafeImg from "./SafeImg";
 import MaskCanvas, { MaskCanvasHandle } from "./MaskCanvas";
 
@@ -63,7 +62,6 @@ function BackgroundBody({
   const [smartReady, setSmartReady] = useState(false);
   const [autoBusy, setAutoBusy] = useState(false);
   const canvasInline = useAppStore((s) => s.canvasInline);
-  const reduce = useReducedMotion();
   const inline = canvasInline && target.host === "canvas";
 
   useEffect(() => {
@@ -105,14 +103,6 @@ function BackgroundBody({
     });
     setResultUrl(null);
   }, [image]);
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") close();
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [close]);
 
   const canSubmit =
     !busy && (kind !== "ai" || (prompt.trim() !== "" && model !== ""));
@@ -187,43 +177,23 @@ function BackgroundBody({
   };
 
   return (
-    <motion.div
-      initial={reduce ? false : { opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      transition={{ duration: reduce ? 0 : DUR.base, ease: EASE.ios }}
-      className={
-        inline
-          ? "flex h-full min-h-0 w-full flex-col bg-base"
-          : "fixed inset-x-0 bottom-0 top-12 z-30 flex flex-col bg-base"
+    <EditorShell
+      inline={inline}
+      onClose={close}
+      title={t("换背景")}
+      subtitle={t("涂抹要替换的背景区域，也可先「自动选中背景」再修整")}
+      headerExtra={
+        <Button
+          variant="primary"
+          size="sm"
+          loading={busy}
+          disabled={!canSubmit}
+          onClick={() => void submit()}
+        >
+          {t("换背景")}
+        </Button>
       }
-    >
-      <header className="relative z-10 shrink-0 glass">
-        <div className="flex min-h-12 items-center gap-3 px-6 py-2">
-          <div className="flex min-w-0 flex-col">
-            <h1 className="truncate text-title3 text-primary">{t("换背景")}</h1>
-            <p className="truncate text-footnote text-tertiary">
-              {t("涂抹要替换的背景区域，也可先「自动选中背景」再修整")}
-            </p>
-          </div>
-          <div className="ml-auto flex shrink-0 items-center gap-2">
-            <Button
-              variant="primary"
-              size="sm"
-              loading={busy}
-              disabled={!canSubmit}
-              onClick={() => void submit()}
-            >
-              {t("换背景")}
-            </Button>
-            <IconButton
-              label={t("关闭换背景")}
-              icon={<IconClose size={16} />}
-              onClick={close}
-            />
-          </div>
-        </div>
-
+      toolbar={
         <div
           role="toolbar"
           aria-label={t("换背景工具")}
@@ -336,11 +306,21 @@ function BackgroundBody({
             </div>
           )}
         </div>
-      </header>
-
+      }
+      footer={
+        error && (
+          <div
+            role="alert"
+            className="shrink-0 border-t border-danger/25 bg-danger/10 px-6 py-2 text-footnote text-danger"
+          >
+            {error}
+          </div>
+        )
+      }
+    >
       <div
         ref={containerRef}
-        className="relative flex min-h-0 flex-1 items-center justify-center overflow-hidden p-6"
+        className="relative flex h-full w-full items-center justify-center overflow-hidden p-6"
       >
         {resultUrl ? (
           <div className="flex h-full min-h-0 flex-col items-center gap-3">
@@ -380,15 +360,6 @@ function BackgroundBody({
           <span className="text-body text-tertiary">{t("加载中…")}</span>
         )}
       </div>
-
-      {error && (
-        <div
-          role="alert"
-          className="shrink-0 border-t border-danger/25 bg-danger/10 px-6 py-2 text-footnote text-danger"
-        >
-          {error}
-        </div>
-      )}
-    </motion.div>
+    </EditorShell>
   );
 }

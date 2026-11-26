@@ -52,12 +52,15 @@ export type OutputFormat = "png" | "gif";
 
 export type GifComplexity = "low" | "medium" | "high";
 
-export const GIF_FRAME_MIN = 2;
-export const GIF_FRAME_MAX = 16;
-export const GIF_FRAME_DEFAULT = 9;
-export const GIF_FRAME_MS_MIN = 20;
-export const GIF_FRAME_MS_MAX = 2000;
-export const GIF_FRAME_MS_DEFAULT = 200;
+/// 动图区间与默认值统一来自 rules：presets 只做转出，types 的 re-export 不变
+export {
+  GIF_FRAME_MIN,
+  GIF_FRAME_MAX,
+  GIF_FRAME_DEFAULT,
+  GIF_FRAME_MS_MIN,
+  GIF_FRAME_MS_MAX,
+  GIF_FRAME_MS_DEFAULT,
+} from "./rules";
 
 /// label 同 QUALITY_OPTIONS：字面量即词典 key
 export const COMPLEXITY_OPTIONS = [

@@ -19,7 +19,8 @@ export interface MenuItem {
   shortcut?: string;
 }
 
-const CONTENT = "anim-pop z-[55] min-w-48 rounded-pop glass p-1.5 shadow-pop";
+const CONTENT =
+  "anim-pop z-[55] min-w-48 rounded-pop border border-line bg-elevated p-1.5 shadow-pop";
 
 function itemClass(danger?: boolean) {
   return cn(
