@@ -222,14 +222,17 @@ export default function CanvasView() {
                 />
               </DropdownMenu>
             )}
-            <Button
-              size="sm"
-              variant="primary"
-              icon={<IconPlus size={14} />}
-              onClick={() => setAddOpen(true)}
-            >
-              {t("添加图片")}
-            </Button>
+            {/* 空画布由舞台中央的空态提供唯一「添加图片」入口，避免同屏重复 */}
+            {nodeCount > 0 && (
+              <Button
+                size="sm"
+                variant="primary"
+                icon={<IconPlus size={14} />}
+                onClick={() => setAddOpen(true)}
+              >
+                {t("添加图片")}
+              </Button>
+            )}
           </>
         }
       />

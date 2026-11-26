@@ -26,12 +26,23 @@ import { TooltipProvider } from "./components/ui/Tooltip";
 import { CommandPalette } from "./components/ui/CommandPalette";
 import { ConfirmDialog } from "./components/ui/Dialog";
 import TitleBar from "./components/shell/TitleBar";
+import Splitter from "./components/shell/Splitter";
 import ResizeHandles from "./components/shell/ResizeHandles";
 import ShortcutsSheet from "./components/shell/ShortcutsSheet";
 import DropOverlay from "./components/shell/DropOverlay";
 import UpdateDialog from "./components/shell/UpdateDialog";
 import { useWindowState } from "./hooks/useWindowState";
 import { useGlobalShortcuts } from "./hooks/useGlobalShortcuts";
+import { useCompact } from "./hooks/useMediaQuery";
+import {
+  INSPECTOR_DEFAULT,
+  INSPECTOR_MAX,
+  INSPECTOR_MIN,
+  SIDEBAR_DEFAULT,
+  SIDEBAR_MAX,
+  SIDEBAR_MIN,
+} from "./lib/layout";
+import { useLayoutStore } from "./stores/layoutStore";
 import { sanitizePrefs, useAppStore } from "./stores/appStore";
 import { useChatStore } from "./stores/chatStore";
 import { useProviderStore } from "./stores/providerStore";
@@ -72,6 +83,13 @@ function AppShell() {
   const backgroundTarget = useAppStore((s) => s.backgroundTarget);
   const animationTarget = useAppStore((s) => s.animationTarget);
   const canvasInline = useAppStore((s) => s.canvasInline);
+  const sidebarCollapsed = useAppStore((s) => s.sidebarCollapsed);
+  const compact = useCompact();
+  const sidebarWidth = useLayoutStore((s) => s.sidebarWidth);
+  const inspectorWidth = useLayoutStore((s) => s.inspectorWidth);
+  const setSidebarWidth = useLayoutStore((s) => s.setSidebarWidth);
+  const setInspectorWidth = useLayoutStore((s) => s.setInspectorWidth);
+  const setResizing = useLayoutStore((s) => s.setResizing);
   const addFileAttachment = useChatStore((s) => s.addFileAttachment);
   const setView = useAppStore((s) => s.setView);
   const reduce = useReducedMotion();
@@ -261,6 +279,18 @@ function AppShell() {
       <div className="relative z-10 flex min-h-0 flex-1 pt-12">
         <NavRail />
         {showSidebar && <Sidebar />}
+        {showSidebar && !compact && !sidebarCollapsed && (
+          <Splitter
+            orientation="vertical"
+            label={t("调整侧栏宽度")}
+            value={sidebarWidth}
+            min={SIDEBAR_MIN}
+            max={SIDEBAR_MAX}
+            defaultValue={SIDEBAR_DEFAULT}
+            onChange={setSidebarWidth}
+            onDraggingChange={(on) => setResizing(on ? "sidebar" : null)}
+          />
+        )}
         <main className="flex min-w-0 flex-1 flex-col p-2">
           <div className="content-sheet relative flex min-h-0 flex-1 flex-col">
             {/* 新旧视图叠放交叉淡入：wait 模式会先退场再入场，切页中间有 300ms 空屏 */}
@@ -308,6 +338,19 @@ function AppShell() {
             </AnimatePresence>
           </div>
         </main>
+        {showInspector && !compact && (
+          <Splitter
+            orientation="vertical"
+            invert
+            label={t("调整检查器宽度")}
+            value={inspectorWidth}
+            min={INSPECTOR_MIN}
+            max={INSPECTOR_MAX}
+            defaultValue={INSPECTOR_DEFAULT}
+            onChange={setInspectorWidth}
+            onDraggingChange={(on) => setResizing(on ? "inspector" : null)}
+          />
+        )}
         {showInspector && <Inspector />}
       </div>
 

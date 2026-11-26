@@ -28,6 +28,9 @@ const shell = {
   命令: "Commands",
   展开侧栏: "Expand sidebar",
   折叠侧栏: "Collapse sidebar",
+  调整侧栏宽度: "Resize sidebar width",
+  调整检查器宽度: "Resize inspector width",
+  恢复默认布局: "Reset layout",
 
   // 标题栏
   聊天: "Chat",

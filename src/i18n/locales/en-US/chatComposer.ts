@@ -103,6 +103,7 @@ const chatComposer = {
 
   // 输入与发送
   提示词: "Prompt",
+  调整输入坞高度: "Resize composer height",
   "描述你想要的画面…": "Describe the image you want…",
   提示词助手: "Prompt assistant",
   加入队列: "Add to queue",

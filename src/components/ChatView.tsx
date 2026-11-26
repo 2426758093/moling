@@ -4,6 +4,7 @@ import { motion, AnimatePresence } from "framer-motion";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useChatStore } from "../stores/chatStore";
 import { useAppStore } from "../stores/appStore";
+import { useLayoutStore } from "../stores/layoutStore";
 import { sizeLabel } from "../lib/types";
 import { useProviderStore } from "../stores/providerStore";
 import { useScrollEdge } from "../hooks/useScrollEdge";
@@ -37,6 +38,7 @@ export default function ChatView() {
   const providers = useProviderStore((s) => s.providers);
   const defaultProviderId = useProviderStore((s) => s.defaultProviderId);
   const motionTokens = useMotionTokens();
+  const composerHeight = useLayoutStore((s) => s.composerHeight);
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   useScrollEdge(scrollRef);
@@ -110,6 +112,17 @@ export default function ChatView() {
       cancelAnimationFrame(raf2);
     };
   }, [messages, virtualizer]);
+
+  // 输入坞高度变化会改变消息可视区：重新量测虚拟列表，并在吸底状态下保持底部锚定。
+  useEffect(() => {
+    virtualizer.measure();
+    const count = useChatStore.getState().messages.length;
+    if (!stickToBottom.current || count === 0) return;
+    const raf = requestAnimationFrame(() => {
+      virtualizer.scrollToIndex(count - 1, { align: "end" });
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [composerHeight, virtualizer]);
 
   const empty = activeId === null || messages.length === 0;
 

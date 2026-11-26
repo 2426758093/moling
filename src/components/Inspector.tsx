@@ -6,15 +6,15 @@ import { useAppStore } from "../stores/appStore";
 import { api, type ThinkingConfig } from "../lib/api";
 import { toast } from "../lib/notify";
 import { useCompact } from "../hooks/useMediaQuery";
+import { useLayoutStore } from "../stores/layoutStore";
 import { maxReferenceImages } from "../lib/useModelCaps";
 import { FOCUS_COMPOSER_EVENT, OPEN_ASSIST_EVENT } from "../lib/commands";
-import { RATIO_OPTIONS, REFERENCE_ROLES } from "../lib/types";
+import { REFERENCE_ROLES } from "../lib/types";
 import { Button } from "./ui/Button";
-import { IconButton } from "./ui/IconButton";
 import { Select } from "./ui/Select";
 import { SegmentedControl } from "./ui/SegmentedControl";
 import { Switch } from "./ui/Switch";
-import { IconBrain, IconClose, IconImage } from "./Icons";
+import { IconBrain, IconImage } from "./Icons";
 
 type Tab = "params" | "refs" | "assist";
 
@@ -31,19 +31,16 @@ export default function Inspector() {
   const { t } = useTranslation();
   const compact = useCompact();
   const [tab, setTab] = useState<Tab>("params");
+  const inspectorWidth = useLayoutStore((s) => s.inspectorWidth);
 
   const providers = useProviderStore((s) => s.providers);
   const defaultProviderId = useProviderStore((s) => s.defaultProviderId);
   const setDefaultProvider = useProviderStore((s) => s.setDefaultProvider);
   const saveProvider = useProviderStore((s) => s.save);
 
-  const prefs = useAppStore((s) => s.prefs);
-  const setPrefs = useAppStore((s) => s.setPrefs);
-  const applyRatio = useAppStore((s) => s.applyRatio);
   const setView = useAppStore((s) => s.setView);
 
   const attachments = useChatStore((s) => s.attachments);
-  const removeAttachment = useChatStore((s) => s.removeAttachment);
 
   const [thinking, setThinking] = useState<ThinkingConfig | null>(null);
 
@@ -82,17 +79,6 @@ export default function Inspector() {
     }
   };
 
-  const ratioOptions = [
-    ...RATIO_OPTIONS.map((r) => ({ value: r.id, label: r.label })),
-    ...(prefs.ratio === "custom"
-      ? [{ value: "custom", label: t("自定义") }]
-      : []),
-  ];
-
-  const countOptions = Array.from(
-    new Set([1, 2, 4, prefs.count].filter((n) => n >= 1 && n <= 4)),
-  ).sort((a, b) => a - b);
-
   const openAssist = () => {
     window.dispatchEvent(new Event(FOCUS_COMPOSER_EVENT));
     window.dispatchEvent(new Event(OPEN_ASSIST_EVENT));
@@ -105,7 +91,8 @@ export default function Inspector() {
   return (
     <aside
       aria-label={t("生成参数")}
-      className="flex w-72 shrink-0 flex-col border-l border-separator bg-window"
+      className="flex shrink-0 flex-col border-l border-separator bg-window"
+      style={{ width: inspectorWidth }}
     >
       <div className="flex h-12 shrink-0 items-center gap-2 px-3">
         <SegmentedControl<Tab>
@@ -173,33 +160,6 @@ export default function Inspector() {
                   { value: "", label: t("（未选择）") },
                   ...models.map((m) => ({ value: m, label: m })),
                 ]}
-              />
-            </div>
-
-            <div className="flex flex-col gap-1.5">
-              <span className="text-caption text-tertiary">{t("画幅")}</span>
-              <Select
-                label={t("画幅")}
-                value={prefs.ratio}
-                onValueChange={applyRatio}
-                options={ratioOptions}
-              />
-            </div>
-
-            <div className="flex flex-col gap-1.5">
-              <span className="text-caption text-tertiary">
-                {t("生成数量")}
-              </span>
-              <SegmentedControl
-                value={String(prefs.count)}
-                onValueChange={(v) => setPrefs({ count: Number(v) })}
-                label={t("生成数量")}
-                size="sm"
-                block
-                options={countOptions.map((n) => ({
-                  value: String(n),
-                  label: `${n}`,
-                }))}
               />
             </div>
 
@@ -287,13 +247,6 @@ export default function Inspector() {
                             : ""}
                         </span>
                       </span>
-                      <IconButton
-                        label={t("移除参考图")}
-                        size="sm"
-                        tooltip={false}
-                        icon={<IconClose size={12} />}
-                        onClick={() => removeAttachment(a.id)}
-                      />
                     </div>
                   );
                 })}

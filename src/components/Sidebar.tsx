@@ -3,6 +3,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { useTranslation } from "react-i18next";
 import { useAppStore } from "../stores/appStore";
 import { useChatStore } from "../stores/chatStore";
+import { useLayoutStore } from "../stores/layoutStore";
 import { useCompact } from "../hooks/useMediaQuery";
 import { useMotionTokens } from "../lib/useMotion";
 import { DUR } from "../lib/motion";
@@ -14,6 +15,7 @@ import {
   IconChevron,
   IconClose,
   IconPlus,
+  IconRotate,
   IconSearch,
 } from "./Icons";
 import { cn } from "./ui/cn";
@@ -37,6 +39,9 @@ export default function Sidebar() {
   const motionTokens = useMotionTokens();
   const compact = useCompact();
   const collapsed = manualCollapsed || compact;
+  const sidebarWidth = useLayoutStore((s) => s.sidebarWidth);
+  const resizing = useLayoutStore((s) => s.resizing === "sidebar");
+  const resetLayout = useLayoutStore((s) => s.resetLayout);
   const searchRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -72,17 +77,20 @@ export default function Sidebar() {
 
   return (
     <motion.aside
-      animate={{ width: collapsed ? 0 : 248 }}
-      transition={motionTokens.spring("gentle")}
+      animate={{ width: collapsed ? 0 : sidebarWidth }}
+      transition={resizing ? { duration: 0 } : motionTokens.spring("gentle")}
       aria-hidden={collapsed}
       className="relative shrink-0 overflow-hidden border-r border-separator bg-window"
     >
       <div
         className={cn(
-          "flex h-full w-[248px] flex-col",
+          "flex h-full flex-col",
           collapsed && "pointer-events-none opacity-0",
         )}
-        style={{ visibility: collapsed ? "hidden" : "visible" }}
+        style={{
+          width: sidebarWidth,
+          visibility: collapsed ? "hidden" : "visible",
+        }}
       >
         <div className="shrink-0 space-y-1.5 px-3 pb-1 pt-3">
           <Button
@@ -179,13 +187,22 @@ export default function Sidebar() {
           <span className="text-caption text-quaternary">
             {t("留白，是画面的一部分")}
           </span>
-          <IconButton
-            label={t("折叠侧栏")}
-            size="sm"
-            tooltip={false}
-            icon={<IconChevron direction="left" size={13} />}
-            onClick={toggleSidebar}
-          />
+          <div className="flex items-center gap-0.5">
+            <IconButton
+              label={t("恢复默认布局")}
+              size="sm"
+              tooltip={false}
+              icon={<IconRotate size={13} />}
+              onClick={resetLayout}
+            />
+            <IconButton
+              label={t("折叠侧栏")}
+              size="sm"
+              tooltip={false}
+              icon={<IconChevron direction="left" size={13} />}
+              onClick={toggleSidebar}
+            />
+          </div>
         </div>
       </div>
     </motion.aside>

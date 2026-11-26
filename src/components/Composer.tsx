@@ -63,8 +63,12 @@ import {
   IconQueue,
 } from "./Icons";
 import PromptAssist from "./PromptAssist";
+import Splitter from "./shell/Splitter";
 import { Input } from "./ui/Field";
 import { useStylePresets } from "../stores/stylePresetStore";
+import { useLayoutStore } from "../stores/layoutStore";
+import { useCompact } from "../hooks/useMediaQuery";
+import { COMPOSER_DEFAULT, COMPOSER_MAX, COMPOSER_MIN } from "../lib/layout";
 
 // Radix Select 不接受空字符串作为选项值，空风格需要一个哨兵值
 const NONE_STYLE = "none";
@@ -362,6 +366,10 @@ function SamplingPanel({
 
 export default function Composer() {
   const { t } = useTranslation();
+  const compact = useCompact();
+  const composerHeight = useLayoutStore((s) => s.composerHeight);
+  const setComposerHeight = useLayoutStore((s) => s.setComposerHeight);
+  const setResizing = useLayoutStore((s) => s.setResizing);
   // 从画布/画廊切回聊天时 Composer 才挂载，草稿需在首次渲染就进输入框
   const [text, setText] = useState(
     () => useChatStore.getState().draftPrompt ?? "",
@@ -722,8 +730,21 @@ export default function Composer() {
   };
 
   return (
-    <div className="shrink-0 px-3 pb-3 pt-1.5">
-      <div className="relative mx-auto max-w-chat wide:max-w-chat-wide">
+    <div className="flex shrink-0 flex-col" style={{ height: composerHeight }}>
+      {!compact && (
+        <Splitter
+          orientation="horizontal"
+          invert
+          label={t("调整输入坞高度")}
+          value={composerHeight}
+          min={COMPOSER_MIN}
+          max={COMPOSER_MAX}
+          defaultValue={COMPOSER_DEFAULT}
+          onChange={setComposerHeight}
+          onDraggingChange={(on) => setResizing(on ? "composer" : null)}
+        />
+      )}
+      <div className="relative mx-auto flex min-h-0 w-full max-w-chat flex-1 flex-col px-3 pb-3 pt-1.5 wide:max-w-chat-wide">
         <AnimatePresence>
           {assistOpen && (
             <PromptAssist draft={text} onClose={() => setAssistOpen(false)} />
@@ -740,7 +761,7 @@ export default function Composer() {
           onDrop={onComposerDrop}
           className={cn(
             // 焦点环用 outline：.glass 自己的 box-shadow 会压过 ring-* 工具类
-            "relative overflow-hidden rounded-card border border-line bg-elevated shadow-card",
+            "relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-card border border-line bg-elevated shadow-card",
             dropActive
               ? "outline-2 outline-dashed outline-accent/50"
               : inputFocused
@@ -770,7 +791,7 @@ export default function Composer() {
                     : { opacity: 0, height: 0 }
                 }
                 transition={motionTokens.fade(DUR.base)}
-                className="flex gap-2 overflow-x-auto px-2 pt-2"
+                className="flex shrink-0 gap-2 overflow-x-auto px-2 pt-2"
               >
                 {attachments.map((a) => (
                   <motion.div
@@ -857,7 +878,7 @@ export default function Composer() {
           </AnimatePresence>
 
           {/* 参数摘要：模型能力范围内的快捷入口，全部 24px */}
-          <div className="flex flex-wrap items-center gap-1 px-2 pt-2">
+          <div className="flex shrink-0 flex-wrap items-center gap-1 px-2 pt-2">
             <Popover
               side="top"
               align="start"
@@ -1252,10 +1273,10 @@ export default function Composer() {
             rows={1}
             placeholder={t("描述你想要的画面…")}
             aria-label={t("提示词")}
-            className="block max-h-[150px] w-full resize-none bg-transparent px-3 pb-1 pt-2 text-body leading-relaxed text-primary outline-none placeholder:text-tertiary"
+            className="block min-h-0 w-full flex-1 resize-none overflow-y-auto bg-transparent px-3 pb-1 pt-2 text-body leading-relaxed text-primary outline-none placeholder:text-tertiary"
           />
 
-          <div className="flex items-center gap-1 px-1.5 pb-1.5">
+          <div className="flex shrink-0 items-center gap-1 px-1.5 pb-1.5">
             <IconButton
               label={t("提示词助手")}
               icon={<IconSparkle size={18} />}
@@ -1315,7 +1336,7 @@ export default function Composer() {
           </div>
         </div>
 
-        <div className="mt-1.5 flex items-center justify-center gap-2 text-center text-footnote text-quaternary">
+        <div className="mt-1.5 flex shrink-0 items-center justify-center gap-2 text-center text-footnote text-quaternary">
           <span>{t("Enter 发送 · Shift Enter 换行 · / 提示词助手")}</span>
           {attachments.length > 0 && (
             <span className="text-tertiary">
